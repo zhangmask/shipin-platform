@@ -1,0 +1,34 @@
+{
+  "profile": "shipin.components@1",
+  "description": "每个镜头重复的小行为(转场/落版卡/字幕/声音设计)从代码常量升为幂等组件参数;默认值即为原有管线行为,变体可覆盖 defaults 派生新配方。",
+  "components": {
+    "transition": {
+      "kind": "stitch",
+      "description": "逐边界转场拼接(硬切/叠化),保时长",
+      "apply": "shipin_platform.assembly.build_transition_stitch",
+      "defaults": {"transition_duration": 0.4, "fps": 24},
+      "variant_overridable": ["transition_duration"]
+    },
+    "outro_card": {
+      "kind": "kenburns",
+      "description": "品牌落版卡:静态首帧缓慢推近(不再死板)",
+      "apply": "shipin_platform.assembly.kenburns",
+      "defaults": {"zoom_to": 1.18, "fps": 24, "size": "1280x704"},
+      "variant_overridable": ["zoom_to", "size"]
+    },
+    "subtitle": {
+      "kind": "burn_srt",
+      "description": "字幕烧录(libass 探测 → drawtext 回退,带 cue 验收)",
+      "apply": "shipin_platform.assembly.burn_srt",
+      "defaults": {"font_size": 46, "margin_v": 96},
+      "variant_overridable": ["font_size", "margin_v"]
+    },
+    "sound_design": {
+      "kind": "master_audio",
+      "description": "声音设计主混音(旁白定位 + BGM 闪避 + 切点音效)",
+      "apply": "shipin_platform.assembly.master_audio",
+      "defaults": {"bgm_gain_db": -19.0, "duck": true},
+      "variant_overridable": ["bgm_gain_db", "duck"]
+    }
+  }
+}

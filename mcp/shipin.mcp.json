@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "shipin": {
+      "command": "python",
+      "args": ["D:/aishipin/shipin-platform/tools/mcp_server.py"],
+      "type": "stdio",
+      "description": "Shipin 平台：AI 制作/看板的 16 个受控工具（状态机闸门+成本记账）"
+    }
+  }
+}

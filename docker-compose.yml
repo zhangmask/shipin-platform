@@ -1,0 +1,29 @@
+services:
+  api:
+    build: .
+    image: shipin-platform:latest
+    container_name: shipin-platform
+    ports:
+      - "8765:8765"
+    volumes:
+      # data/ 全部持久化：项目台账 / 阶段状态 / 成本 / 任务队列 / API key
+      - shipin-data:/app/data
+    environment:
+      # P0 鉴权：off=开发开放 / strict=强制 X-API-Key
+      - SHIPIN_AUTH_MODE=${SHIPIN_AUTH_MODE:-off}
+      # 管理员密钥（官方推荐：由 host 环境注入，勿写入文件）
+      - SHIPIN_ADMIN_KEY=${SHIPIN_ADMIN_KEY:-}
+      # 模型/素材凭据（只读环境变量，绝不进镜像）
+      - AGNES_API_KEY=${AGNES_API_KEY:-}
+      - WHISPER_MODEL=${WHISPER_MODEL:-}
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8765/api/health', timeout=3).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      start_period: 25s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  shipin-data:

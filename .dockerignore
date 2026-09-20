@@ -1,0 +1,21 @@
+# P6：容器构建排除运行时数据与本地产物（镜像只装平台本体）
+.git
+.gitignore
+data
+outputs
+test_out
+out
+assets
+payloads
+legacy_archive
+.mimosa
+.pytest_cache
+__pycache__
+*.pyc
+*.log
+web/node_modules
+web/dist
+server.log
+._cues_*
+tools/__pycache__
+src/**/__pycache__

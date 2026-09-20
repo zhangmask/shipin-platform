@@ -1,0 +1,18 @@
+# P6：运行时依赖锁（与 pyproject.toml [project.dependencies] 同源）
+# 容器内 `pip install -r requirements.txt`；本地亦可用 `pip install -e .`
+# Linux 强制 CPU 版 torch：默认 PyPI 源会拉入 ~5.5GB CUDA 工具链，仅 CPU 推理/转写不需要。
+# （Windows/macOS 不受影响，仍走各自默认 wheel）
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch ; platform_system == "Linux"
+openai>=2.44.0
+openai-whisper>=20250625
+moviepy>=2.0.0
+pydantic>=2.0
+pyyaml>=6.0
+pillow>=10.0
+numpy>=1.24
+requests>=2.31
+python-dotenv>=1.0
+fastapi>=0.110
+uvicorn>=0.29
+aiofiles>=23.0

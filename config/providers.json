@@ -1,0 +1,85 @@
+{
+  "profile": "shipin.default@1",
+  "_comment": "供应商抽象层 runtime profile，对齐 hypit runtime/credential-store 设计：凭据只以环境变量引用，密钥绝不落盘。capabilities: image.default / video.default / tts.default / asr.default",
+  "credentials": {
+    "agnes": {
+      "env": "AGNES_KEY"
+    },
+    "flux": {
+      "env": "MEDIASTACK_API_KEY"
+    },
+    "openai": {
+      "env": "OPENAI_API_KEY"
+    }
+  },
+  "endpoints": {
+    "image.default": {
+      "use": "agnes-image",
+      "model": "agnes-image-2.5-flash",
+      "provider": "agnes",
+      "credentials_ref": [
+        "agnes"
+      ]
+    },
+    "image.flux": {
+      "use": "flux",
+      "model": "flux-pro",
+      "provider": "flux",
+      "credentials_ref": [
+        "flux"
+      ]
+    },
+    "image.openai": {
+      "use": "openai",
+      "model": "dall-e-3",
+      "provider": "openai",
+      "credentials_ref": [
+        "openai"
+      ]
+    },
+    "image.pil": {
+      "use": "pil",
+      "model": "placeholder",
+      "provider": "local"
+    },
+    "video.default": {
+      "use": "agnes-video",
+      "model": "agnes-video-2.5-flash",
+      "provider": "agnes",
+      "credentials_ref": [
+        "agnes"
+      ],
+      "resolution": "720p"
+    },
+    "tts.default": {
+      "use": "tts-v1",
+      "model": "tts-v1",
+      "provider": "agnes",
+      "credentials_ref": [
+        "agnes"
+      ]
+    },
+    "asr.default": {
+      "use": "whisper-local",
+      "model": "medium",
+      "provider": "local"
+    }
+  },
+  "bindings": {
+    "image": "image.default",
+    "video": "video.default",
+    "tts": "tts.default",
+    "asr": "asr.default"
+  },
+  "pricing": {
+    "image": {
+      "usd_per_unit": 0.001
+    },
+    "video": {
+      "usd_per_sec": 0.02
+    },
+    "tts": {
+      "usd_per_unit": 0.0
+    }
+  }
+}

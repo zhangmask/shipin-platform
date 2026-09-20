@@ -1,0 +1,42 @@
+{
+  "name": "video_pipeline_v1",
+  "intent_schema": {
+    "fields": ["project_id", "brief"],
+    "description": "一次制作任务：shipin-platform 项目 ID + brief（可选，缺省复用 data/projects/<id>/brief.json）"
+  },
+  "steps": [
+    {
+      "name": "intake_script",
+      "title": "需求澄清与粗剧本",
+      "actions": ["pipeline.text"],
+      "entry_actions": [],
+      "reviewer": "review.text_stage",
+      "review_focus": "复用 run_text_phase 内部规则+LLM 双审结论；校验 brief/剧本/分镜 decision 与产物完整性",
+      "auto_advance": true,
+      "manual_pass_enabled": true,
+      "max_review_attempts": 3
+    },
+    {
+      "name": "keyframes_video",
+      "title": "首尾帧与视频生成",
+      "actions": ["pipeline.generate", "gen.image", "gen.video"],
+      "entry_actions": [],
+      "reviewer": "review.clip_quality",
+      "review_focus": "逐镜真实 QC（ffprobe+黑帧+内切+首帧比对）与旁白对齐结论；素材放进成片是否合规",
+      "auto_advance": true,
+      "manual_pass_enabled": true,
+      "max_review_attempts": 3
+    },
+    {
+      "name": "post_production",
+      "title": "后期制作与终验",
+      "actions": ["pipeline.assemble"],
+      "entry_actions": [],
+      "reviewer": "review.final_film",
+      "review_focus": "真实 VLM 终验（品牌出现/断切/物理异常）+ 发布门 released",
+      "auto_advance": true,
+      "manual_pass_enabled": true,
+      "max_review_attempts": 3
+    }
+  ]
+}

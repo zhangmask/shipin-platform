@@ -1,0 +1,34 @@
+"""一次性整理脚本：按清单把散落/遗留文件归档到 legacy_archive/。
+
+用法: python tools/relocate_legacy tools/relocate_manifest.json
+清单中 src/dst 均为相对项目根的目标路径（dst 是最终路径，非目录）；
+只做 shutil.move，全部带存在性校验，失败打印不中断。
+"""
+import json
+import shutil
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+manifest_path = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "tools" / "relocate_manifest.json"
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+moved, failed = [], []
+for entry in manifest["moves"]:
+    src = ROOT / entry["src"]
+    dst = ROOT / entry["dst"]
+    if not src.exists():
+        failed.append(f"MISSING {entry['src']}")
+        continue
+    if dst.exists():
+        failed.append(f"DST_EXISTS {entry['dst']}")
+        continue
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dst))
+    moved.append(entry["src"])
+
+print(f"moved={len(moved)} failed={len(failed)}")
+for f in failed:
+    print("FAILED:", f)
+for m in moved:
+    print("MOVED:", m)

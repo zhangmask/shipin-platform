@@ -1,0 +1,66 @@
+{
+ "profile": "shipin.category-templates@1",
+ "_comment": "品类模板注册表（hypit SVS 样式表的轻量等价物）：给剧本/分镜的创作提供品类化的硬规则与文案。所有模板数据只描述创作偏好，不含任何凭据。tvc 为默认模板，其规则文案与 pipeline_runner.SCRIPT_PROMPT 现行硬规则一致（显式 category=tvc 时必须零行为偏差）。",
+ "templates": {
+  "tvc": {
+   "name": "TVC 广告",
+   "description": "15-60s 品牌 TVC：hook→pain→turn→value→outro 五拍结构，末镜品牌落版",
+   "shots_range": [
+    5,
+    10
+   ],
+   "shot_min_sec": 2.5,
+   "structure": "hook→pain→turn→value→outro",
+   "pace": "normal",
+   "narration_rate": 2.7,
+   "rules": "硬规则:镜头 5-10 个(短片取下限,保证每镜 ≥2.5s);结构 hook→pain→turn→value→outro(末镜=品牌落版);总旁白字数 ≈ duration×2.7;禁\"然后\";每个 scene 只有一个地点一个事件(单镜头必须可连续拍完);品牌元素≥3镜。",
+   "landing_note": "末镜必须是【静态可拍画面】--暖色调背景上产品静置,品牌名与 slogan 后期叠加字幕呈现(不在 scene 里写\"叠加/浮现/多景切换\"等非拍摄描述);末镜 narration=品牌名+slogan。",
+   "brand_shots_min": 3
+  },
+  "drama": {
+   "name": "信息流短剧",
+   "description": "30-90s 信息流短剧：强钩子+反转+情绪冲突，对白驱动，结局引向品牌。",
+   "shot_range": [
+    6,
+    14
+   ],
+   "shot_min_sec": 3.0,
+   "structure": "hook→冲突(矛盾升级)→反转→情感落点→outro(品牌钩)",
+   "pace": "normal",
+   "narration_rate": 2.7,
+   "rules": "镜头 6-14 个(强节奏取下限,每镜 ≥3.0s);结构 hook→冲突→反转→情感→outro(末镜=品牌落版);每镜只有一个地点一个事件;对白/旁白口语化,单个 scene ≤30 字;每镜必须有台词或旁白(无声镜头不超2镜);禁\"然后\";品牌元素≥2镜,落版前必须出现一次 logo。",
+   "landing_note": "末镜是【静态可拍画面】:产品静置于带故事温度的场景中,品牌名与 slogan 后期叠加;末镜 narration=一句总结钩子+品牌名。",
+   "brand_shots_min": 2
+  },
+  "talk": {
+   "name": "真人口播",
+   "description": "15-60s 单人出镜口播：钩子→干货→CTA,镜头以中景/特写交替。",
+   "shot_range": [
+    4,
+    8
+   ],
+   "shot_min_sec": 2.5,
+   "structure": "hook→干货1→干货2→CTA(末镜=钩子+品牌名)",
+   "pace": "fast",
+   "narration_rate": 3.2,
+   "rules": "口播风格:镜头 4-8 个,每镜1 ≥2.5s;结构 hook→干货→干货→CTA;全片同一主角连续出镜;每句旁白 ≤24 字、口语化、短句;口播语速较快,总旁白字数 ≈ duration×3.2;禁\"然后\";每个 scene 只有一个地点(同一室内或同一外景);品牌元素≥2镜。",
+   "landing_note": "末镜为口播收尾卡:主角直视镜头说品牌名+slogan,或 logo 卡帧定格;scene 只写可拍画面。",
+   "brand_shots_min": 2
+  },
+  "tutorial": {
+   "name": "教程/演示",
+   "description": "步骤式教程：一个动作一步镜,最后落到品牌与成果。",
+   "shot_range": [
+    5,
+    12
+   ],
+   "shot_min_sec": 2.5,
+   "structure": "hook→step 1..n→成果→品牌落版",
+   "pace": "slow",
+   "narration_rate": 2.5,
+   "rules": "教程人风格:镜头=步骤数+开头+落版;每镜只讲一个可操作步骤;旁白 ≤20 字/镜、动作演示不看屏幕;镜头段落以动作动词开头;末镜为成果展示+品牌落版;品牌元素≥2镜。",
+   "landing_note": "末镜成果展示:完成态画面(成品/截图/使用中),品牌名+logo 后期落版,静止可拍。",
+   "brand_shots_min": 2
+  }
+ }
+}

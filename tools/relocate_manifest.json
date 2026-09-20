@@ -1,0 +1,33 @@
+{
+  "comment": "platform-closeout B3: org files into legacy_archive. Generated 2026-09-17.",
+  "moves": [
+    {"src": "burn_and_verify.py", "dst": "legacy_archive/scripts/burn_and_verify.py"},
+    {"src": "final_qc.py", "dst": "legacy_archive/scripts/final_qc.py"},
+    {"src": "make_final.py", "dst": "legacy_archive/scripts/make_final.py"},
+    {"src": "record_stages.py", "dst": "legacy_archive/scripts/record_stages.py"},
+    {"src": "submit_storyboard.py", "dst": "legacy_archive/scripts/submit_storyboard.py"},
+    {"src": "outputs/burn.sh", "dst": "legacy_archive/scripts/burn.sh"},
+    {"src": "outputs/burn_final.py", "dst": "legacy_archive/scripts/burn_final.py"},
+    {"src": "outputs/burn_subs.py", "dst": "legacy_archive/scripts/burn_subs.py"},
+    {"src": "outputs/burn_subs2.py", "dst": "legacy_archive/scripts/burn_subs2.py"},
+    {"src": "outputs/burn_subs3.py", "dst": "legacy_archive/scripts/burn_subs3.py"},
+    {"src": "test_out/_tools/_gen_placeholders.py", "dst": "legacy_archive/scripts/_gen_placeholders.py"},
+    {"src": "test_out/_tools/_render_shots.sh", "dst": "legacy_archive/scripts/_render_shots.sh"},
+    {"src": "test_out/_req_black.json", "dst": "legacy_archive/scripts/_req_black.json"},
+    {"src": "test_out/_req_burn.json", "dst": "legacy_archive/scripts/_req_burn.json"},
+    {"src": "test_out/_req_image_prompt.json", "dst": "legacy_archive/scripts/_req_image_prompt.json"},
+    {"src": "data/guard_demo_output.txt", "dst": "legacy_archive/demo_logs/guard_demo_output.txt"},
+    {"src": "data/guard_real_run_log.txt", "dst": "legacy_archive/demo_logs/guard_real_run_log.txt"},
+    {"src": "data/guard_real_run_log2.txt", "dst": "legacy_archive/demo_logs/guard_real_run_log2.txt"},
+    {"src": "data/guard_real_run_log3.txt", "dst": "legacy_archive/demo_logs/guard_real_run_log3.txt"},
+    {"src": "data/guard_real_run_log4.txt", "dst": "legacy_archive/demo_logs/guard_real_run_log4.txt"},
+    {"src": "data/guard_real_run_log5.txt", "dst": "legacy_archive/demo_logs/guard_real_run_log5.txt"},
+    {"src": "data/guard_real_run_log6.txt", "dst": "legacy_archive/demo_logs/guard_real_run_log6.txt"},
+    {"src": "data/guard_real_run_log7.txt", "dst": "legacy_archive/demo_logs/guard_real_run_log7.txt"},
+    {"src": "data/guard_real_run_log8.txt", "dst": "legacy_archive/demo_logs/guard_real_run_log8.txt"},
+    {"src": "data/guard_ledger_demo", "dst": "legacy_archive/demo_logs/guard_ledger_demo"},
+    {"src": "data/_probe_ledger", "dst": "legacy_archive/demo_logs/_probe_ledger"},
+    {"src": "data/_probe_ledger2", "dst": "legacy_archive/demo_logs/_probe_ledger2"},
+    {"src": "test_out", "dst": "legacy_archive/test_out"}
+  ]
+}
