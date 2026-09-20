@@ -51,21 +51,27 @@ PROJECTS_DIR = ROOT / "data" / "projects"
 BGM_PATH = ROOT / "assets" / "bgm" / "warm_60s.wav"
 
 SIZE_ORDER = ["ecu", "cu", "mcu", "cs", "ms", "ws", "ows"]
-LOCATION_TOKENS = ["写字楼", "街道", "街", "门口", "门", "吧台", "窗边", "店内", "落版"]
+LOCATION_TOKENS = ["写字楼", "办公室", "会议室", "办公桌", "工位", "前台",
+                   "电梯", "楼梯", "走廊", "过道", "门口", "门厅", "大堂",
+                   "吧台", "餐桌", "厨房", "窗边", "店铺", "店内", "商场",
+                   "广场", "街道", "街", "路口", "路边", "天台", "屋顶",
+                   "车间", "仓库", "工地", "车内", "车上", "客厅", "卧室",
+                   "餐厅", "咖啡", "洗手间", "阳台", "泳池", "球场", "舞台",
+                   "候机", "月台", "落版"]
 
 SCRIPT_PROMPT = """你是严格的 TVC 编剧。依据 brief 创作剧本,输出严格 JSON(无 markdown、无解释):
-{"duration_sec": <int>, "shots": [{"shot_id": "S01", "duration_sec": <2-5>, "narration": "<一句≤14字>", "scene": "<单一地点单一事件,≤30字>"}]}
-硬规则:镜头 5-10 个(短片取下限,保证每镜 ≥2.5s);结构 hook→pain→turn→value→outro(末镜=品牌落版);总旁白字数 ≈ duration×2.7;禁"然后";每个 scene 只有一个地点一个事件(单镜头必须可连续拍完);品牌元素≥3镜。
-落版镜专项:末镜必须是【静态可拍画面】--暖色调背景上产品静置,品牌名与 slogan 以后期叠加字幕呈现(不在 scene 里写"叠加/浮现/多景切换"等非拍摄描述);末镜 narration=品牌名+slogan。
+{"duration_sec": <int>, "shots": [{"shot_id": "S01", "duration_sec": <2-5>, "narration": "<一句≤14字的画外旁白,可空串>", "dialogue": {"role_code": "hero_male|colleague_male|assistant_female", "text": "<该角色在镜头内说出口的台词,≤20字>"} 或省略, "scene": "<单一地点单一事件,≤30字>"}]}
+硬规则:镜头 5-10 个(短片取下限,保证每镜 ≥2.5s);结构 hook→pain→turn→value→outro(末镜=品牌落版);每镜必须有 narration 或 dialogue 之一(两拍换声,忌双轨同压);**全片至少 2 镜必须有 dialogue**(真人开口说话,禁全片只剩话外音旁白);总字数(旁白+台词 words) ≈ duration×2.7;台词必须口语短句、一句一个意思、≤20字,禁书面腔;台词与旁白不得重复同一句话(同一信息二选一);说话角色每镜至多一个,ROLE_CODE 只取自列表;禁"然后"与旁白覆盖产品价值句;每个 scene 只有一个地点一个事件(单镜头必须可连续拍完);品牌元素≥3镜。
+落版镜专项:末镜必须是【静态可拍画面】--暖色调背景上产品静置,品牌名与 slogan 以字幕/台词呈现(不在 scene 里写"叠加/浮现/多景切换"等非拍摄描述);末镜 narration=品牌名+slogan(不再设 dialogue)。
 
 brief:
 {brief}"""
 
 STORYBOARD_PROMPT = """你是严格的 TVC 分镜师。把剧本展开为分镜，输出严格 JSON（无 markdown、无解释）：
-{"hero_shot": "<shot_id>", "shots": [{"shot_id": "...", "duration_sec": <秒>, "beat": "hook|pain|turn|value|outro", "rhythm": "slow|medium|fast", "sfx": "sfx_<n>", "shot_size": "ecu|cu|mcu|cs|ms|ws|ows", "subject": "<与全片逐字一致的主角锚定>", "motion": "<英文运动短语，必含具体动作动词+速度/幅度词，如 slowly lifts the cup / turns her head gently / steam rises softly，禁中文>", "scene": "<单一地点>", "spatial": "<构图>", "camera": "<机位/运动术语：dolly/truck/crane/pedestal，禁zoom表移动>", "cause": "<承接上一镜的可拍视觉过渡>", "effect": "<给下一镜的可拍衔接点>", "narration": "<逐字复制剧本旁白>"}]}
-硬规则：每镜只一个连续动作；motion 必须是英文且含动作动词与速度/幅度副词（i2v 规则强校验）；相邻镜 shot_size 必须不同档；主角锚定逐字一致（第一镜的 subject 后续镜逐字复制）；相邻镜间 cause/effect 必须可拍（动作接力/视线/光线）；末镜为品牌落版（静态画面+大字 logo，motion 写 static product shot with soft light drift）；品牌元素≥3镜。
+{"hero_shot": "<shot_id>", "shots": [{"shot_id": "...", "duration_sec": <秒>, "beat": "hook|pain|turn|value|outro", "rhythm": "slow|medium|fast", "sfx": "sfx_<n>", "shot_size": "ecu|cu|mcu|cs|ms|ws|ows", "subject": "<与全片逐字一致的主角锚定>", "motion": "<英文运动短语，必含具体动作动词+速度/幅度词，如 slowly lifts the cup / turns her head gently / steam rises softly，禁中文>", "scene": "<单一地点>", "spatial": "<构图>", "camera": "<机位/运动术语：dolly/truck/crane/pedestal，禁zoom表移动>", "cause": "<承接上一镜的可拍视觉过渡>", "effect": "<给下一镜的可拍衔接点>", "narration": "<逐字复制剧本旁白,无旁白则空串>", "dialogue": "<逐字复制剧本台词,无台词则空串>", "speaking": "<仅当有 dialogue 时:该角色说话时的面部与口型英文描述,如 speaks the line with lips moving clearly, mouth shapes visible; 无台词则为空串>"}]}
+硬规则：每镜只一个连续动作；motion 必须是英文且含动作动词与速度/幅度副词（i2v 规则强校验）；**有 dialogue 的镜头 motion 必须含明显的说话/口型动作（speaks naturally / talking while doing X），并且 subject 必须保持说话人开口；无台词则 speaking 留空**；相邻镜 shot_size 必须不同档；主角锚定逐字一致（第一镜的 subject 后续镜逐字复制）；相邻镜间 cause/effect 必须可拍（动作接力/视线/光线）；末镜为品牌落版（静态画面+大字 logo，motion 写 static product shot with soft light drift，dialogue/speaking 留空）；品牌元素≥3镜。
 
-剧本:
+剧本(含台词):
 {script}
 
 主角锚定模板(第一镜 subject 用它,后续逐字复制):主角:25岁左右年轻女性,黑色长直发披肩、米白色针织开衫、深灰色围巾"""
@@ -219,7 +225,9 @@ def _script_prompt(brief_data: dict, category: Optional[str] = None) -> str:
     if tpl.category == "tvc" or not tpl.rules:
         return SCRIPT_PROMPT.replace("{brief}", brief_json)
     schema = ('{"duration_sec": <int>, "shots": [{"shot_id": "S01", '
-              '"duration_sec": <2-5>, "narration": "<一句≤14字>", '
+              '"duration_sec": <2-5>, "narration": "<一句≤14字的画外旁白,可空串>", '
+              '"dialogue": {"role_code": "hero_male|colleague_male|assistant_female", '
+              '"text": "<该角色在镜头内说出口的台词,≤20字>"} 或省略, '
               '"scene": "<单一地点单一事件,≤30字>"}]}')
     return (
         f"你是严格的{tpl.name}编剧。依据 brief 创作剧本,输出严格 JSON"
@@ -278,8 +286,11 @@ def run_text_phase(project_id: str, brief: dict, store,
             draft = None
             continue
         for s in draft.get("shots", []):
-            s.setdefault("narration", next((x["narration"] for x in script["shots"]
-                                            if x["shot_id"] == s["shot_id"]), ""))
+            _src = next((x for x in script["shots"]
+                         if x["shot_id"] == s["shot_id"]), {})
+            s.setdefault("narration", _src.get("narration", ""))
+            dlg = _src.get("dialogue")
+            s.setdefault("dialogue", dlg if isinstance(dlg, dict) else "")
         r = _iterate("storyboard", draft, project_id, store, use_llm=True)
         steps.append({"stage": "storyboard", "attempt": attempt + 1,
                       "decision": r["decision"], "criticals": r["stats"]["critical"]})
@@ -374,11 +385,17 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                 or "cinematic, soft natural light")
     img_prompts, vid_prompts = [], []
     for s in storyboard["shots"]:
+        dlg = s.get("dialogue")
+        spk = (str(s.get("speaking") or "").strip()
+               if isinstance(dlg, dict) and dlg.get("text") else "")
+        speaking_en = f" {spk}." if spk else ""
         img_prompts.append({"shot_id": s["shot_id"], "prompt_en":
-                            f"{s['subject']}. {s['motion']}. Scene: {s['scene']}. "
+                            f"{s['subject']}. {s['motion']}{speaking_en} "
+                            f"Scene: {s['scene']}. "
                             f"{s['spatial']}. {s['camera']}. {style}, no text"})
         vid_prompts.append({"shot_id": s["shot_id"],
-                            "prompt_text": f"{s['motion']}. Camera: {s['camera']}. "
+                            "prompt_text": f"{s['motion']}{speaking_en} "
+                                           f"Camera: {s['camera']}. "
                                            f"Single continuous take, no cuts."})
     for stage, data in (("image_prompt", {"style_anchor": style, "shot_prompts": img_prompts}),
                         ("video_prompt", {"shot_prompts": vid_prompts})):
@@ -521,19 +538,39 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
         return ref if (ref and Path(ref).is_file()) else None
     need = [s["shot_id"] for s in shots if not _tts_of(s["shot_id"])]
     if need:
-        segs = [tts.build_segment(s["shot_id"], s["narration"], role_code="biz_female")
-                for s in shots if s["shot_id"] in need]
+        segs = []
+        # 台词镜:角色先开口(role_code→音色),旁白随后跟;无台词镜只有旁白
+        for s in shots:
+            if s["shot_id"] not in need:
+                continue
+            dlg = s.get("dialogue")
+            if isinstance(dlg, dict) and dlg.get("text"):
+                role = str(dlg.get("role_code") or "biz_female")
+                segs.append(tts.build_segment(f"{s['shot_id']}_dlg", dlg["text"],
+                                              role_code=role))
+                if s.get("narration"):
+                    segs.append(tts.build_segment(s["shot_id"], s["narration"],
+                                                  role_code="biz_female"))
+            else:
+                segs.append(tts.build_segment(s["shot_id"], s["narration"],
+                                              role_code="biz_female"))
         tts.synthesize_segments_sync(segs)
         record_cost(project_id, "tts", model="tts-v1",
-                    units=float(len(segs)), note="旁白")
+                    units=float(len(segs)), note="旁白+台词")
     for s in shots:
         p = _tts_of(s["shot_id"])
         if not p:
             return {"ok": False, "phase": "generate", "reason": f"{s['shot_id']} TTS 缺失"}
         manifest["shots"][s["shot_id"]]["tts"] = p
+        dlg = s.get("dialogue")
+        if isinstance(dlg, dict) and dlg.get("text"):
+            dv = glob_tts(work, f"{s['shot_id']}_dlg")
+            if dv:
+                manifest["shots"][s["shot_id"]]["dlg"] = dv
     align = align_narration([{"shot_id": s["shot_id"],
                               "duration_sec": float(s.get("duration_sec") or 3),
-                              "narration_path": manifest["shots"][s["shot_id"]]["tts"]}
+                              "narration_path": manifest["shots"][s["shot_id"]]["tts"],
+                              "dialogue_path": manifest["shots"][s["shot_id"]].get("dlg")}
                              for s in shots])
     manifest["align"] = align
     _save(project_id, "manifest.json", manifest)
@@ -626,7 +663,7 @@ def run_assemble_phase(project_id: str, store) -> dict:
     out["color_grade"] = {"output": graded}
 
     # 4) 字幕(服务端按 align 时间轴生成)
-    srt = _build_srt(storyboard, tl)
+    srt = _build_srt(storyboard, tl, manifest)
     srt_path = work / "subs.srt"
     srt_path.write_text(srt, encoding="utf-8")
     burn = burn_srt(str(Path(graded).resolve()), str(srt_path.resolve()),
@@ -637,16 +674,25 @@ def run_assemble_phase(project_id: str, store) -> dict:
         return {"ok": False, "phase": "assemble", "reason": f"burn: {burn.get('error', burn)}"}
     out["burn"] = {"violations": burn.get("violations")}
 
-    # 5) 声音设计
-    events = [{"path": manifest["shots"][s]["tts"], "time": t["audio_start_sec"]}
-              for s, t in zip(sids, tl)]
+    # 5) 声音设计：旁白轨 + 台词轨(role 音色) 全部落点,台词在前旁白在后
+    events = []
+    for s, t_ in zip(sids, tl):
+        mrec = manifest["shots"].get(s, {})
+        narr_p = mrec.get("tts")
+        dlg_p = mrec.get("dlg")
+        # 台词先说(镜起点)，旁白随后 (align 已算好 narr_at)
+        if dlg_p:
+            events.append({"path": dlg_p,
+                           "time": t_["dlg_start_sec"] or t_["audio_start_sec"]})
+        if narr_p:
+            events.append({"path": narr_p, "time": t_["audio_start_sec"]})
     ma = master_audio(None, float(a_total(tl)), str(work / "soundbed.wav"),
                       bgm_path=str(BGM_PATH) if BGM_PATH.exists() else None,
                       bgm_gain_db=float(comp_snd.get("bgm_gain_db", -19.0)),
                       duck=bool(comp_snd.get("duck", True)),
                       narration_events=events,
-                      sfx_events=[{"time": t["audio_start_sec"], "kind": "whoosh"}
-                                  for t in tl[1:]])
+                      sfx_events=[{"time": t_["audio_start_sec"], "kind": "whoosh"}
+                                  for t_ in tl[1:]])
     if not ma.get("ok"):
         return {"ok": False, "phase": "assemble", "reason": f"master: {ma.get('error')}"}
     out["audio"] = {k: ma.get(k) for k in ("bgm_ducked", "sfx_count")}
@@ -693,16 +739,41 @@ def a_total(tl: list[dict]) -> float:
     return round(sum(t["window_sec"] for t in tl), 2)
 
 
-def _build_srt(storyboard: dict, tl: list[dict]) -> str:
+def _build_srt(storyboard: dict, tl: list[dict], manifest: Optional[dict] = None) -> str:
+    """SRT：旁白 + 台词双轨字幕。
+
+    台词镜：台词「角色: 文本」先说（窗口起点起，显示时长 = 台词实长+0.1s），
+    旁白随后（align 算好的 narr_at 起）。无台词镜只出旁白。
+    """
     narr = {s["shot_id"]: s.get("narration", "") for s in storyboard["shots"]}
+    dlg = {s["shot_id"]: s.get("dialogue") for s in storyboard["shots"]}
+    ROLE_NAMES = {"hero_male": "主角", "colleague_male": "同事",
+                  "assistant_female": "助理", "biz_female": "旁白"}
 
     def fmt(t):
         h, m = int(t // 3600), int(t % 3600 // 60)
         sec, ms = int(t % 60), int(round((t % 1) * 1000))
         return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
     lines, t = [], 0.0
-    for i, rec in enumerate(tl):
+    idx = 1
+    for rec in tl:
         w = rec["window_sec"]
-        lines.append(f"{i+1}\n{fmt(t)} --> {fmt(t + w)}\n{narr.get(rec['shot_id'], '')}\n")
+        d = dlg.get(rec["shot_id"])
+        n = narr.get(rec["shot_id"], "")
+        if isinstance(d, dict) and d.get("text"):
+            role = str(d.get("role_code") or "biz_female")
+            name = ROLE_NAMES.get(role, role)
+            dlg_sec = rec.get("dlg_sec") or 1.2
+            d_show = min(dlg_sec + 0.1, w)
+            lines.append(f"{idx}\n{fmt(t)} --> {fmt(t + d_show)}\n{name}: {d['text']}\n")
+            idx += 1
+            if n:
+                ns = t + dlg_sec + 0.18
+                if ns < t + w - 0.05:
+                    lines.append(f"{idx}\n{fmt(ns)} --> {fmt(t + w)}\n{n}\n")
+                    idx += 1
+        elif n:
+            lines.append(f"{idx}\n{fmt(t)} --> {fmt(t + w)}\n{n}\n")
+            idx += 1
         t += w
     return "\n".join(lines)

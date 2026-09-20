@@ -193,6 +193,11 @@ VALID_SCRIPT = {
                "narration": "夜色下的城市街道闪着点微光",
                "scene": "夜色街道"} for i in range(6)],
 }
+# 台词门(§10.7):全片 ≥2 镜合规 dialogue——测试样本跟上新 schema
+VALID_SCRIPT["shots"][1]["dialogue"] = {"role_code": "colleague_male",
+                                        "text": "就在前面那栋楼"}
+VALID_SCRIPT["shots"][3]["dialogue"] = {"role_code": "hero_male",
+                                        "text": "签完就能收工"}
 
 
 def _valid_storyboard() -> dict:

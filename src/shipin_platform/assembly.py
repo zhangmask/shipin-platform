@@ -52,7 +52,9 @@ def align_narration(shots: list[dict], min_tail: float = MIN_TAIL,
                     master_duration: float = MASTER_MAX) -> dict:
     """按旁白实长计算每个镜头的最终窗口（旁白驱动剪辑）。
 
-    shots: [{shot_id, duration_sec, narration_path}]
+    shots: [{shot_id, duration_sec, narration_path, dialogue_path?}]
+    dialogue_path(台词轨)存在时：台词先出，旁白随后跟；窗口取
+    台词+气口 与 旁白+气口 中更长者——两条人声都必须落在镜内说完。
     返回 {verdict, timeline, total_sec, findings, next_action}
 
     规则（确定性）：
@@ -67,29 +69,45 @@ def align_narration(shots: list[dict], min_tail: float = MIN_TAIL,
         sid = str(s.get("shot_id", "?"))
         sb_dur = float(s.get("duration_sec") or 0)
         np_ = s.get("narration_path")
+        dp_ = s.get("dialogue_path")
         tts = _ffprobe_duration(Path(np_)) if np_ else 0.0
+        dlg = _ffprobe_duration(Path(dp_)) if dp_ else 0.0
         if not np_ or not Path(np_).exists():
             findings.append({"severity": "critical", "code": "NARRATION_MISSING",
                              "message": f"{sid} 旁白音频不存在: {np_}"})
             tts = 0.0
-        needed = tts + min_tail
-        window = max(sb_dur, needed) if tts else sb_dur
+        # 双轨：台词在窗口起点先出（留 0.1s 起嘴），旁白紧跟台词之后；
+        # 没有台词时旁白从起点出。
+        voice_tail = tts + dlg + 0.22 if dlg else tts
+        needed = voice_tail + min_tail
+        window = max(sb_dur, needed) if voice_tail else sb_dur
         window = min(window, master_duration)
-        if tts and needed > master_duration:
+        if voice_tail and needed > master_duration:
             findings.append({"severity": "critical", "code": "SPILL",
-                             "message": (f"{sid} 旁白 {tts:.2f}s + 气口 {min_tail}s "
+                             "message": (f"{sid} 声音 {voice_tail:.2f}s + 气口 {min_tail}s "
                                          f"超过素材上限 {master_duration}s——缩句或拆镜")})
-        if tts and window - tts > max_gap:
+        if voice_tail and window - voice_tail > max_gap:
             findings.append({"severity": "suggestion", "code": "DEAD_AIR",
-                             "message": (f"{sid} 旁白 {tts:.2f}s / 窗口 {window:.2f}s，"
-                                         f"干晾 {window - tts:.2f}s（>{max_gap}s）")})
+                             "message": (f"{sid} 对白+旁白 {voice_tail:.2f}s / "
+                                         f"窗口 {window:.2f}s，"
+                                         f"干晾 {window - voice_tail:.2f}s（>{max_gap}s）")})
+        # 台词轨定位：台词从窗口起点出，旁白紧跟台词之后 0.18s；
+        # 无台词时旁白直接从窗口起点出——两轨都必须落在镜头内。
+        if dlg:
+            audio_dlg_at = t
+            narr_at = t + dlg + 0.18
+        else:
+            audio_dlg_at = None
+            narr_at = t
         timeline.append({
             "shot_id": sid,
             "storyboard_sec": sb_dur,
             "window_sec": round(window, 2),
             "tts_sec": round(tts, 2),
-            "audio_start_sec": round(t, 2),
-            "extended": bool(tts and window > sb_dur + 0.01),
+            "dlg_sec": round(dlg, 2),
+            "audio_start_sec": round(narr_at, 2),
+            "dlg_start_sec": round(audio_dlg_at, 2) if audio_dlg_at else None,
+            "extended": bool(dlg or (tts and window > sb_dur + 0.01)),
         })
         t += window
     verdict = "fix" if any(f["severity"] == "critical" for f in findings) else "ok"
@@ -98,9 +116,10 @@ def align_narration(shots: list[dict], min_tail: float = MIN_TAIL,
         "timeline": timeline,
         "total_sec": round(t, 2),
         "findings": findings,
-        "next_action": ("旁白比素材长，缩句后重 TTS" if verdict == "fix"
+        "next_action": ("声音比素材长，缩句后重 TTS" if verdict == "fix"
                         else "把 timeline 的 window_sec 传给 /api/video/stitch（保时长转场）"
-                        "，audio_start_sec 用于 /api/audio/master 定位旁白床"),
+                        "，audio_start_sec 用于 /api/audio/master 定位旁白床；"
+                        "dlg_start_sec 用于定台词音轨"),
     }
 
 

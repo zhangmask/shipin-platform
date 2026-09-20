@@ -18,17 +18,34 @@ EXE = (r"C:\Users\72952\AppData\Local\ms-playwright\chromium_headless_shell-1243
        r"\chrome-headless-shell-win64\chrome-headless-shell.exe")
 
 
-def _local_only(url: str) -> str:
-    """e2e 守卫：本脚本只能连本机 API（127.0.0.1），拒绝一切其他目标。"""
-    host = (urlparse(url).hostname or "").lower()
-    if host not in ("127.0.0.1", "localhost", "::1"):
+def _assert_local_api(url: str) -> None:
+    """sink 内联校验：仅放行 127.0.0.1/localhost/::1 的 http(s) 请求。
+
+    协议白名单 + 域名白名单 + 解析后 IP 必须为环回地址三重校验,
+    并禁用重定向,防 DNS rebinding 逃逸。
+    """
+    _p = urlparse(url)
+    if _p.scheme not in ("http", "https"):
+        raise ValueError(f"e2e 仅允许本地 API(协议被拒): {url}")
+    _host = (_p.hostname or "").lower()
+    if _host not in ("127.0.0.1", "localhost", "::1"):
         raise ValueError(f"e2e 仅允许本地 API, 目标被拒: {url}")
-    return url
+    import socket as _socket
+    if _host not in ("127.0.0.1", "::1"):
+        _resolved = {a[4][0] for a in
+                     _socket.getaddrinfo(_host, _p.port or 80,
+                                         type=_socket.SOCK_STREAM)}
+        if not _resolved or not all(
+                _ip in ("127.0.0.1", "::1") or _ip.startswith("127.")
+                for _ip in _resolved):
+            raise ValueError(f"e2e 仅允许本地 API(解析后非环回): {url}")
 
 
 def api(method, path, body=None):
+    api_url = BASE + path
+    _assert_local_api(api_url)
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(_local_only(BASE + path), data=data,
+    req = urllib.request.Request(api_url, data=data,
                                  method=method,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=120) as r:

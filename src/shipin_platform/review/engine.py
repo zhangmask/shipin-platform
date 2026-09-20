@@ -827,7 +827,7 @@ class ReviewEngine:
                         proposed_fix=f"把该句拆成多句或删减到≤{self.MAX_NARRATION_CHARS}字(短句大字标准,一句一个点)",
                     ))
 
-        # Infeasible scene keywords (un-producible effect claims)
+# Infeasible scene keywords (un-producible effect claims)
         INFEASIBLE = ("穿越", "瞬移", "魔法", "法术", "超能力", "原地起飞", "长生",
                       "外星", "钢铁侠", "现实扭曲", "变出钱来")
         for s in shots:
@@ -844,6 +844,64 @@ class ReviewEngine:
                     revision_strategy=cls["strategy"],
                     proposed_fix="换成可实拍/可生成的等效视觉(如:用高速镜头表现'瞬间到位')",
                 ))
+
+        # ── 台词门（§10.7 台词规范落地）：台词不能全片缺席、不能超长、
+        #    不能与旁白重复、role_code 必须合法。
+        valid_roles = {"hero_male", "colleague_male", "assistant_female"}
+        dlg_shots = 0
+        for s in shots:
+            d = s.get("dialogue")
+            if not isinstance(d, dict) or not d.get("text"):
+                continue
+            dlg_shots += 1
+            text = str(d["text"]).strip()
+            if len(text) > 20:
+                cls = self.classifier.classify("script", "dialogue_too_long", str(len(text)))
+                findings.append(Finding(
+                    dimension="dialogue", severity=Severity.CRITICAL,
+                    issue=f"镜头{s.get('shot_id', '?')}台词{len(text)}字超20字上限",
+                    evidence=f"台词:{text[:60]}",
+                    failure_mode=cls["mode"], revision_strategy=cls["strategy"],
+                    proposed_fix="把台词拆短到 ≤20 字(一句台词一个意思)",
+                ))
+            if str(s.get("narration", "")).strip() and \
+                    text.split("，")[0] in str(s.get("narration", "")):
+                cls = self.classifier.classify("script", "dialogue_dupe_narration", text[:16])
+                findings.append(Finding(
+                    dimension="dialogue", severity=Severity.CRITICAL,
+                    issue=f"镜头{s.get('shot_id', '?')}台词与旁白重复同一信息",
+                    evidence=f"台词:{text[:40]} / 旁白:{s.get('narration','')[:40]}",
+                    failure_mode=cls["mode"], revision_strategy=cls["strategy"],
+                    proposed_fix="同一信息二选一:台词说给画面里开口说话的角色,旁白说画外音;两者不得复述同一句话",
+                ))
+            role = str(d.get("role_code") or "")
+            if role not in valid_roles:
+                cls = self.classifier.classify("script", "dialogue_role_invalid", role or "empty")
+                findings.append(Finding(
+                    dimension="dialogue", severity=Severity.CRITICAL,
+                    issue=f"镜头{s.get('shot_id', '?')}台词 role_code 非法: {role or '空'}",
+                    evidence=f"role_code={role!r} (合法集: {sorted(valid_roles)})",
+                    failure_mode=cls["mode"], revision_strategy=cls["strategy"],
+                    proposed_fix=f"role_code 取 {sorted(valid_roles)} 之一; 若角色名不在池内, 改由旁白承担该句",
+                ))
+            if s.get("shot_id") == shots[-1].get("shot_id"):
+                cls = self.classifier.classify("script", "dialogue_in_outro", role or "")
+                findings.append(Finding(
+                    dimension="dialogue", severity=Severity.CRITICAL,
+                    issue=f"末镜落版镜不应有角色台词(品牌落版用旁白/字幕)",
+                    evidence=f"末镜台词:{text[:40]}",
+                    failure_mode=cls["mode"], revision_strategy=cls["strategy"],
+                    proposed_fix="把末镜台词移给倒数第二镜, 末镜只留旁白/品牌字幕",
+                ))
+        if len(shots) >= 4 and dlg_shots < 2:
+            cls = self.classifier.classify("script", "dialogue_missing", str(dlg_shots))
+            findings.append(Finding(
+                dimension="dialogue", severity=Severity.CRITICAL,
+                issue=f"全片{dlg_shots}镜有台词, 少于 2 镜——低于对白门禁",
+                evidence=f"dialogue shots: {dlg_shots} / {len(shots)}",
+                failure_mode=cls["mode"], revision_strategy=cls["strategy"],
+                proposed_fix="给至少 2 镜加 dialogue(角色开口说话, 内容口语短句, ≤20 字), 与旁白信息互补不重复",
+            ))
 
         return findings
 

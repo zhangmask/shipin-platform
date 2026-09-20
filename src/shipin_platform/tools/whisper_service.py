@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json as _json
+import os
 import whisper
 from pathlib import Path
 from typing import Optional
@@ -84,29 +85,37 @@ class WhisperService:
         root = output_dir.resolve()
         root.mkdir(parents=True, exist_ok=True)
 
-        srt_path, json_path, anchors_path = _out_paths(root, audio_path)
+        # 输出文件名只取输入文件纯 stem(剥离目录成分与危险字符)，
+        # 一律拼接在 root 之下,并对 root 做 realpath 前缀围栏校验。
+        _stem = Path(audio_path).name.rsplit(".", 1)[0]
+        _stem = _stem.replace("\\", "").replace("/", "").strip(".") or "output"
+        srt_path = root / (_stem + ".srt")
+        json_path = root / (_stem + ".json")
+        anchors_path = root / (_stem + ".word_anchors.json")
+        _root_real = os.path.realpath(os.fspath(root)) + os.sep
+        for _out in (srt_path, json_path, anchors_path):
+            assert os.path.realpath(os.fspath(_out)).startswith(_root_real), \
+                f"输出路径越界被拒绝: {_out}"
 
-        # Write SRT
-        with open(srt_path, "w", encoding="utf-8") as f:
-            for i, seg in enumerate(result["segments"], 1):
-                start = self._format_ts(seg["start"])
-                end = self._format_ts(seg["end"])
-                text = seg["text"].strip()
-                f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
+        # Write SRT (write_text 落盘)
+        srt_path.write_text(
+            "".join(f"{i}\n{self._format_ts(seg['start'])} --> "
+                    f"{self._format_ts(seg['end'])}\n{seg['text'].strip()}\n\n"
+                    for i, seg in enumerate(result["segments"], 1)),
+            encoding="utf-8")
 
         # Write JSON (raw whisper result, word-level timestamps included)
-        with open(json_path, "w", encoding="utf-8") as f:
-            _json.dump(result, f, ensure_ascii=False, indent=2)
+        json_path.write_text(_json.dumps(result, ensure_ascii=False, indent=2),
+                             encoding="utf-8")
 
         # Write word anchors (flat, segment-linked)
         anchors = extract_word_anchors(result)
-        with open(anchors_path, "w", encoding="utf-8") as f:
-            _json.dump({
-                "source": str(audio_path),
-                "language": self.language,
-                "word_count": len(anchors),
-                "anchors": anchors,
-            }, f, ensure_ascii=False, indent=2)
+        anchors_path.write_text(_json.dumps({
+            "source": str(audio_path),
+            "language": self.language,
+            "word_count": len(anchors),
+            "anchors": anchors,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
 
         return {
             "ok": True,

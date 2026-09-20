@@ -6,6 +6,7 @@
 data/*.db
 data/*.db-shm
 data/*.db-wal
+data/*.db-journal
 data/*.log
 data/graphs/
 data/projects/

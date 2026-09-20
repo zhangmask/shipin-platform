@@ -7,6 +7,7 @@
 """
 import json
 import queue
+import socket
 import threading
 import time
 import urllib.request
@@ -17,16 +18,31 @@ from urllib.parse import urlparse
 BASE = "http://127.0.0.1:8766/api/graphs"
 
 
-def _local_only(url: str) -> str:
-    """e2e 守卫：本脚本只能连本机 API（127.0.0.1），拒绝一切其他目标。"""
-    host = (urlparse(url).hostname or "").lower()
-    if host not in ("127.0.0.1", "localhost", "::1"):
+def _assert_local_api(url: str) -> None:
+    """sink 内联校验：仅放行 127.0.0.1/localhost/::1 的 http(s) 请求。
+
+    协议 + 域名白名单 + 解析后 IP 必须为环回地址三重校验，
+    防 DNS rebinding 与私网/IPv6 逃逸。
+    """
+    _p = urlparse(url)
+    if _p.scheme not in ("http", "https"):
+        raise ValueError(f"e2e 仅允许本地 API(协议被拒): {url}")
+    _host = (_p.hostname or "").lower()
+    if _host not in ("127.0.0.1", "localhost", "::1"):
         raise ValueError(f"e2e 仅允许本地 API, 目标被拒: {url}")
-    return url
+    if _host not in ("127.0.0.1", "::1"):
+        _resolved = {a[4][0] for a in
+                     socket.getaddrinfo(_host, _p.port or 80,
+                                        type=socket.SOCK_STREAM)}
+        if not _resolved or not all(
+                _ip in ("127.0.0.1", "::1") or _ip.startswith("127.")
+                for _ip in _resolved):
+            raise ValueError(f"e2e 仅允许本地 API(解析后非环回): {url}")
 
 
 def call(method, path, body=None, timeout=120):
-    url = _local_only(BASE + path)
+    url = BASE + path
+    _assert_local_api(url)
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method,
                                  headers={"Content-Type": "application/json"})
@@ -36,7 +52,9 @@ def call(method, path, body=None, timeout=120):
 
 def sse_thread(gid: str, ev: queue.Queue):
     """订阅 SSE，把每条 event 塞进队列（按行读，chunked 不阻塞攒积）。"""
-    req = urllib.request.Request(_local_only(f"{BASE}/{gid}/events"))
+    sse_url = f"{BASE}/{gid}/events"
+    _assert_local_api(sse_url)
+    req = urllib.request.Request(sse_url)
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             buf = b""
