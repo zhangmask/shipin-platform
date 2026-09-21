@@ -27,6 +27,7 @@ import re
 import socket
 import subprocess
 import tempfile
+import time
 import urllib.request
 from pathlib import Path
 from typing import Optional
@@ -177,16 +178,32 @@ def check_timeline(timeline, duration_sec: Optional[float] = None,
 
 
 def _vlm_credentials() -> str:
+    """Resolve AGNES key from env FIRST; the %TEMP%/agnes_key.txt fallback only
+    as a legacy convenience. 2026-09-21 实跑事故：temp 文件曾被外部进程写成
+    模型返回文本(『11.09|从咖啡店门口…』形态)，被放进 Authorization 头导致
+    latin-1 UnicodeEncodeError——key 只信任 env/.env，且必须通过形状校验。
+    """
     key = os.environ.get("AGNES_KEY", "").strip()
-    if key:
+    if _key_ok(key):
         return key
     tf = Path(os.environ.get("TEMP", tempfile.gettempdir())) / "agnes_key.txt"
     if tf.exists():
         try:
-            return tf.read_text(encoding="utf-8").strip()
+            key = tf.read_text(encoding="utf-8").strip()
         except OSError:
-            return ""
+            key = ""
+        if _key_ok(key):
+            return key
     return ""
+
+
+def _key_ok(key: str) -> bool:
+    """机器密钥形状校验：仅 ASCII [A-Za-z0-9._=-]，且长度 ≥16——把
+    「agent 返回文本被误当 key」这类事故挡在发送之前（否则非 ASCII
+    进 HTTP 头直接 latin-1 崩）。"""
+    if not key or len(key) < 16:
+        return False
+    return all(32 < ord(c) < 127 for c in key)
 
 
 def _check_ssrf(url: str) -> str:
@@ -238,19 +255,31 @@ def _ask_vlm(images, prompt, key: str, max_tokens: int = 1800) -> str:
     """Ask VLM via requests (urllib has SSL issues with some Agnes endpoints)."""
     import requests
     import os as _os
+    if not _key_ok(key):  # 发送前保险:坏 key 平缓报错,不把垃圾写进 Authorization 头
+        raise ValueError("AGENT_KEY 校验失败(长度<16 或含非 ASCII)——禁止把非密钥内容当凭据上送")
     body = {
         "model": _os.environ.get("SHIPIN_VLM_MODEL", "agnes-3.0-flash"),
         "messages": [{"role": "user", "content": [*images, {"type": "text", "text": prompt}]}],
         "max_tokens": max_tokens,
     }
-    resp = requests.post(
-        _check_ssrf(CHAT_URL),
-        json=body,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        timeout=240,
-    )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    # 上游偶发 5xx/网络瞬断(实测:真实终片审查批量请求见过 500)——重试 3 次
+    # 退避 3s,别让一次瞬态错误毁掉整场终验(失败仍会如实抛出)。
+    last_exc: Optional[Exception] = None
+    for _attempt in range(3):
+        try:
+            resp = requests.post(
+                _check_ssrf(CHAT_URL),
+                json=body,
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                timeout=240,
+            )
+            if resp.status_code < 500:
+                resp.raise_for_status()
+                return resp.json()["choices"][0]["message"]["content"]
+        except (requests.exceptions.RequestException, KeyError, ValueError) as e:
+            last_exc = e
+        time.sleep(3 * (_attempt + 1))
+    raise RuntimeError(f"AGNES VLM 请求 3 次均失败: {last_exc}")
 
 
 # ── cross-shot identity gate (审计:A.4 模板,VBench-2.0 human_identity 思路) ─
@@ -403,9 +432,14 @@ def _batch_prompt(times: str, n: int, context: Optional[dict] = None,
         "画面却出现其他主体）；能对上就不要写。\n"
         "返回严格 JSON，不要任何额外文字：{\"frames\": [{\"t\": <秒>, \"scene\": \"...\", "
         "\"subtitle\": \"...\", \"anomaly\": 0/1}], "
-        "\"breaks\": [断点描述字符串, ...], \"brand_seen\": true/false,"
+        "\"breaks\": [{\"t\": <秒>, \"desc\": \"...\", \"kind\": \"intra\"|\"boundary\"}], "
+        "\"brand_seen\": true/false,"
         " \"shot_issues\": [{\"shot\": \"S03\", \"issue\": \"...\"}]}\n"
-        "没有断点则 breaks 为空数组；有内容崩坏（变形/漂移/断帧）的帧在 anomaly 标记 1；"
+        "断帧规则：同一分镜内部的突变/崩坏/闪帧才算异常，kind='intra' 且必须列入 breaks；"
+        "相邻分镜交界处的正常画面切换（t 落在进分镜表给出的镜头边界附近，"
+        "只是『换了一个镜头』）必须标 kind='boundary'，不得列入异常——"
+        "没有 intra 断点则 breaks 为空数组；"
+        "有内容崩坏（变形/漂移/断帧）的帧在 anomaly 标记 1；"
         "所有帧都符合分镜预期则 shot_issues 为空数组。"
     )
     _bname = str(ctx.get("brand_name") or "").strip()
@@ -658,6 +692,14 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
 
     batch_results: list[dict] = []
     breaks: list[str] = []
+    boundary_transitions: list[dict] = []
+    # 剪辑豁免：kind='boundary' 的断帧只有落在真实镜头边界 ±1s 内才可信
+    # (coffee-v7 实跑:正当转场被误报成 critical 的 2 条即此类);模型乱标
+    # 「boundary」但 t 远离任何边界 → 仍按 critical 处理。
+    bounds = _shot_boundaries(shots) if shots else []
+    # 帧采样错位:VLM 报的是「采样帧」秒,不是剪辑瞬间(采样点距边界 0.45~1.6s),
+    # 短镜(3s)跨边界成对帧可达 ~1.6s;margin 取 2.0s 才覆盖跨镜 pair。
+    _BOUNDARY_MARGIN = 2.0
     brand_seen = False
     anomalies: list[dict] = []
     shot_issues: list[dict] = []
@@ -678,8 +720,32 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
         except (json.JSONDecodeError, AttributeError):
             parsed = {}
         for b in (parsed.get("breaks") or []):
-            if isinstance(b, str) and b not in breaks:
-                breaks.append(b)
+            if isinstance(b, str):
+                if b not in breaks:
+                    breaks.append(b)
+                continue
+            if not isinstance(b, dict):
+                continue
+            try:
+                t_b = float(b.get("t"))
+            except (TypeError, ValueError):
+                t_b = None
+            kind = str(b.get("kind") or "intra")
+            desc = str(b.get("desc") or "")[:130]
+            if (kind == "boundary" and t_b is not None and any(
+                    abs(t_b - bb) <= _BOUNDARY_MARGIN for bb in bounds)):
+                # 变量名 bkey:绝不能再覆写外层 key(AGNES 凭据)——2026-09-21
+                # 实测事故:此分支把 key 改成 f"{t}|{desc}",后续批次 Authorization
+                # 头变成『Bearer 11.09|画面从咖啡店门口…』,latin-1 编码直接崩。
+                bkey = f"{t_b:.2f}|{desc}"
+                if not any(x["t"] == t_b and x["desc"] == desc
+                           for x in boundary_transitions):
+                    boundary_transitions.append({"t": t_b, "desc": desc})
+                continue
+            msg = (f"镜头内画面突变 t={t_b}s：{desc}" if t_b is not None
+                   else f"镜头内画面突变：{desc}")
+            if msg not in breaks:
+                breaks.append(msg)
         if parsed.get("brand_seen"):
             brand_seen = True
         for fr in (parsed.get("frames") or []):
@@ -720,6 +786,8 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
     verdict = "pass" if not all_findings else "fix"
     _reason = (f"确定性 {len(det_findings)} + VLM 断帧 {len(breaks)}"
                f" + 内容崩坏 {len([a for a in anomalies if a])}")
+    if boundary_transitions:
+        _reason += f"(正当换镜 {len(boundary_transitions)} 处不计)"
     if not brand_seen and str(ctx.get("brand_name") or "").strip():
         _reason += " + 品牌未入画"
     return {
@@ -728,6 +796,7 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
                    f"终验发现 {len(all_findings)} 处问题（{_reason}）"),
         "brand_seen": brand_seen,
         "breaks": breaks,
+        "boundary_transitions": boundary_transitions,
         "anomalies": anomalies,
         "deterministic": deterministic,
         "findings": all_findings,

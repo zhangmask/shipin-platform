@@ -497,7 +497,7 @@ def _make_flash_clip(out, bands: list[tuple[float, float]],
     return Path(out)
 
 
-def _vlm_stub(monkeypatch, *, shot_issues=None, same_person=None):
+def _vlm_stub(monkeypatch, *, shot_issues=None, same_person=None, breaks=None):
     """替换 hard_gates 的 VLM 通道:按提示词分派 SAME_PERSON 与批次问题。"""
     import json as _json
     from shipin_platform.review import hard_gates
@@ -509,7 +509,8 @@ def _vlm_stub(monkeypatch, *, shot_issues=None, same_person=None):
             return _json.dumps({"same": False, "spec": "脸换了",
                                 "reason": "两镜不是同一张脸"},
                                ensure_ascii=False)
-        body = {"frames": [], "breaks": [], "brand_seen": True,
+        body = {"frames": [], "breaks": [] if breaks is None else breaks,
+                "brand_seen": True,
                 "shot_issues": [] if shot_issues is None else shot_issues}
         return _json.dumps(body, ensure_ascii=False)
 
@@ -637,3 +638,82 @@ class TestTimelineAccounting:
         r = check_timeline(tl, duration_sec=4.0,
                            expected_shot_ids=["S01", "S02"])
         assert r["verdict"] == "ok", r["findings"]
+
+
+class TestBoundaryBreakGate:
+    """轮9a:VLM 打断的 kind 豁免——'boundary' 且 t 落在真实镜头边界 ±2s 内
+    → 移出 findings(正当换镜);否则(模型乱标/远距)仍 critical。
+    容差 2.0s:采样帧距边界 0.45~1.6s,VLM 报的 t 是采样秒不是剪辑瞬间。"""
+
+    def test_boundary_kind_exempted_intra_kept(self, monkeypatch, tmp_path):
+        _vlm_stub(monkeypatch, breaks=[
+            {"t": 2.0, "desc": "S01→S02 正常换镜", "kind": "boundary"},
+            {"t": 3.5, "desc": "S02 镜内闪白", "kind": "intra"}])
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "b.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "女主角"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "女主角"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        codes = {f["code"] for f in r["findings"] if f["code"] != "FINAL_NO_AUDIO"}
+        assert codes == {"VLM_BREAK"}, r["findings"]
+        msgs = [f["message"] for f in r["findings"]]
+        assert any("3.5" in m for m in msgs)
+        assert not any("2.0" in m for m in msgs)
+        assert len(r["boundary_transitions"]) == 1
+
+    def test_boundary_kind_far_from_real_boundary_stays_critical(
+            self, monkeypatch, tmp_path):
+        """模型乱标 kind='boundary' 但 t 远离任何真实边界 → 仍拦截。"""
+        _vlm_stub(monkeypatch, breaks=[
+            {"t": 8.5, "desc": "乱标的转场", "kind": "boundary"}])
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "b2.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "A"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "A"},
+            {"shot_id": "S03", "duration_sec": 2.0, "subject": "A"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        codes = {f["code"] for f in r["findings"]}
+        assert "VLM_BREAK" in codes, r["findings"]
+        assert r["boundary_transitions"] == []
+
+    def test_legacy_string_break_still_critical(self, monkeypatch, tmp_path):
+        """旧式字符串断句(无 kind)保持原语义:全部 critical。"""
+        _vlm_stub(monkeypatch, breaks=["S01 内同一主角突然换装"])
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "b3.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "A"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "A"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        codes = {f["code"] for f in r["findings"]}
+        assert "VLM_BREAK" in codes
+        assert r["boundary_transitions"] == []
+
+
+class TestKeySanity:
+    """轮9a(实跑事故回归):AGNES 凭据必须通过形状校验,任何非密钥内容
+    (模型返回文本、断帧串)不得进入 Authorization 头——曾发生 boundary
+    豁免分支把外层 key 覆写成 f"{t}|{desc}",后续批次装上『Bearer
+    11.09|画面从…』直接 latin-1 崩。"""
+
+    def test_junk_key_blocked_before_wire(self, monkeypatch):
+        from shipin_platform.review import hard_gates
+        hard_gates.time.sleep = lambda _s: None  # 不真的等退避
+        import requests as _req
+        hit = []
+        def _nope(*a, **k):
+            hit.append(a)
+            raise AssertionError("不应触网")
+        monkeypatch.setattr(_req, "post", _nope)
+        with pytest.raises(ValueError):
+            hard_gates._ask_vlm([], "看画面", "11.09|画面从咖啡店门口推门切换为吧台特写")
+        assert hit == []
+
+    def test_credentials_reject_junk_shapes(self):
+        import shipin_platform.review.hard_gates as hg
+        assert not hg._key_ok("11.09|从咖啡店门口突然切换")
+        assert not hg._key_ok("Bearer cpk-xxxx")
+        assert not hg._key_ok("短")
+        assert hg._key_ok("cpk-ldbV0mCIwcZILFBkm1Wbc7Y7UUOJHiyYTEb0fayCJadfk4K4")

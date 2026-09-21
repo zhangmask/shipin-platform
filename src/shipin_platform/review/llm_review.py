@@ -119,15 +119,26 @@ def _parse_json_object(text: str) -> Optional[dict]:
 
 def _llm_key() -> str:
     key = os.environ.get("AGNES_KEY", "").strip()
-    if key:
+    if _key_ok(key):
         return key
     tf = Path(os.environ.get("TEMP", "")) / "agnes_key.txt" if os.environ.get("TEMP") else None
     if tf and tf.exists():
         try:
-            return tf.read_text(encoding="utf-8").strip()
+            key = tf.read_text(encoding="utf-8").strip()
         except OSError:
-            return ""
+            key = ""
+        if _key_ok(key):
+            return key
     return ""
+
+
+def _key_ok(key: str) -> bool:
+    """机器密钥形状校验(与 hard_gates 一致):仅可打印 ASCII 且 ≥16 字符——挡
+    「模型返回文本被误当 key」进 Authorization 头(非 ASCII 会触发 http.client
+    latin-1 UnicodeEncodeError,实测事故)。"""
+    if not key or len(key) < 16:
+        return False
+    return all(32 < ord(c) < 127 for c in key)
 
 
 def _check_ssrf(url: str) -> str:

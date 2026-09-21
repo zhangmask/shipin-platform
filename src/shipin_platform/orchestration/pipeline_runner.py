@@ -973,6 +973,7 @@ def run_assemble_phase(project_id: str, store) -> dict:
     brief = _load(project_id, "brief.json") or {}
     shots = storyboard["shots"]
     tl = manifest["align"]["timeline"]
+    sids = [t["shot_id"] for t in tl]
     # 审计 G5:clip 内容哈希一致性——generate 验收过的素材在拼接前必须字节一致,
     # 防「审查通过的是 A 文件,拼接用的是换过的 B 文件」类狸猫换太子
     import hashlib as _hl2
@@ -992,7 +993,6 @@ def run_assemble_phase(project_id: str, store) -> dict:
             return {"ok": False, "phase": "assemble",
                     "reason": f"{_sid} 素材读取失败: {_e}"}
     windows = [t["window_sec"] for t in tl]
-    sids = [t["shot_id"] for t in tl]
     # 组件配方默认值(远期3:散落常量升为可覆盖参数;异常时回退原常量)
     comp_outro = _component_defaults("outro_card")
     comp_trans = _component_defaults("transition")
