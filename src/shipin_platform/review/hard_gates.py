@@ -212,9 +212,11 @@ def _silence_spans(video: str, noise_db: float = _NARR_SILENCE_DB,
 def check_narration_presence(video: str, shots: list[dict]) -> dict:
     """每镜旁白声轨存在性(轮14,确定性,无 ASR/模型依赖)。
 
-    shots 每项需含 {shot_id, narration, narr_at|audio_start_sec,
-    tts_sec?, duration_sec(align 窗口)};只有 narration 非空且起点可解析的
-    镜才查——纯画面镜(手冲特写/logo 落版)不要求有声。判定:
+    shots 每项需含 {shot_id, narration?, dialogue?, narr_at|
+    audio_start_sec, tts_sec?, duration_sec(align 窗口)};narration 与
+    dialogue(字符串或 {text, role} 字典)任一非空且起点可解析的镜才查
+    (轮20:纯台词镜也要查)——都没有台词的纯画面镜(手冲特写/logo
+    落版)不要求有声。判定:
       - 旁白窗口 [at, at+tts_sec] 整体落在静音段内 → critical
         NARRATION_MISSING(TTS 缺失/音频错位:画面照演,嘴上没词);
       - 有声占比 < _NARR_MIN_SOUND_RATIO → warning NARRATION_THIN;
@@ -249,7 +251,14 @@ def check_narration_presence(video: str, shots: list[dict]) -> dict:
     for s in shots:
         if not isinstance(s, dict):
             continue
-        text = str(s.get("narration") or "").strip()
+        # 轮20:台词镜(narration 为空、只有 dialogue)也要查——剧本要求
+        # 「至少 2 镜必须有 dialogue」,这些镜的 TTS 失败此前整镜跳过
+        narration = str(s.get("narration") or "").strip()
+        _dlg = s.get("dialogue")
+        dialogue = (str(_dlg.get("text") or "").strip()
+                    if isinstance(_dlg, dict) else str(_dlg or "").strip())
+        text = narration or dialogue
+        kind = "旁白" if narration else "台词"
         if not text:
             continue
         # align 时间轴两种历史字段名都认:narr_at(新) / audio_start_sec(旧)
@@ -274,13 +283,13 @@ def check_narration_presence(video: str, shots: list[dict]) -> dict:
         if sound <= 0.05:
             findings.append({
                 "severity": "critical", "code": "NARRATION_MISSING",
-                "message": (f"镜头{sid} 旁白窗口 {a:.2f}~{b:.2f}s 全程静音——"
+                "message": (f"镜头{sid} {kind}窗口 {a:.2f}~{b:.2f}s 全程静音——"
                             f"TTS 缺失或音频错位(画面照演,嘴上没词): "
                             f"{text[:40]}")})
         elif ratio < _NARR_MIN_SOUND_RATIO:
             findings.append({
                 "severity": "warning", "code": "NARRATION_THIN",
-                "message": (f"镜头{sid} 旁白窗口 {a:.2f}~{b:.2f}s 有声占比 "
+                "message": (f"镜头{sid} {kind}窗口 {a:.2f}~{b:.2f}s 有声占比 "
                             f"仅 {ratio:.0%}(阈值 {_NARR_MIN_SOUND_RATIO:.0%})"
                             f"——旁白可能被截断/音量过低")})
     verdict = "ok" if not any(f["severity"] == "critical"

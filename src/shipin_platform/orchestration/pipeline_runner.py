@@ -1216,6 +1216,8 @@ def run_assemble_phase(project_id: str, store) -> dict:
     # 画面照演但嘴上没词,「符不符合剧本」此前只核视频,音频侧在此补门
     _narr_shots = [{"shot_id": s["shot_id"],
                     "narration": s.get("narration"),
+                    # 轮20:纯台词镜(narration 空)也要过声轨存在性门
+                    "dialogue": s.get("dialogue"),
                     "narr_at": (t.get("narr_at") if isinstance(t, dict)
                                 else None),
                     "audio_start_sec": (t.get("audio_start_sec")

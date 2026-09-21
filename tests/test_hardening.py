@@ -938,6 +938,44 @@ class TestNarrationPresence:
         assert r["verdict"] == "ok"
         assert r["stats"]["checked"] == 0
 
+    # ── 轮20:纯台词镜(dialogue-only)也要过声轨门 ────────────────────
+    # 剧本要求「至少 2 镜必须有 dialogue」——这些镜 narration 为空,
+    # 旧逻辑整镜跳过,台词 TTS 失败没人管。
+
+    def test_dialogue_only_shot_checked(self, tmp_path):
+        """narration 空 + dialogue 非空 → 查,静音时 critical。"""
+        from shipin_platform.review.hard_gates import check_narration_presence
+        clip = _narr_clip(tmp_path / "dlg.mp4")  # 0~1s 有声,其后静音
+        shots = [{"shot_id": "S03", "narration": "", "narr_at": 3.5,
+                  "duration_sec": 2.0,
+                  "dialogue": {"role": "女主", "text": "这杯咖啡真暖"}}]
+        r = check_narration_presence(str(clip), shots)
+        assert r["verdict"] == "fix"
+        hit = next(f for f in r["findings"]
+                   if f["code"] == "NARRATION_MISSING")
+        assert "S03" in hit["message"] and "台词窗口" in hit["message"], hit
+        assert r["stats"]["checked"] == 1
+
+    def test_dialogue_only_string_form_checked(self, tmp_path):
+        """dialogue 为纯字符串形态同样认(两种历史结构)。"""
+        from shipin_platform.review.hard_gates import check_narration_presence
+        clip = _narr_clip(tmp_path / "dlg2.mp4")
+        shots = [{"shot_id": "S04", "narration": "", "narr_at": 0.2,
+                  "duration_sec": 2.0, "dialogue": "欢迎光临"}]
+        r = check_narration_presence(str(clip), shots)
+        assert r["verdict"] == "ok", r["findings"]  # 0.2~2.2s 内有声
+        assert r["stats"]["checked"] == 1
+
+    def test_no_text_shot_still_skipped(self, tmp_path):
+        """narration 与 dialogue 都空(纯画面镜)仍不查——不误报。"""
+        from shipin_platform.review.hard_gates import check_narration_presence
+        clip = _narr_clip(tmp_path / "dlg3.mp4")
+        shots = [{"shot_id": "S04", "narration": "", "dialogue": "",
+                  "narr_at": 4.0, "duration_sec": 2.0}]
+        r = check_narration_presence(str(clip), shots)
+        assert r["verdict"] == "ok"
+        assert r["stats"]["checked"] == 0
+
 
 class TestTempHygiene:
     """轮19(磁盘打满事故回归):审查调用结束后不得在 TEMP 遗留抽帧/
