@@ -76,7 +76,7 @@ class TestFitDuration:
         data = {"duration_sec": 20,
                 "shots": [{"shot_id": f"S{i:02d}", "duration_sec": 5}
                           for i in range(1, 5)]}
-        out, ok = pr._fit_duration_to_target(data, 10)
+        out, ok, meta = pr._fit_duration_to_target(data, 10)
         assert ok
         total = sum(s["duration_sec"] for s in out["shots"])
         assert total == 10
@@ -85,16 +85,64 @@ class TestFitDuration:
     def test_clip_unreachable(self):
         data = {"shots": [{"shot_id": "S01", "duration_sec": 2},
                           {"shot_id": "S02", "duration_sec": 2}]}
-        out, ok = pr._fit_duration_to_target(data, 20)  # 4s → 钳8s×2=16s ≠20
+        out, ok, meta = pr._fit_duration_to_target(data, 20)  # 4s → 钳8s×2=16s ≠20
         assert not ok
         assert max(s["duration_sec"] for s in out["shots"]) <= 8.0
 
     def test_noop_within_tolerance(self):
         data = {"shots": [{"shot_id": "S01", "duration_sec": 9.5},
                           {"shot_id": "S02", "duration_sec": 10.5}]}
-        out, ok = pr._fit_duration_to_target(data, 20.0)
+        out, ok, meta = pr._fit_duration_to_target(data, 20.0)
         assert ok
         assert [s["duration_sec"] for s in out["shots"]] == [9.5, 10.5]
+
+
+class TestIterateDurationLoop:
+    """轮25 回归:_iterate 的时长闭环收尾块曾引用三个从未赋名的变量
+    (fitted_total/dev/llm_meta)——stage="script" 且 brief 带
+    duration_sec(brief 审查强制必填)时每轮必崩 NameError,整条剧本
+    审查链路形同不存在(实跑复现:/api/pipeline/text 500)。此处把
+    可达/不可达两条路径都钉住:不崩 + duration critical 正确产出。
+    """
+
+    def _script(self, n: int, per: float) -> dict:
+        return {"shots": [{"shot_id": f"S{i:02d}", "duration_sec": per,
+                           "narration": f"台词{i}", "dialogue": "",
+                           "subject": "主角", "scene": "街头",
+                           "motion": "独行"}
+                          for i in range(1, n + 1)]}
+
+    def _store_and_brief(self, pid: str, duration_sec: float):
+        from shipin_platform.orchestration.stage_store import ProjectStageStore
+        store = ProjectStageStore(":memory:")
+        store.create_project(pid)
+        pr._save(pid, "brief.json", {"product_info": "测试咖啡",
+                                     "duration_sec": duration_sec,
+                                     "slogan": "享受每一刻"})
+        return store
+
+    def test_unreachable_duration_emits_critical_no_crash(self):
+        pid = "iter-unreach"
+        store = self._store_and_brief(pid, 24)
+        pr._iterate("script", self._script(1, 3), pid, store,
+                    use_llm=False)
+        rounds = pr._load(pid, "script_review.json")["rounds"]
+        dur_findings = [f for rnd in rounds for f in rnd["findings"]
+                        if "无法收敛" in str(f.get("issue") or "")]
+        assert dur_findings, "不可达时长必须产出 duration critical"
+        assert "24" in dur_findings[0]["issue"]
+
+    def test_reachable_duration_no_crash(self):
+        pid = "iter-reach"
+        store = self._store_and_brief(pid, 24)
+        pr._iterate("script", self._script(8, 3), pid, store,
+                    use_llm=False)  # 8×3=24s 命中目标
+        rounds = pr._load(pid, "script_review.json")["rounds"]
+        assert not [f for rnd in rounds for f in rnd["findings"]
+                    if "无法收敛" in str(f.get("issue") or "")], \
+            "可达路径不应有时长意图 critical"
+        assert rounds[-1].get("metadata", {}).get("duration", {}).get(
+            "fitted") == 24
 
 
 class TestAssembleGate:

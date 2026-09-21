@@ -288,23 +288,36 @@ def _normalize_canvas(src: Path, dst: Path, w: int, h: int) -> bool:
     return r.returncode == 0 and dst.exists()
 
 
-def _fit_duration_to_target(data: dict, target: float) -> tuple[dict, bool]:
-    """将剧本总时长等比逼近 brief 目标（tol 12%），返回 (data, 可达?)。
+def _fit_duration_to_target(data: dict, target: float) -> tuple[dict, bool, dict]:
+    """将剧本总时长等比逼近 brief 目标（tol 12%），返回 (data, 可达?, meta)。
 
     原管线不比对 brief.duration_sec——用户在表单写「30 秒」，剧本却
     播 48 秒，成片时长完全不受意图约束。这里按比例缩放每镜（钳制在
     2.0-8.0s 的可拍区间），缩放后仍够不着的（时长差太多钳完还差）返回
     不可达，由调用方把该 finding 升级为 critical 阻断。
+
+    轮25:meta 外泄 fitted/dev——_iterate 的时长闭环收尾块曾直接引用
+    未定义的 fitted_total/dev/llm_meta,剧本审查循环每轮必崩 NameError
+    (实跑复现),整条剧本审查链路形同不存在。
     """
+    def _fitted_total(d: dict) -> float:
+        return sum(float(s.get("duration_sec") or 0)
+                   for s in (d.get("shots") or []) if isinstance(s, dict))
+
     shots = data.get("shots")
     if not isinstance(shots, list) or not shots:
-        return data, False
-    total = sum(float(s.get("duration_sec") or 0) for s in shots)
+        return data, False, {"target": round(target, 1), "fitted": 0.0,
+                             "dev": 1.0, "reachable": False}
+    total = sum(float(s.get("duration_sec") or 0) for s in shots
+                if isinstance(s, dict))
     if total <= 0:
-        return data, False
+        return data, False, {"target": round(target, 1), "fitted": 0.0,
+                             "dev": 1.0, "reachable": False}
     dev = abs(total - target) / max(target, 0.001)
     if dev <= 0.12:
-        return data, True
+        return data, True, {"target": round(target, 1),
+                            "fitted": round(total, 1),
+                            "dev": round(dev, 3), "reachable": True}
     factor = target / total
     new_shots = []
     for s in shots:
@@ -315,7 +328,11 @@ def _fit_duration_to_target(data: dict, target: float) -> tuple[dict, bool]:
     out = {**data, "shots": new_shots}
     if isinstance(data.get("duration_sec"), (int, float)):
         out["duration_sec"] = round(fitted, 1)
-    return out, reachable
+    return out, reachable, {"target": round(target, 1),
+                            "fitted": round(fitted, 1),
+                            "dev": round(abs(fitted - target)
+                                         / max(target, 0.001), 3),
+                            "reachable": reachable}
 
 
 SCRIPT_REPAIR_PROMPT = """你是严格的 TVC 编剧。下面是一份剧本 JSON 和审片意见。逐条修复所有"必改"项(其余内容与字段保持原样不动),输出修复后的完整剧本 JSON(同一 schema,无 markdown、无解释)。
@@ -378,6 +395,7 @@ def _iterate(stage: str, data: dict, project_id: str, store,
     # 可达性在收敛后复查,钳制到极限仍不达标 → 升级 critical 阻断。
     dur_target = 0.0
     dur_reachable = True
+    dur_meta: dict = {}
     if stage == "script" and brief_ctx:
         try:
             dur_target = float(brief_ctx.get("duration_sec") or 0)
@@ -386,7 +404,8 @@ def _iterate(stage: str, data: dict, project_id: str, store,
     llm_info = {}
     for round_num in range(1, max_rounds + 1):
         if dur_target > 0:
-            data, dur_reachable = _fit_duration_to_target(data, dur_target)
+            data, dur_reachable, dur_meta = _fit_duration_to_target(
+                data, dur_target)
         report = engine.run_review(stage, data, round_num=round_num)
         rounds.append(report.to_dict())
         if report.decision.value in ("pass", "pass_with_warnings", "stall", "stop"):
@@ -423,11 +442,13 @@ def _iterate(stage: str, data: dict, project_id: str, store,
     # 8s×3 镜=24s）→ 升级 critical 阻断，绝不静默放行与用户时长意图
     # 偏差 >12% 的剧本。
     if dur_target > 0:
+        _fitted_total = float(dur_meta.get("fitted") or 0)
+        _dev = float(dur_meta.get("dev") or 0)
         if not dur_reachable:
             final["findings"].append({
                 "dimension": "duration", "severity": "critical",
-                "issue": f"总时长拟合后仍为{fitted_total:.1f}s,目标{dur_target:.1f}s(偏差{dev:.0%}),单镜 2-8s 限度内无法收敛",
-                "evidence": f"target={dur_target}, fitted={fitted_total}",
+                "issue": f"总时长拟合后仍为{_fitted_total:.1f}s,目标{dur_target:.1f}s(偏差{_dev:.0%}),单镜 2-8s 限度内无法收敛",
+                "evidence": f"target={dur_target}, fitted={_fitted_total}",
                 "failure_mode": "manual", "revision_strategy": "restructure",
                 "proposed_fix": "缩短台词/拆分镜头或调整 brief duration_sec 后再提交",
                 "status": "pending"})
@@ -436,7 +457,7 @@ def _iterate(stage: str, data: dict, project_id: str, store,
             if final["decision"] in ("pass", "pass_with_warnings"):
                 final["decision"] = "revise"
         final["metadata"] = {**(final.get("metadata") or {}),
-                             "duration": llm_meta}
+                             "duration": dict(dur_meta, reachable=dur_reachable)}
 
     decision = final["decision"]
     h = stable_artifact_hash(data)

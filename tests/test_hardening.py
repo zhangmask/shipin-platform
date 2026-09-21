@@ -281,6 +281,67 @@ class TestApiGates:
                          json={"project_id": "p1", "gate": "bogus"})
         assert r2.status_code == 409  # gate 错误统一走 StageGateError→409
 
+    # ── 轮25:finalize 终审闸 ────────────────────────────────────────
+    # 回归:finalize 此前只查阶段状态从不读 final_review.json——终审
+    # verdict=fix(VLM 断帧/品牌未入画/时间轴红线/旁白缺失/单镜与入拼
+    # critical 全并入)的成片照样能被置 RELEASED,所有门的阻断在发布
+    # 入口被绕过。未跑过 assemble 同样必须拦。
+
+    def _pass_all_stages(self, pid: str):
+        import hashlib
+        store = api._STAGE_STORE
+        h = hashlib.sha256(b"final-bytes").hexdigest()
+        for stage in ("brief", "script", "storyboard", "video_gen"):
+            store.record_artifact(pid, stage, h)
+        store.record_artifact(pid, "post_production", h)
+        store.record_confirmation(pid, "script")
+
+    def _write_final_review(self, pid: str, verdict: str):
+        import json as _json
+        p = api._project_dir(pid) / "final_review.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(_json.dumps(
+            {"verdict": verdict, "reason": f"终审{verdict}",
+             "findings": [{"severity": "critical", "code": "VLM_BREAK",
+                           "message": "x"}]},
+            ensure_ascii=False), encoding="utf-8")
+        return p
+
+    def test_finalize_blocked_when_final_review_fix(self, client, tmp_path):
+        pid = "fin-fix"
+        client.post("/api/project/create", json={"project_id": pid})
+        self._pass_all_stages(pid)
+        self._write_final_review(pid, "fix")
+        r = client.post(f"/api/project/{pid}/finalize")
+        assert r.status_code == 409
+        fails = r.json()["detail"]["fails"]
+        gate = next(f for f in fails if f.get("gate") == "final_review")
+        assert gate["status"] == "fix" and gate["critical"] == 1
+
+    def test_finalize_blocked_when_no_final_review(self, client):
+        pid = "fin-none"
+        client.post("/api/project/create", json={"project_id": pid})
+        self._pass_all_stages(pid)
+        r = client.post(f"/api/project/{pid}/finalize")
+        assert r.status_code == 409
+        gate = next(f for f in r.json()["detail"]["fails"]
+                    if f.get("gate") == "final_review")
+        assert gate["status"] == "NOT_REVIEWED"
+
+    def test_finalize_ok_when_final_review_pass_keeps_hash(self, client):
+        pid = "fin-pass"
+        client.post("/api/project/create", json={"project_id": pid})
+        self._pass_all_stages(pid)
+        self._write_final_review(pid, "pass")
+        r = client.post(f"/api/project/{pid}/finalize")
+        assert r.status_code == 200 and r.json()["status"] == "RELEASED"
+        # 轮25:发布不得把成片完整性指纹覆写成字面量(那会让后续哈希
+        # 校验永远 409,pipeline_runner 早已避开,这里同样保住了)
+        row = api._STAGE_STORE.get_stage(pid, "post_production")
+        assert row["artifact_hash"] != "RELEASED"
+        assert row["artifact_hash"].startswith("a") or len(
+            row["artifact_hash"]) == 64
+
     def test_iterate_rejects_stale_upstream(self, client):
         client.post("/api/project/create", json={"project_id": "p2"})
         # brief 存在但 BLOCKED → script 迭代必须被拒

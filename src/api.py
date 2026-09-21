@@ -1535,10 +1535,41 @@ def project_finalize(project_id: str):
     # 确认闸门：script 必须经用户确认过（防"一句话意图直接出片"）
     if store.get_confirmation(project_id, "script") is None:
         fails.append({"gate": "script_confirmed", "status": "NOT_CONFIRMED"})
+    # 轮25 终审闸：finalize 此前只查阶段状态,从不读 final_review.json——
+    # 终审 verdict=fix(VLM 断帧/品牌未入画/时间轴红线/旁白缺失/单镜与
+    # 入拼 critical 全部并入)的成片照样能被置 RELEASED,所有门的阻断
+    # 在发布入口被绕过。未跑过 assemble(无 final_review.json)同样拦。
+    _fr_path = _project_dir(project_id) / "final_review.json"
+    _fr: dict = {}
+    try:
+        if _fr_path.is_file():
+            _fr = _json.loads(_fr_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        _fr = {}
+    _fr_verdict = str(_fr.get("verdict") or "")
+    if not _fr_verdict:
+        fails.append({"gate": "final_review", "status": "NOT_REVIEWED",
+                      "detail": "未跑过 assemble 终审(final_review.json 缺失)"})
+    elif _fr_verdict != "pass":
+        _crit = [f for f in (_fr.get("findings") or [])
+                 if f.get("severity") == "critical"]
+        fails.append({"gate": "final_review", "status": _fr_verdict,
+                      "critical": len(_crit),
+                      "reason": str(_fr.get("reason") or "")[:200],
+                      "detail": "终审未通过,按 findings 修复后重跑 assemble"})
     if fails:
         raise HTTPException(status_code=409,
                             detail={"code": "UPSTREAM_FAILED", "fails": fails})
-    store.record_artifact(project_id, "post_production", "RELEASED", status="RELEASED")
+    # 发布:保留下方记的成片完整性指纹,pipeline_runner 早已避开把 hash
+    # 覆写成字面量"RELEASED"(那会让后续 finalize 的哈希校验永远 409),
+    # 这里同样不能覆写;发布事件走 event,不动 artifact。指纹为空(旧数据/
+    # mux 端点未记)时退回字面量,总比 record_artifact 的 EMPTY_HASH 500 好。
+    row = store.get_stage(project_id, "post_production") or {}
+    _pp_hash = str(row.get("artifact_hash") or "").strip()
+    store.record_artifact(project_id, "post_production",
+                          _pp_hash or "RELEASED", status="RELEASED")
+    store.record_event(project_id, "released", "成片已发布(终验通过)",
+                       stage="post_production")
     return {"project_id": project_id, "status": "RELEASED", "stages": store.get_project_status(project_id)}
 
 
