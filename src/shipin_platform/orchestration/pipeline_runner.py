@@ -768,6 +768,8 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
     store.record_artifact(project_id, "image_gen", _sah(img_fp))
 
     # 3) 视频 + QC + 重试(落版卡留给 assemble 的 kenburns,不跑 agnes)
+    # 轮12:单镜 VLM 符合度诊断结果按镜累积(缓存镜沿用旧条目)
+    shots_review = _load(project_id, "shots_review.json") or {}
     for i, s in enumerate(shots):
         sid = s["shot_id"]
         mrec = manifest["shots"][sid]
@@ -841,6 +843,20 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                 except OSError:
                     mrec.pop("clip_sha256", None)
                 store.record_clip_qc(project_id, sid, str(clip), "ok", {"attempts": attempts})
+                # 轮12:单镜 VLM 符合度诊断——每镜独立 ctx 逐帧对照分镜
+                # 文本预期(终审是一个 prompt 扛全部分镜,镜头一多预期被稀释,
+                # coffee-v7 实测 S05/S08 判定漂移)。只记录不拦生成:clip 过审
+                # ≠进终片的内容(assemble 窗口不足时从 master 补帧),critical
+                # 在 assemble 并入终审统一阻断(与 timeline 门同一范式)。
+                try:
+                    from shipin_platform.review.hard_gates import vlm_review_shot
+                    _sr = vlm_review_shot(str(clip), s, frames_count=4)
+                    shots_review[sid] = {"verdict": _sr.get("verdict"),
+                                         "findings": _sr.get("findings") or []}
+                except Exception as e:
+                    shots_review[sid] = {"verdict": "error", "findings": [],
+                                         "error": str(e)[:160]}
+                _save(project_id, "shots_review.json", shots_review)
                 _save(project_id, "manifest.json", manifest)
                 break
             mrec["qc"] = "fix"
@@ -1144,6 +1160,19 @@ def run_assemble_phase(project_id: str, store) -> dict:
             tchk.get("findings") or [])
         fv["verdict"] = "fix"
         fv["reason"] = (fv.get("reason") or "") + "；timeline 门未过"
+    # 轮12:单镜 VLM 诊断(每镜独立 ctx 逐帧对照分镜预期)的 critical 并入
+    # 终验——clip 自身演错剧本/镜内换人在此统一阻断,不随 assemble 的
+    # master 补帧溜进终片。缺文件(旧项目/未跑 generate)时无操作。
+    _sr_all = _load(project_id, "shots_review.json") or {}
+    _sr_crit = [f for _r in _sr_all.values()
+                for f in (_r.get("findings") or [])
+                if f.get("severity") == "critical"]
+    if _sr_crit:
+        fv = dict(fv)
+        fv["findings"] = list(fv.get("findings") or []) + _sr_crit
+        fv["verdict"] = "fix"
+        fv["reason"] = ((fv.get("reason") or "")
+                        + f"；单镜诊断 {len(_sr_crit)} 处 critical")
     _save(project_id, "final_review.json", fv)
     out["final_review"] = {"verdict": fv.get("verdict"),
                            "deterministic": fv.get("deterministic"),

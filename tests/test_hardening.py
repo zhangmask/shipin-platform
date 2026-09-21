@@ -670,6 +670,58 @@ class TestIdentityGate:
         assert "IDENTITY_SWITCH" not in {f["code"] for f in r["findings"]}
 
 
+class TestShotReview:
+    """轮12a:单镜 VLM 符合度诊断 vlm_review_shot——每镜独立 ctx 逐帧
+    对照分镜文本预期(终审是一个 prompt 扛全部分镜,镜头一多预期被稀释),
+    外加确定性层与轮11 镜内身份通道;不含品牌门与跨镜判定。"""
+
+    def test_shot_story_mismatch_flagged(self, monkeypatch, tmp_path):
+        _vlm_stub(monkeypatch, shot_issues=[
+            {"shot": "S02", "issue": "画面是厨房,分镜预期办公室"}])
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "s.mp4", 4.0)
+        shot = {"shot_id": "S02", "duration_sec": 4.0,
+                "subject": "女主角", "scene": "办公室",
+                "motion": "走进办公室"}
+        r = hard_gates.vlm_review_shot(str(clip), shot, frames_count=4)
+        assert r["verdict"] == "fix"
+        hits = [f for f in r["findings"]
+                if f["code"] == "SHOT_STORY_MISMATCH"]
+        assert hits and "单镜诊断" in hits[0]["message"], r["findings"]
+        assert r["shot_id"] == "S02"
+        assert r["frames_reviewed"] == 4
+
+    def test_clean_shot_passes(self, monkeypatch, tmp_path):
+        _vlm_stub(monkeypatch)
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "s_ok.mp4", 4.0)
+        shot = {"shot_id": "S01", "duration_sec": 4.0,
+                "subject": "主角", "scene": "街头", "motion": "独行"}
+        r = hard_gates.vlm_review_shot(str(clip), shot, frames_count=4)
+        assert r["verdict"] == "pass", r["findings"]
+        assert r["identity"]["intra_checked"] == 1  # 人物镜走镜内身份通道
+
+    def test_no_key_blocked(self, monkeypatch, tmp_path):
+        from shipin_platform.review import hard_gates
+        monkeypatch.setattr(hard_gates, "_vlm_credentials", lambda: "")
+        clip = _make_motion_clip(tmp_path / "s_nk.mp4", 4.0)
+        r = hard_gates.vlm_review_shot(str(clip), {"shot_id": "S01",
+                                                   "duration_sec": 4.0})
+        assert r["verdict"] == "blocked"
+
+    def test_intra_identity_switch_in_shot_review(self, monkeypatch, tmp_path):
+        """轮11 镜内通道在单镜诊断里同样生效(15%/85% 首末帧对比)。"""
+        _vlm_stub(monkeypatch, same_person=False)
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "s_id.mp4", 4.0)
+        shot = {"shot_id": "S05b", "duration_sec": 4.0, "subject": "主角"}
+        r = hard_gates.vlm_review_shot(str(clip), shot, frames_count=4)
+        hits = [f for f in r["findings"] if f.get("scope") == "intra"]
+        assert hits, r["findings"]
+        assert "S05b 内部" in hits[0]["message"]
+        assert r["verdict"] == "fix"
+
+
 class TestTimelineAccounting:
     def test_missing_shot_is_critical(self):
         from shipin_platform.review.hard_gates import check_timeline

@@ -544,18 +544,22 @@ _BOUNDARY_ALARM_WORDS = ("错位", "异常", "疑似", "崩坏", "花屏", "变�
 
 
 def _is_boundary_transition(t_b: Optional[float], kind: str, desc: str,
-                            bounds: list[float]) -> bool:
+                            bounds: list[float],
+                            margin: float = _BOUNDARY_MARGIN) -> bool:
     """VLM 断帧是否其实命中真实镜头边界 → 属正常换镜,不计异常。
 
     三关全过才返回 True:
-      1. t 非空且落在某镜头边界 ±_BOUNDARY_MARGIN 内(VLM 报采样帧秒,
+      1. t 非空且落在某镜头边界 ±margin 内(VLM 报采样帧秒,
          不报剪辑瞬间;远离边界的"换镜"不可信);
       2. 显式 kind='boundary' → 直接豁免;
       3. kind 缺失/标 intra 时:desc 必须含换镜语义词且不含告警词。
+
+    margin 默认 _BOUNDARY_MARGIN(全片终审);单镜诊断(轮12)传更紧的
+    边缘窗口——短 clip 上用 2.0s 会把大半个镜头都豁免掉。
     """
     if t_b is None or not bounds:
         return False
-    if not any(abs(t_b - b) <= _BOUNDARY_MARGIN for b in bounds):
+    if not any(abs(t_b - b) <= margin for b in bounds):
         return False
     if str(kind).strip() == "boundary":
         return True
@@ -911,5 +915,181 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
         "dropped_frames": dropped_frames,
         "shot_issues": shot_issues,
         "identity": identity,
+        "batches": batch_results,
+    }
+
+
+# ── 轮12(2026-09-21):单镜 VLM 符合度诊断 ──────────────────────────────
+# 终审是一个 prompt 扛全部分镜预期(30 帧通看),镜头一多预期就被稀释——
+# coffee-v7 实测 S05 动作时序、S08 落版判定漂移皆源于此。用户要求
+# 「对每个分镜真实最终输出+双重诊断,对照剧情/分镜预期逐帧核验」,
+# 确定性侧已有 qc_clip(use_vlm 补 same_scene/morph),VLM 侧缺的正是
+# 「逐帧对照分镜文本」的符合度诊断——本函数补上,每镜独立 ctx、
+# ≤4 图/请求(端点硬限),外加轮11 的镜内身份通道。
+_SHOT_EDGE_MARGIN = 0.75  # 单镜诊断的剪辑边缘豁免窗(见 _is_boundary_transition)
+
+
+def vlm_review_shot(clip_path: str, shot: dict, frames_count: int = 4,
+                    key: Optional[str] = None) -> dict:
+    """对单个已生成镜头跑 focused VLM 诊断(单镜 ctx)。
+
+    与 vlm_review_final 的分工:终审管全片(跨镜连接/品牌/时间轴),
+    本函数管「这一镜是否真的在演剧本写的那一幕」——
+      1) 确定性层:qc_clip(黑帧/内部切镜/首末帧比对,use_vlm=False,
+         避免与 pipeline 里已跑的 use_vlm=True 重复问 VLM);
+      2) VLM 符合度:_batch_prompt 单镜 ctx(分镜预期逐帧注入),
+         4 帧一批(端点 4 图硬限),帧点取 12/38/62/88%;
+      3) 镜内身份:_identity_gate(clip, [shot], key)——轮11 通道在单镜
+         clip 上自然生效(15%/85% 首末帧)。
+    不含品牌门(品牌是全片属性)与跨镜判定(单镜无从比起)。
+    断帧边缘豁免用 _SHOT_EDGE_MARGIN:clip 头尾本就是镜界,贴边断帧
+    多是裁剪借帧伪影;短 clip 上用全片 2.0s 会豁免掉大半个镜头。
+    """
+    from .clip_qc import qc_clip, _duration_and_dims
+    key = key or _vlm_credentials()
+    sid = str(shot.get("shot_id") or "?")
+    if not key:
+        return {"verdict": "blocked", "shot_id": sid, "findings": [],
+                "reason": "AGNES_KEY 未配置；禁止交付"}
+    clip = Path(clip_path).resolve()
+    if not clip.exists():
+        return {"verdict": "blocked", "shot_id": sid, "findings": [],
+                "reason": f"clip not found: {clip}"}
+    dur = float(shot.get("duration_sec") or 0)
+    findings: list[dict] = []
+    # 1) 确定性层
+    det: dict = {}
+    try:
+        qc = qc_clip(str(clip), shot_id=sid, expected_duration_sec=dur,
+                     use_vlm=False)
+        det = {"verdict": qc.get("verdict"), "checks": qc.get("checks")}
+        for f in qc.get("findings") or []:
+            findings.append(dict(f))
+    except Exception as e:
+        findings.append({"severity": "suggestion", "code": "SHOT_QC_ERROR",
+                         "message": f"镜头{sid} 确定性检查失败: {e}"})
+    # 2) VLM 符合度(单镜 ctx,≤4 帧/批)
+    frames: list[dict] = []
+    dropped: list[float] = []
+    try:
+        clip_dur, _dims = _duration_and_dims(clip)
+    except Exception:
+        clip_dur = dur
+    if clip_dur <= 0:
+        clip_dur = dur
+    n = max(2, min(int(frames_count or 4), 4))
+    tmp = tempfile.mkdtemp(prefix="vlm_shot_")
+    for k in range(n):
+        t = round(clip_dur * (0.12 + 0.76 * k / max(1, n - 1)), 2)
+        p = Path(tmp) / f"f{k:02d}_t{t:06.2f}.png"
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-ss", f"{t}", "-i", str(clip),
+             "-frames:v", "1", "-vf", "scale=960:-2", "-y", str(p)],
+            capture_output=True, text=True)
+        if p.exists() and p.stat().st_size > 1000:
+            frames.append({"t": t, "path": str(p), "shot": f"镜头{sid}",
+                           "shot_idx": 0})
+        else:
+            dropped.append(t)
+    if not frames:
+        return {"verdict": "blocked", "shot_id": sid, "findings": findings,
+                "reason": f"镜头{sid} 未能抽取任何帧", "deterministic": det}
+    ctx = {"shots": [dict(shot, duration_sec=clip_dur)],
+           "duration_sec": round(clip_dur, 2)}
+    bounds = [0.0, round(clip_dur, 2)]
+    breaks: list[str] = []
+    boundary_transitions: list[dict] = []
+    anomalies: list[dict] = []
+    shot_issues: list[dict] = []
+    batch_results: list[dict] = []
+    for i in range(0, len(frames), 3):
+        batch = (frames[0:4] if i == 0
+                 else frames[max(0, i - 1): i + 4][:4])
+        times_str = ", ".join(f"{f['t']}" for f in batch)
+        prompt = _batch_prompt(times_str, len(batch), context=ctx, batch=batch)
+        try:
+            resp = _ask_vlm(
+                [{"type": "image_url",
+                  "image_url": {"url": "data:image/png;base64," +
+                                base64.b64encode(
+                                    Path(f["path"]).read_bytes()).decode()}}
+                 for f in batch],
+                prompt, key, max_tokens=1200)
+            m = re.search(r"\{.*\}", resp, re.S)
+            parsed = json.loads(m.group(0)) if m else {}
+        except Exception as e:
+            batch_results.append({"batch": i // 3, "error":
+                                  f"{type(e).__name__}: {e}"[:160]})
+            continue
+        batch_results.append({"batch": i // 3, "t": [f["t"] for f in batch]})
+        for b in (parsed.get("breaks") or []):
+            if isinstance(b, str):
+                if b not in breaks:
+                    breaks.append(b)
+                continue
+            if not isinstance(b, dict):
+                continue
+            try:
+                t_b = float(b.get("t"))
+            except (TypeError, ValueError):
+                t_b = None
+            kind = str(b.get("kind") or "intra")
+            desc = str(b.get("desc") or "")[:130]
+            if _is_boundary_transition(t_b, kind, desc, bounds,
+                                       margin=_SHOT_EDGE_MARGIN):
+                if not any(x["t"] == t_b and x["desc"] == desc
+                           for x in boundary_transitions):
+                    boundary_transitions.append({"t": t_b, "desc": desc})
+                continue
+            msg = (f"镜头{sid} 单镜诊断 镜头内画面突变 t={t_b}s：{desc}"
+                   if t_b is not None
+                   else f"镜头{sid} 单镜诊断 镜头内画面突变：{desc}")
+            if msg not in breaks:
+                breaks.append(msg)
+        for fr in (parsed.get("frames") or []):
+            if isinstance(fr, dict) and fr.get("anomaly"):
+                anomalies.append({"t": fr.get("t"),
+                                  "note": str(fr.get("scene") or "")[:80]})
+        for si in (parsed.get("shot_issues") or []):
+            if isinstance(si, dict) and str(si.get("issue") or "").strip():
+                shot_issues.append({"shot": str(si.get("shot") or sid),
+                                    "issue": str(si.get("issue"))[:200]})
+    for b in breaks:
+        findings.append({"severity": "critical", "code": "VLM_BREAK",
+                         "message": b})
+    for a in anomalies[:10]:
+        findings.append({"severity": "critical", "code": "VLM_FRAME_ANOMALY",
+                         "message": f"镜头{sid} t={a['t']}s 帧内容崩坏: "
+                                    f"{a['note']}"})
+    for si in shot_issues:
+        findings.append({"severity": "critical", "code": "SHOT_STORY_MISMATCH",
+                         "message": f"镜头{si['shot']} 单镜诊断: "
+                                    f"{si['issue']}"})
+    # 3) 镜内身份(轮11 通道在单镜 clip 上复用)
+    identity: dict = {"pairs": [], "checked": 0, "findings": [],
+                      "intra_pairs": [], "intra_checked": 0}
+    try:
+        identity = _identity_gate(clip, [dict(shot, duration_sec=clip_dur)],
+                                  key)
+        findings.extend(identity.get("findings") or [])
+    except Exception as e:
+        identity = {"error": f"{type(e).__name__}: {e}"[:160]}
+    verdict = "fix" if any(f.get("severity") == "critical"
+                           for f in findings) else "pass"
+    return {
+        "verdict": verdict,
+        "shot_id": sid,
+        "reason": (f"镜头{sid} 单镜诊断{'通过' if verdict == 'pass' else '发现 '
+                     + str(len([f for f in findings if f.get('severity') == 'critical']))
+                     + ' 处 critical'}"),
+        "findings": findings,
+        "breaks": breaks,
+        "boundary_transitions": boundary_transitions,
+        "anomalies": anomalies,
+        "shot_issues": shot_issues,
+        "identity": identity,
+        "deterministic": det,
+        "frames_reviewed": len(frames),
+        "dropped_frames": dropped,
         "batches": batch_results,
     }
