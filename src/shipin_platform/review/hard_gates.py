@@ -459,6 +459,41 @@ def _shot_boundaries(shots: list[dict]) -> list[float]:
     return bounds
 
 
+# ── 轮10a(2026-09-21):kind 缺失时的语义兜底 ────────────────────────────
+# agnes-3.0-flash 对同一批断帧的 kind 标注跨会话不稳定(实测同批 6 条
+# break,一轮全带 kind、下一轮可能全不带),缺 kind 时合法换镜回落成
+# "intra" 被误拦。兜底:换镜语义词 + 排除告警词,缺一不可——
+# 真实缺陷(29.18s"…疑似画面内容错位")同时含"切换"与"错位",告警词
+# 优先 → 仍按 critical 拦截。
+_BOUNDARY_MARGIN = 2.0  # 采样帧距剪辑瞬间 0.45~1.6s,跨镜对帧最远 ~1.6s
+_BOUNDARY_SWITCH_WORDS = ("切换", "换镜", "转场", "镜头交替", "切至",
+                          "镜头切换", "跨镜头", "正常交接", "过渡")
+_BOUNDARY_ALARM_WORDS = ("错位", "异常", "疑似", "崩坏", "花屏", "变形",
+                        "漂移", "鬼影", "残影", "撕裂", "闪烁", "闪白",
+                        "闪帧", "雪花", "污染", "缺损", "丢失")
+
+
+def _is_boundary_transition(t_b: Optional[float], kind: str, desc: str,
+                            bounds: list[float]) -> bool:
+    """VLM 断帧是否其实命中真实镜头边界 → 属正常换镜,不计异常。
+
+    三关全过才返回 True:
+      1. t 非空且落在某镜头边界 ±_BOUNDARY_MARGIN 内(VLM 报采样帧秒,
+         不报剪辑瞬间;远离边界的"换镜"不可信);
+      2. 显式 kind='boundary' → 直接豁免;
+      3. kind 缺失/标 intra 时:desc 必须含换镜语义词且不含告警词。
+    """
+    if t_b is None or not bounds:
+        return False
+    if not any(abs(t_b - b) <= _BOUNDARY_MARGIN for b in bounds):
+        return False
+    if str(kind).strip() == "boundary":
+        return True
+    if not any(w in desc for w in _BOUNDARY_SWITCH_WORDS):
+        return False
+    return not any(w in desc for w in _BOUNDARY_ALARM_WORDS)
+
+
 def _context_frames(video_dur: float, shots: list[dict], frames_count: int) -> list[tuple[float, int]]:
     """Per-shot *coverage* sampling — every shot gets open/middle/close frames.
 
@@ -693,13 +728,11 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
     batch_results: list[dict] = []
     breaks: list[str] = []
     boundary_transitions: list[dict] = []
-    # 剪辑豁免：kind='boundary' 的断帧只有落在真实镜头边界 ±1s 内才可信
-    # (coffee-v7 实跑:正当转场被误报成 critical 的 2 条即此类);模型乱标
-    # 「boundary」但 t 远离任何边界 → 仍按 critical 处理。
+    # 剪辑豁免(_is_boundary_transition):kind='boundary' 或 desc 含换镜语义词
+    # 的断帧,只有落在真实镜头边界 ±_BOUNDARY_MARGIN 内才豁免(coffee-v7 实跑:
+    # 正当转场被误报成 critical 的 5 条即此类);t 远离所有边界或 desc 含告警词
+    # (错位/疑似/异常…) → 仍按 critical 处理。
     bounds = _shot_boundaries(shots) if shots else []
-    # 帧采样错位:VLM 报的是「采样帧」秒,不是剪辑瞬间(采样点距边界 0.45~1.6s),
-    # 短镜(3s)跨边界成对帧可达 ~1.6s;margin 取 2.0s 才覆盖跨镜 pair。
-    _BOUNDARY_MARGIN = 2.0
     brand_seen = False
     anomalies: list[dict] = []
     shot_issues: list[dict] = []
@@ -732,8 +765,7 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
                 t_b = None
             kind = str(b.get("kind") or "intra")
             desc = str(b.get("desc") or "")[:130]
-            if (kind == "boundary" and t_b is not None and any(
-                    abs(t_b - bb) <= _BOUNDARY_MARGIN for bb in bounds)):
+            if _is_boundary_transition(t_b, kind, desc, bounds):
                 # 变量名 bkey:绝不能再覆写外层 key(AGNES 凭据)——2026-09-21
                 # 实测事故:此分支把 key 改成 f"{t}|{desc}",后续批次 Authorization
                 # 头变成『Bearer 11.09|画面从咖啡店门口…』,latin-1 编码直接崩。

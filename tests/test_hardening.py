@@ -691,6 +691,55 @@ class TestBoundaryBreakGate:
         assert "VLM_BREAK" in codes
         assert r["boundary_transitions"] == []
 
+    # ── 轮10a:kind 缺失时的语义兜底 ────────────────────────────────
+    # agnes 对同一批断帧的 kind 标注跨会话不稳定,缺 kind 的合法换镜
+    # 回落到 intra 被误拦。desc 含换镜语义词且无告警词 → 豁免;只要
+    # 带告警词(错位/疑似/异常…)或 t 远离边界 → 仍 critical。
+
+    def test_unlabeled_switch_words_in_margin_exempted(self, monkeypatch, tmp_path):
+        """无 kind + desc 含换镜语义 + t 在边界 ±2s 内 → 正常换镜,不算异常。"""
+        _vlm_stub(monkeypatch, breaks=[
+            {"t": 1.4, "desc": "从街角场景直接切换到咖啡店门口，跨镜头正常交接"}])
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "b4.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "女主角"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "女主角"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        codes = {f["code"] for f in r["findings"] if f["code"] != "FINAL_NO_AUDIO"}
+        assert "VLM_BREAK" not in codes, r["findings"]
+        assert len(r["boundary_transitions"]) == 1
+        assert r["boundary_transitions"][0]["t"] == 1.4
+
+    def test_unlabeled_alarm_word_stays_critical(self, monkeypatch, tmp_path):
+        """缺 kind 但 desc 含告警词(29.18 类真实缺陷)→ 即使有"切换"也拦截。"""
+        _vlm_stub(monkeypatch, breaks=[
+            {"t": 1.4, "desc": "从品牌标志切换为纯色背景带slogan，疑似画面内容错位"}])
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "b5.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "A"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "A"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        codes = {f["code"] for f in r["findings"]}
+        assert "VLM_BREAK" in codes, r["findings"]
+        assert r["boundary_transitions"] == []
+
+    def test_unlabeled_switch_words_far_from_boundary_stays_critical(
+            self, monkeypatch, tmp_path):
+        """缺 kind + 换镜语义齐全但 t 远离任何真实边界 → 仍是镜头内突变。"""
+        _vlm_stub(monkeypatch, breaks=[
+            {"t": 4.9, "desc": "镜头切换到与分镜顺序不符的另一幕"}])
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "b6.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "A"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "A"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        codes = {f["code"] for f in r["findings"]}
+        assert "VLM_BREAK" in codes, r["findings"]
+        assert r["boundary_transitions"] == []
+
 
 class TestKeySanity:
     """轮9a(实跑事故回归):AGNES 凭据必须通过形状校验,任何非密钥内容
