@@ -650,6 +650,29 @@ class TestIdentityGate:
         r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
         assert r["identity"]["checked"] == 0, r["identity"]
 
+    def test_synonym_roles_now_paired(self, monkeypatch, tmp_path):
+        """轮24:『白领在办公』vs『上班族在地铁』经同义词归一后同角色,
+        必须比——旧逻辑字面不同被误判"不同角色"整对跳过,身份从不审。"""
+        _vlm_stub(monkeypatch)
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "p6.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "白领在办公室加班"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "上班族走进地铁"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        assert r["identity"]["checked"] == 1, r["identity"]
+
+    def test_gendered_synonym_roles_now_paired(self, monkeypatch, tmp_path):
+        """轮24:『女人』vs『女生』同样归一到同一规范角色后比。"""
+        _vlm_stub(monkeypatch)
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "p7.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "女人站在街角"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "女生推门进入"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        assert r["identity"]["checked"] == 1, r["identity"]
+
     def test_expanded_person_hints_paired(self, monkeypatch, tmp_path):
         """轮16 补表:『男生』这类主体此前不在表内,整镜身份判定被跳过。"""
         _vlm_stub(monkeypatch)

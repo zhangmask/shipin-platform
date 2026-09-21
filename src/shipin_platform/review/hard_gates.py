@@ -619,6 +619,24 @@ def _look_pinned(shots: list[dict], actor_anchor: str = "") -> bool:
     return False
 
 
+# 轮24:角色同义词归一化——「白领在办公」vs「上班族在地铁」本是同一类
+# 人,字面不同会被误判成"不同角色"而整对跳过,身份从不比对。先归一到
+# 规范角色再比交集;顾客vs店员这类真不同角色仍跳过。
+_ROLE_SYNONYMS = {
+    "女子": "女性", "女人": "女性", "女孩": "女性", "女生": "女性",
+    "男子": "男性", "男人": "男性", "男孩": "男性",
+    "消费者": "顾客", "用户": "顾客",
+    "孩子": "儿童", "少年": "儿童",
+    "白领": "上班族",
+}
+
+
+def _roles_of(subject: str) -> set:
+    """主体里声明了的规范角色集合(同义词已归一)。"""
+    return {_ROLE_SYNONYMS.get(r, r)
+            for r in _PERSON_ROLES if r in str(subject or "")}
+
+
 def _person_pair(a: dict, b: dict) -> bool:
     """相邻两镜是否应做跨镜身份判定(轮16 重写配对判据)。
 
@@ -626,9 +644,10 @@ def _person_pair(a: dict, b: dict) -> bool:
     同人不同写的相邻镜被跳过(coffee-v7 实证:S05→S05b 正是换人的
     镜界,却从未进过跨镜门,只有镜内通道兜到)。新规则:
       1) 两镜都是人物镜(_PERSON_HINTS);
-      2) 不构成「不同角色」——双方各有无交集的具体角色词时跳过
-         (顾客vs店员的合理切换不误判);一方或双方只用泛称
-         (主角/主人公…) → 判定为同一主人公,比。
+      2) 不构成「不同角色」——双方各自声明了无交集的规范角色时跳过
+        (顾客vs店员的合理切换不误判;轮24:白领vs上班族经同义词归一
+        后同角色,比);一方或双方只用泛称(主角/主人公…) → 判定为
+        同一主人公,比。
     """
     sa, sb = str(a.get("subject") or ""), str(b.get("subject") or "")
     if not _is_person_shot(sa) or not _is_person_shot(sb):
@@ -636,8 +655,8 @@ def _person_pair(a: dict, b: dict) -> bool:
     ta, tb = _subject_tokens(sa), _subject_tokens(sb)
     if ta & tb:
         return True  # 旧规则:词元重叠(同一描述的重复写法)
-    roles_a = {r for r in _PERSON_ROLES if r in sa}
-    roles_b = {r for r in _PERSON_ROLES if r in sb}
+    roles_a = _roles_of(sa)
+    roles_b = _roles_of(sb)
     if roles_a and roles_b and not (roles_a & roles_b):
         return False  # 双方明确不同角色(顾客vs店员)
     return True
