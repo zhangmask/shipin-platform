@@ -1006,6 +1006,86 @@ class TestTempHygiene:
         assert not leaked, f"审查后泄漏临时目录: {leaked[:5]}"
 
 
+class TestBlackFrameGate:
+    """轮22:黑帧检测(blackdetect)——审查链此前的空洞:闪帧有
+    transient_spikes、冻结有 motion_energy,「整段变黑」没有一门在看。"""
+
+    @staticmethod
+    def _black_clip(out: Path, black_at: float, black_dur: float,
+                    total: float = 8.0) -> Path:
+        """total 秒片段,black_at 起插入 black_dur 秒纯黑段,其余彩色。"""
+        out.parent.mkdir(parents=True, exist_ok=True)
+        a, b = black_at, black_at + black_dur
+        tail = total - b
+        subprocess.run(
+            [FFMPEG, "-y", "-loglevel", "error",
+             "-f", "lavfi", "-i", f"color=c=blue:s=320x240:r=24:duration={a}",
+             "-f", "lavfi", "-i",
+             f"color=c=black:s=320x240:r=24:duration={black_dur}",
+             "-f", "lavfi", "-i",
+             f"color=c=red:s=320x240:r=24:duration={tail}",
+             "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]",
+             "-map", "[v]", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+             str(out)],
+            capture_output=True, text=True, check=True)
+        return out
+
+    def test_clip_interior_black_is_critical(self, tmp_path):
+        from shipin_platform.review.clip_qc import qc_clip
+        clip = self._black_clip(tmp_path / "bk.mp4", 3.6, 0.8)
+        r = qc_clip(str(clip), shot_id="S02", expected_duration_sec=8.0)
+        codes = {f["code"] for f in r["findings"]}
+        assert "BLACK_FRAMES" in codes, r["findings"]
+        hit = next(f for f in r["findings"] if f["code"] == "BLACK_FRAMES")
+        assert hit["severity"] == "critical"
+        assert "3.6" in hit["message"] or "整段黑屏" in hit["message"]
+
+    def test_clip_edge_black_is_warning(self, tmp_path):
+        """贴边黑段(≤0.25s,生成淡入残留)只警告,不拦生成。"""
+        from shipin_platform.review.clip_qc import qc_clip
+        clip = self._black_clip(tmp_path / "bk_edge.mp4", 0.0, 0.5)
+        r = qc_clip(str(clip), shot_id="S01", expected_duration_sec=8.0)
+        codes = {f["code"] for f in r["findings"]}
+        assert "BLACK_FRAMES" not in codes
+        assert "BLACK_FRAMES_EDGE" in codes, r["findings"]
+
+    def test_clean_clip_no_black_finding(self, tmp_path):
+        from shipin_platform.review.clip_qc import qc_clip
+        clip = _make_motion_clip(tmp_path / "bk_ok.mp4", 4.0)
+        r = qc_clip(str(clip), shot_id="S01", expected_duration_sec=4.0)
+        assert not [f for f in r["findings"]
+                    if f["code"].startswith("BLACK_FRAMES")]
+
+    def test_final_black_away_from_boundary_is_critical(self, monkeypatch,
+                                                        tmp_path):
+        """终审层:黑段距镜头边界 >1.5s(排除叠化压黑过渡)→ critical。"""
+        _vlm_stub(monkeypatch)
+        from shipin_platform.review import hard_gates
+        clip = self._black_clip(tmp_path / "bk_final.mp4", 3.6, 0.8)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "主角"},
+            {"shot_id": "S02", "duration_sec": 4.0, "subject": "主角"},
+            {"shot_id": "S03", "duration_sec": 2.0, "subject": "主角"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=6,
+                                        context=ctx)
+        codes = {f["code"] for f in r["findings"]}
+        assert "FINAL_BLACK_FRAMES" in codes, r["findings"]
+
+    def test_final_black_near_boundary_exempted(self, monkeypatch, tmp_path):
+        """黑段贴在镜头边界 ±1.5s 内(叠化压黑过渡)→ 不拦。"""
+        _vlm_stub(monkeypatch)
+        from shipin_platform.review import hard_gates
+        clip = self._black_clip(tmp_path / "bk_bnd.mp4", 1.8, 0.3,
+                                total=6.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "主角"},
+            {"shot_id": "S02", "duration_sec": 4.0, "subject": "主角"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=6,
+                                        context=ctx)
+        assert "FINAL_BLACK_FRAMES" not in {f["code"]
+                                            for f in r["findings"]}
+
+
 class TestKeyframeGate:
     """轮21:关键帧 vs 分镜文本门——视频模型以 first_frame 为条件生成,
     关键帧跑偏整镜必歪;qc_clip 的 dHash 只比 clip 首帧 vs 参考图(同源

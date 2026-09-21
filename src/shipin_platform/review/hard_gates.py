@@ -1066,6 +1066,23 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
                 "severity": "warning", "code": "FINAL_TRANSIENT_SPIKES",
                 "message": (f"成片检测到 1 处镜头边界外的亮度瞬变闪帧"
                             f"(t={spikes[0]['t']}s)——建议复核该时刻")})
+        # 轮22:全片黑帧(blackdetect)。叠化拼接的边界两侧 ~1s 内允许
+        # 压黑过渡;此外的整段黑屏=生成失败/渲染残帧。与 per-clip 的
+        # BLACK_FRAMES 同源不同层:clip 层管素材,这里管成片。
+        from .clip_qc import black_spans as _black_spans
+        _bspans = _black_spans(video, min_dur=0.5)
+        deterministic["black_spans"] = _bspans
+        _bnds = _shot_boundaries(shots) if shots else []
+        _bad_black = [sp for sp in _bspans
+                      if sp[0] > 0.3 and sp[1] < video_dur - 0.3
+                      and all(abs(sp[0] - b) > 1.5 and abs(sp[1] - b) > 1.5
+                              for b in _bnds)]
+        if _bad_black:
+            det_findings.append({
+                "severity": "critical", "code": "FINAL_BLACK_FRAMES",
+                "message": (f"成片检测到 {len(_bad_black)} 处镜内整段黑屏"
+                            f"(t={[(round(s, 2), round(e, 2)) for s, e, _ in _bad_black]})"
+                            f"——生成失败/渲染残帧,需定位重生成")})
     except Exception as e:
         det_findings.append({"severity": "suggestion", "code": "DETERMINISTIC_PASS_ERROR",
                              "message": f"确定性结构检查失败: {e}"})

@@ -286,6 +286,37 @@ def vlm_morph_check(clip_path: str, samples: int = 3) -> dict:
                 "reason": f"VLM 变形检查失败: {type(exc).__name__}: {exc}"[:200]}
 
 
+# ── 轮22:黑帧检测(blackdetect) ─────────────────────────────────────
+# 审查链此前的空洞:闪帧有 transient_spikes、冻结有 motion_energy,
+# 但「整段变黑」(生成失败/转场穿帧/渲染残帧)没有任何一门在看——
+# VLM 看抽帧也可能只抽到黑帧两侧。blackdetect 是 ffmpeg 原生、
+# 零成本、逐帧精确。返回 [(start, end, dur)]。
+
+
+def black_spans(video: Path, min_dur: float = 0.4,
+                pix_th: float = 0.10) -> list[tuple[float, float, float]]:
+    """ffmpeg blackdetect → [(start, end, dur)]。never raises。"""
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-v", "info", "-i", str(video),
+             "-vf", f"blackdetect=d={min_dur}:pix_th={pix_th}",
+             "-an", "-f", "null", "-"],
+            capture_output=True, text=True)
+    except Exception:
+        return []
+    text = (r.stderr or "") + (r.stdout or "")
+    starts = [float(m) for m in re.findall(r"black_start:\s*([0-9.]+)", text)]
+    ends = [float(m) for m in re.findall(r"black_end:\s*([0-9.]+)", text)]
+    durs = [float(m) for m in re.findall(
+        r"black_duration:\s*([0-9.]+)", text)]
+    spans = []
+    for i, s in enumerate(starts):
+        e = ends[i] if i < len(ends) else s
+        d = durs[i] if i < len(durs) else (e - s)
+        spans.append((s, e, d))
+    return spans
+
+
 # ── the gate itself ───────────────────────────────────────────────────
 
 
@@ -377,6 +408,21 @@ def qc_clip(
             "message": (f"镜头{shot_id} t={_s['t']}s 存在亮度瞬变"
                         f"(Δ={_s['delta']}/255, 持续 {_s['t_width']} 个采样帧)"
                         f"——闪白/闪黑/单帧崩坏帧,必须重新生成")})
+
+    # 4c) 黑帧(轮22):整段变黑=交付级画面异常。贴边(≤0.25s,生成的淡入
+    #     淡出残留)只警告;镜内黑段 critical——此前闪帧/冻结都有门,
+    #     「整段黑屏」是审查链的空洞。
+    _bspans = black_spans(v)
+    checks["black"] = {"count": len(_bspans), "spans": _bspans}
+    for _bs, _be, _bd in _bspans:
+        _edge = _bs <= 0.25 or _be >= dur - 0.25
+        findings.append({
+            "severity": "warning" if _edge else "critical",
+            "code": "BLACK_FRAMES_EDGE" if _edge else "BLACK_FRAMES",
+            "message": (f"镜头{shot_id} {_bs:.2f}~{_be:.2f}s 整段黑屏"
+                        f"({_bd:.2f}s)——"
+                        + ("边缘淡入淡出残留,建议复核" if _edge else
+                           "生成失败/渲染残帧,必须重新生成"))})
 
     # 5) first frame vs reference image
     checks["reference_match"] = {"enabled": bool(reference_image)}
