@@ -722,6 +722,82 @@ class TestShotReview:
         assert r["verdict"] == "fix"
 
 
+def _narr_clip(out: Path, dur: float = 6.0, sound_until: float = 1.0) -> Path:
+    """视频轨 + 音频轨:前 sound_until 秒有正弦,其后静音(测旁白门用)。
+    volume=enable 的反向启用:t>sound_until 时音量 0(禁用期是直通,
+    不能写成 enable='lt(t,x)')。"""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [FFMPEG, "-y", "-loglevel", "error",
+         "-f", "lavfi", "-i", f"color=c=blue:s=320x240:r=24:duration={dur}",
+         "-f", "lavfi", "-i", f"sine=frequency=440:duration={dur}",
+         "-map", "0:v", "-map", "1:a",
+         "-af", f"volume=enable='gt(t,{sound_until})':volume=0",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+         "-shortest", str(out)],
+        capture_output=True, text=True, check=True)
+    return out
+
+
+class TestNarrationPresence:
+    """轮14:每镜旁白声轨存在性(确定性)——TTS 缺失/音频错位时画面照演
+    但嘴上没词;「符不符合剧本」此前只核视频,这是音频侧第一道门。"""
+
+    def test_silent_window_is_critical(self, tmp_path):
+        from shipin_platform.review.hard_gates import check_narration_presence
+        clip = _narr_clip(tmp_path / "n.mp4")  # 0~1s 有声,1~6s 静音
+        shots = [
+            {"shot_id": "S01", "narration": "深夜街头", "narr_at": 0.2,
+             "duration_sec": 2.0},
+            {"shot_id": "S02", "narration": "加班后的倦", "narr_at": 3.5,
+             "duration_sec": 2.0}]
+        r = check_narration_presence(str(clip), shots)
+        codes = {f["code"] for f in r["findings"]}
+        assert r["verdict"] == "fix"
+        assert "NARRATION_MISSING" in codes
+        hit = next(f for f in r["findings"]
+                   if f["code"] == "NARRATION_MISSING")
+        assert "S02" in hit["message"], hit
+        assert r["stats"]["checked"] == 2  # S01 有声不计,S02 缺失计
+
+    def test_sounding_window_passes(self, tmp_path):
+        from shipin_platform.review.hard_gates import check_narration_presence
+        clip = _narr_clip(tmp_path / "n_ok.mp4")
+        shots = [{"shot_id": "S01", "narration": "有旁白", "narr_at": 0.2,
+                  "duration_sec": 2.0}]
+        r = check_narration_presence(str(clip), shots)
+        assert r["verdict"] == "ok", r["findings"]
+
+    def test_no_narration_shot_skipped(self, tmp_path):
+        """纯画面镜(手冲特写/logo 落版)不要求有声——不查更不报。"""
+        from shipin_platform.review.hard_gates import check_narration_presence
+        clip = _narr_clip(tmp_path / "n_skip.mp4")
+        shots = [{"shot_id": "S04", "narration": "", "narr_at": 4.0,
+                  "duration_sec": 2.0}]
+        r = check_narration_presence(str(clip), shots)
+        assert r["verdict"] == "ok"
+        assert r["stats"]["checked"] == 0
+
+    def test_no_audio_track_is_critical(self, tmp_path):
+        from shipin_platform.review.hard_gates import check_narration_presence
+        clip = _make_motion_clip(tmp_path / "n_noaud.mp4", 4.0)  # 无音轨
+        shots = [{"shot_id": "S01", "narration": "有词无轨", "narr_at": 0.2,
+                  "duration_sec": 2.0}]
+        r = check_narration_presence(str(clip), shots)
+        assert r["verdict"] == "fix"
+        assert r["findings"][0]["code"] == "NO_AUDIO_TRACK"
+
+    def test_missing_narr_at_skipped(self, tmp_path):
+        """缺 narr_at(旧项目数据)无法定位窗口——跳过,不误报。"""
+        from shipin_platform.review.hard_gates import check_narration_presence
+        clip = _narr_clip(tmp_path / "n_noat.mp4")
+        shots = [{"shot_id": "S01", "narration": "有词无 at", "narr_at": None,
+                  "duration_sec": 2.0}]
+        r = check_narration_presence(str(clip), shots)
+        assert r["verdict"] == "ok"
+        assert r["stats"]["checked"] == 0
+
+
 class TestTimelineAccounting:
     def test_missing_shot_is_critical(self):
         from shipin_platform.review.hard_gates import check_timeline

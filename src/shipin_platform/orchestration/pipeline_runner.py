@@ -1159,7 +1159,9 @@ def run_assemble_phase(project_id: str, store) -> dict:
                       "motion": str(s.get("motion"))[:40],
                       "narration": str(s.get("narration") or "")[:40]}
                      for s, t in zip(shots, tl)]}
-    from shipin_platform.review.hard_gates import vlm_review_final, check_timeline
+    from shipin_platform.review.hard_gates import (vlm_review_final,
+                                                   check_timeline,
+                                                   check_narration_presence)
     # M7(2026-09-21 审计):成片层的素材复用/时序红线在此自动挂载为硬门,
     # 不再是工厂手动 API 端点。timeline 按 align 窗口构造:每镜一条,
     # at=该镜绝对开始时间、end=start+window,dur=window_sec。
@@ -1185,6 +1187,23 @@ def run_assemble_phase(project_id: str, store) -> dict:
     out["timeline_check"] = {"verdict": tchk.get("verdict"),
                              "findings": tchk.get("findings", [])}
     fv = vlm_review_final(str(work / "final.mp4"), frames_count=16, context=ctx)
+    # 轮14:每镜旁白声轨存在性(确定性,ASR-free)——TTS 失败/音频错位时
+    # 画面照演但嘴上没词,「符不符合剧本」此前只核视频,音频侧在此补门
+    _narr_shots = [{"shot_id": s["shot_id"],
+                    "narration": s.get("narration"),
+                    "narr_at": (t.get("narr_at") if isinstance(t, dict)
+                                else None),
+                    "audio_start_sec": (t.get("audio_start_sec")
+                                        if isinstance(t, dict) else None),
+                    "tts_sec": (t.get("tts_sec") if isinstance(t, dict)
+                                else None),
+                    "duration_sec": (t.get("window_sec") if isinstance(t, dict)
+                                     else None)}
+                   for s, t in zip(shots, tl)]
+    nchk = check_narration_presence(str(work / "final.mp4"), _narr_shots)
+    _save(project_id, "narration_check.json", nchk)
+    out["narration_check"] = {"verdict": nchk.get("verdict"),
+                              "findings": nchk.get("findings", [])}
     if tchk.get("verdict") == "fix":
         # timeline 红线(fix)直接并入终验——不能只靠 VLM 软提示
         fv = dict(fv)
@@ -1196,9 +1215,12 @@ def run_assemble_phase(project_id: str, store) -> dict:
     # 终验——clip 自身演错剧本/镜内换人在此统一阻断,不随 assemble 的
     # master 补帧溜进终片。缺文件(旧项目/未跑 generate)时无操作。
     # 轮13:master 补料 part 的实际入拼片段复审(parts_review.json)同一范式。
+    # 轮14:旁白声轨缺失(narration_check.json)同一范式。
     _sr_all = _load(project_id, "shots_review.json") or {}
     _pr_all = _load(project_id, "parts_review.json") or {}
+    _nc = _load(project_id, "narration_check.json") or {}
     _sr_crit = [f for _r in list(_sr_all.values()) + list(_pr_all.values())
+                + [_nc]
                 for f in (_r.get("findings") or [])
                 if f.get("severity") == "critical"]
     if _sr_crit:
@@ -1206,7 +1228,8 @@ def run_assemble_phase(project_id: str, store) -> dict:
         fv["findings"] = list(fv.get("findings") or []) + _sr_crit
         fv["verdict"] = "fix"
         fv["reason"] = ((fv.get("reason") or "")
-                        + f"；单镜诊断 {len(_sr_crit)} 处 critical")
+                        + f"；附属门(单镜诊断/入拼复审/旁白声轨) "
+                          f"{len(_sr_crit)} 处 critical")
     _save(project_id, "final_review.json", fv)
     out["final_review"] = {"verdict": fv.get("verdict"),
                            "deterministic": fv.get("deterministic"),

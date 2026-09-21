@@ -174,6 +174,132 @@ def check_timeline(timeline, duration_sec: Optional[float] = None,
     return {"verdict": verdict, "findings": findings, "stats": stats}
 
 
+# ── 轮14:每镜旁白声轨存在性门(确定性,ASR-free) ──────────────────────
+# 「符不符合剧本」此前只核视频:某镜 TTS 失败/音频错位时,画面照演但
+# 嘴上没词,旧门只有全片 FINAL_NO_AUDIO 警告,抓不住单镜缺失。
+# 按 align 的 narr_at 窗口用 silencedetect 核验:有旁白台词的镜,
+# 其窗口内必须真有超过阈值的有声段。
+_SIL_END_RE = re.compile(r"silence_end:\s*([0-9.]+)")
+_NARR_MIN_SOUND_RATIO = 0.15   # 窗口内有声占比下限(低于=偏薄,警告)
+_NARR_SILENCE_DB = -45.0       # 静音判定阈值(dB)
+
+
+def _silence_spans(video: str, noise_db: float = _NARR_SILENCE_DB,
+                   min_dur: float = 0.35) -> list[tuple[float, float]]:
+    """ffmpeg silencedetect → [(start, end)] 静音段(秒)。never raises。"""
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-v", "info", "-i", str(video),
+             "-af", f"silencedetect=noise={noise_db}dB:d={min_dur}",
+             "-f", "null", "-"],
+            capture_output=True, text=True)
+    except Exception:
+        return []
+    text = (r.stderr or "") + (r.stdout or "")
+    starts = [float(m) for m in re.findall(
+        r"silence_start:\s*([0-9.]+)", text)]
+    ends = [float(m) for m in _SIL_END_RE.findall(text)]
+    spans: list[tuple[float, float]] = []
+    for i, s in enumerate(starts):
+        # 个别构建在 EOF 不输出 silence_end——尾部静音延到大值兜底,
+        # 否则 [start, start+d] 之外的有声会被漏算成"有旁白"
+        e = ends[i] if i < len(ends) else s + 3600.0
+        spans.append((s, e))
+    return spans
+
+
+def check_narration_presence(video: str, shots: list[dict]) -> dict:
+    """每镜旁白声轨存在性(轮14,确定性,无 ASR/模型依赖)。
+
+    shots 每项需含 {shot_id, narration, narr_at|audio_start_sec,
+    tts_sec?, duration_sec(align 窗口)};只有 narration 非空且起点可解析的
+    镜才查——纯画面镜(手冲特写/logo 落版)不要求有声。判定:
+      - 旁白窗口 [at, at+tts_sec] 整体落在静音段内 → critical
+        NARRATION_MISSING(TTS 缺失/音频错位:画面照演,嘴上没词);
+      - 有声占比 < _NARR_MIN_SOUND_RATIO → warning NARRATION_THIN;
+      - 成片无任何音轨 → critical NO_AUDIO_TRACK(整轨缺失)。
+    返回 {"verdict": "ok"|"fix", "findings": [...], "stats": {...}}。
+    """
+    findings: list[dict] = []
+    checked = 0
+    try:
+        has_audio = _has_audio_stream(video)
+    except Exception:
+        has_audio = True  # 探测失败不误判,交由既有 FINAL_NO_AUDIO 门
+    if not has_audio:
+        return {"verdict": "fix",
+                "findings": [{"severity": "critical", "code": "NO_AUDIO_TRACK",
+                              "message": "成片无音轨——旁白/氛围声全部缺失,"
+                                         "音画审查不可用"}],
+                "stats": {"checked": 0}}
+    spans = _silence_spans(video)
+
+    def _sounding(a: float, b: float) -> float:
+        """[a,b] 内非静音时长。"""
+        if b <= a:
+            return 0.0
+        silent = 0.0
+        for s, e in spans:
+            lo, hi = max(s, a), min(e, b)
+            if hi > lo:
+                silent += hi - lo
+        return (b - a) - silent
+
+    for s in shots:
+        if not isinstance(s, dict):
+            continue
+        text = str(s.get("narration") or "").strip()
+        if not text:
+            continue
+        # align 时间轴两种历史字段名都认:narr_at(新) / audio_start_sec(旧)
+        raw_at = s.get("narr_at")
+        if raw_at is None:
+            raw_at = s.get("audio_start_sec")
+        try:
+            at = float(raw_at)
+        except (TypeError, ValueError):
+            continue
+        # 窗口优先 tts_sec(该镜旁白真实时长),缺省回退 align 窗口
+        try:
+            tts = float(s.get("tts_sec") or 0)
+        except (TypeError, ValueError):
+            tts = 0.0
+        win = tts if tts > 0.2 else (float(s.get("duration_sec") or 0) or 3.0)
+        a, b = max(at, 0.0), max(at, 0.0) + min(win, 10.0)
+        checked += 1
+        sound = _sounding(a, b)
+        ratio = sound / (b - a) if b > a else 0.0
+        sid = s.get("shot_id", "?")
+        if sound <= 0.05:
+            findings.append({
+                "severity": "critical", "code": "NARRATION_MISSING",
+                "message": (f"镜头{sid} 旁白窗口 {a:.2f}~{b:.2f}s 全程静音——"
+                            f"TTS 缺失或音频错位(画面照演,嘴上没词): "
+                            f"{text[:40]}")})
+        elif ratio < _NARR_MIN_SOUND_RATIO:
+            findings.append({
+                "severity": "warning", "code": "NARRATION_THIN",
+                "message": (f"镜头{sid} 旁白窗口 {a:.2f}~{b:.2f}s 有声占比 "
+                            f"仅 {ratio:.0%}(阈值 {_NARR_MIN_SOUND_RATIO:.0%})"
+                            f"——旁白可能被截断/音量过低")})
+    verdict = "ok" if not any(f["severity"] == "critical"
+                              for f in findings) else "fix"
+    return {"verdict": verdict, "findings": findings,
+            "stats": {"checked": checked}}
+
+
+def _has_audio_stream(video: str) -> bool:
+    """ffprobe 探测是否存在音轨(never raises)。"""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0",
+             str(video)], capture_output=True, text=True)
+        return bool((r.stdout or "").strip())
+    except Exception:
+        return True
+
+
 # ── final-video VLM gate ───────────────────────────────────────────
 
 
