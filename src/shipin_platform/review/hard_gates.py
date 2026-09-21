@@ -310,6 +310,97 @@ def _has_audio_stream(video: str) -> bool:
         return True
 
 
+# ── 轮21:关键帧图 vs 分镜文本(视频生成前的第一道画面门) ─────────────
+# qc_clip 的 dHash 只比「clip 首帧 vs 参考图」——同源,几乎必然一致;
+# 而视频模型以 first_frame 为条件生成,关键帧跑偏则整镜必歪,且要到
+# 视频阶段甚至终审才发现(返工最贵的一环)。在 generate 里、视频生成
+# 前先把关键帧对照分镜主体/场景文本审掉。
+
+
+def vlm_image_matches_text(image_path: str, expect: dict, key: str) -> dict:
+    """问 VLM 关键帧图是否体现分镜文本(主体/场景)。never raises。
+
+    信息不足无法判断时 match=true(不冤控)——宁可漏报不可误杀,
+    误杀的代价是无限重生成。"""
+    if not key:
+        return {"available": False, "match": None,
+                "reason": "AGNES_KEY 未配置"}
+    p = Path(image_path)
+    if not p.is_file():
+        return {"available": False, "match": None, "reason": "关键帧不存在"}
+    subj = str(expect.get("subject") or "")[:60]
+    scene = str(expect.get("scene") or "")[:40]
+    if not subj and not scene:
+        return {"available": True, "match": True,
+                "reason": "无文本预期,跳过"}
+    try:
+        with open(p, "rb") as fh:
+            b64 = base64.b64encode(fh.read()).decode()
+        prompt = (
+            "下图是广告分镜的首帧关键图。只依据画面事实判断它是否体现了"
+            f"分镜的文字描述——主体[{subj}]、场景[{scene}]。"
+            "主体身份/场景类型不符即不符(构图/光线/景别差异不算);"
+            "信息不足无法判断时 match 给 true。"
+            '返回严格 JSON：{"match": true/false, "reason": "..."}'
+        )
+        resp = _ask_vlm(
+            [{"type": "image_url",
+              "image_url": {"url": "data:image/png;base64," + b64}}],
+            prompt, key, max_tokens=300)
+        m = re.search(r"\{.*\}", resp, re.S)
+        parsed = json.loads(m.group(0)) if m else {}
+        # 与轮11 _same_person 同一教训:载荷没有 match 字段(协议错配/
+        # 路由错/JSON 截断)→ available=False 跳过,绝不让「解析失败」
+        # 冒充「不符」的 critical——一次 hiccup 不该拦掉整镜
+        if "match" not in parsed:
+            return {"available": False, "match": None,
+                    "reason": "VLM 未返回 match 字段(载荷不匹配),跳过本次审图"}
+        return {"available": True, "match": bool(parsed.get("match")),
+                "reason": str(parsed.get("reason", ""))[:200]}
+    except Exception as e:
+        return {"available": False, "match": None,
+                "reason": f"VLM 关键帧审图失败: {type(e).__name__}: {e}"[:200]}
+
+
+def check_keyframes(shots: list[dict], key: Optional[str] = None) -> dict:
+    """逐镜关键帧 vs 分镜文本(轮21)。
+
+    shots: [{shot_id, first_frame, subject, scene}];
+    返回 {"verdict": "ok"|"fix", "findings": [...], "stats": {...}}。
+    finding 带 shot_id 字段,critical 由调用方并入 shots_review 既有
+    合并通道(终审统一阻断)。"""
+    key = key or _vlm_credentials()
+    findings: list[dict] = []
+    checked, skipped = 0, 0
+    if not key:
+        return {"verdict": "ok", "findings": [], "stats": {"checked": 0},
+                "reason": "AGNES_KEY 未配置，跳过关键帧审图"}
+    for s in shots:
+        if not isinstance(s, dict):
+            continue
+        img = s.get("first_frame")
+        subj = str(s.get("subject") or "").strip()
+        scene = str(s.get("scene") or "").strip()
+        if not img or not Path(img).is_file() or not (subj or scene):
+            skipped += 1
+            continue
+        r = vlm_image_matches_text(img, s, key)
+        if not r.get("available"):
+            continue
+        checked += 1
+        if not r.get("match"):
+            findings.append({
+                "shot_id": s.get("shot_id"),
+                "severity": "critical", "code": "KEYFRAME_MISMATCH",
+                "message": (f"镜头{s.get('shot_id', '?')} 关键帧与分镜文本不符"
+                            f"(主体[{subj[:24]}] 场景[{scene[:16]}]): "
+                            f"{r.get('reason', '')[:100]}——视频以该帧为条件"
+                            f"生成必歪,应重新生成关键帧")})
+    return {"verdict": "ok" if not findings else "fix",
+            "findings": findings,
+            "stats": {"checked": checked, "skipped": skipped}}
+
+
 # ── final-video VLM gate ───────────────────────────────────────────
 
 

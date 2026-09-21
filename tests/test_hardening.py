@@ -1006,6 +1006,86 @@ class TestTempHygiene:
         assert not leaked, f"审查后泄漏临时目录: {leaked[:5]}"
 
 
+class TestKeyframeGate:
+    """轮21:关键帧 vs 分镜文本门——视频模型以 first_frame 为条件生成,
+    关键帧跑偏整镜必歪;qc_clip 的 dHash 只比 clip 首帧 vs 参考图(同源
+    几乎必然一致),没人审过参考图本身。"""
+
+    @staticmethod
+    def _kf_stub(monkeypatch, *, match=True, payload=None):
+        import json as _json
+        from shipin_platform.review import hard_gates
+
+        def ask(images, prompt, key, max_tokens=300):
+            if payload is not None:
+                return payload
+            return _json.dumps({"match": match, "reason": "判定理由"},
+                               ensure_ascii=False)
+
+        monkeypatch.setattr(hard_gates, "_vlm_credentials", lambda: "fake-key")
+        monkeypatch.setattr(hard_gates, "_ask_vlm", ask)
+
+    @staticmethod
+    def _png(p: Path) -> str:
+        from PIL import Image
+        Image.new("RGB", (96, 72), (120, 80, 40)).save(p)
+        return str(p)
+
+    def test_keyframe_mismatch_flagged(self, monkeypatch, tmp_path):
+        self._kf_stub(monkeypatch, match=False)
+        from shipin_platform.review.hard_gates import check_keyframes
+        img = self._png(tmp_path / "kf.png")
+        r = check_keyframes([{"shot_id": "S02", "first_frame": img,
+                              "subject": "女主角在办公室",
+                              "scene": "办公室"}])
+        assert r["verdict"] == "fix"
+        hit = r["findings"][0]
+        assert hit["code"] == "KEYFRAME_MISMATCH"
+        assert hit["shot_id"] == "S02"
+        assert "关键帧与分镜文本不符" in hit["message"]
+
+    def test_keyframe_match_passes(self, monkeypatch, tmp_path):
+        self._kf_stub(monkeypatch, match=True)
+        from shipin_platform.review.hard_gates import check_keyframes
+        img = self._png(tmp_path / "kf_ok.png")
+        r = check_keyframes([{"shot_id": "S02", "first_frame": img,
+                              "subject": "女主角在办公室",
+                              "scene": "办公室"}])
+        assert r["verdict"] == "ok", r["findings"]
+        assert r["stats"]["checked"] == 1
+
+    def test_no_key_skips(self, monkeypatch, tmp_path):
+        from shipin_platform.review import hard_gates
+        monkeypatch.setattr(hard_gates, "_vlm_credentials", lambda: "")
+        img = self._png(tmp_path / "kf_nk.png")
+        r = hard_gates.check_keyframes([{"shot_id": "S01",
+                                         "first_frame": img,
+                                         "subject": "主角", "scene": "街头"}])
+        assert r["verdict"] == "ok"
+        assert r["stats"]["checked"] == 0
+
+    def test_missing_frame_skipped(self, monkeypatch, tmp_path):
+        self._kf_stub(monkeypatch, match=False)
+        from shipin_platform.review.hard_gates import check_keyframes
+        r = check_keyframes([{"shot_id": "S01",
+                              "first_frame": str(tmp_path / "nope.png"),
+                              "subject": "主角", "scene": "街头"}])
+        assert r["verdict"] == "ok"
+        assert r["stats"]["skipped"] == 1
+
+    def test_unparseable_payload_not_a_verdict(self, monkeypatch, tmp_path):
+        """载荷没有 match 字段(协议错配/路由错)→ available=False 跳过,
+        不冒充『不符』的 critical(与轮11 _same_person 同一教训)。"""
+        self._kf_stub(monkeypatch,
+                      payload='{"frames": [], "brand_seen": true}')
+        from shipin_platform.review.hard_gates import check_keyframes
+        img = self._png(tmp_path / "kf_junk.png")
+        r = check_keyframes([{"shot_id": "S01", "first_frame": img,
+                              "subject": "主角", "scene": "街头"}])
+        assert r["verdict"] == "ok", r["findings"]
+        assert r["stats"]["checked"] == 0
+
+
 class TestTimelineAccounting:
     def test_missing_shot_is_critical(self):
         from shipin_platform.review.hard_gates import check_timeline

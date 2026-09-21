@@ -781,6 +781,30 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
             continue
         dur = float(s.get("duration_sec") or 3)
         clip = work / f"{sid}_clip.mp4"
+        # 轮21:关键帧 vs 分镜文本门——视频模型以 first_frame 为条件
+        # 生成,关键帧跑偏整镜必歪,而 qc_clip 的 dHash 只比「clip 首帧
+        # vs 参考图」(同源几乎必然一致),没人审过参考图本身。视频生成
+        # 前先审图:每镜审一次(关键帧路径变化即重审),critical 并入
+        # shots_review 既有合并通道由终审统一阻断。
+        _kf_stamp = str(mrec.get("first_frame") or "")
+        if mrec.get("keyframe_review_of") != _kf_stamp:
+            try:
+                from shipin_platform.review.hard_gates import check_keyframes
+                _kf = check_keyframes([{
+                    "shot_id": sid,
+                    "first_frame": mrec.get("first_frame"),
+                    "subject": s.get("subject"),
+                    "scene": s.get("scene")}])
+                mrec["keyframe_review_of"] = _kf_stamp
+                mrec["keyframe_review"] = _kf.get("verdict")
+                if _kf.get("findings"):
+                    _sr = _load(project_id, "shots_review.json") or {}
+                    _sr[f"__keyframe_{sid}__"] = {
+                        "verdict": _kf.get("verdict"),
+                        "findings": _kf.get("findings") or []}
+                    _save(project_id, "shots_review.json", _sr)
+            except Exception as e:
+                mrec["keyframe_review"] = f"error: {str(e)[:120]}"
         attempts = []
         for attempt in range(3):
             # 重试阶梯(v6 实证):1) 原提示词 2) 固定机位+原运动
