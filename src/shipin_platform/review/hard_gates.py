@@ -462,13 +462,55 @@ def _same_person(imgs: list, key: str) -> dict:
 # ── 轮11a(2026-09-21):镜内人物一致性判定所需的「人物镜头」识别 ─────────
 # 只有主体描述指向「人」的镜头才做首末帧对比:手冲特写、logo 落版等
 # 无人物画面交给 VLM 判"是否同一人"只会得到无意义结论。
-_PERSON_HINTS = ("主角", "女子", "女人", "女性", "女孩",
-                 "男子", "男人", "男性", "咖啡师", "店员", "顾客", "老人",
-                 "孩子", "少年", "青年", "人物", "模特", "上班族", "白领")
+# 轮16:补 男女/职业词——"男生在加班""程序员坐下"这类主体此前不在表内,
+# 整镜的身份判定被静默跳过。只用复合词不用单字"男/女":「女包」
+# 「男装」等商品镜不该被当人物镜。
+_PERSON_HINTS = ("主角", "主人公", "人物", "模特",
+                 "女子", "女人", "女性", "女孩", "女生", "男女",
+                 "男子", "男人", "男性", "男生",
+                 "咖啡师", "店员", "顾客", "消费者", "用户",
+                 "老人", "孩子", "少年", "青年", "大学生", "学生",
+                 "上班族", "白领", "程序员", "设计师", "博主",
+                 "创业者", "主播", "演员", "舞者", "歌手", "厨师",
+                 "司机", "医生", "教师", "主持人", "嘉宾")
+
+# 轮16:具体角色词——相邻两镜各自声明了**不同**角色时不做身份判定
+# (「顾客」vs「店员」是分镜本意的合理切换);泛称(主角/主人公…)不在此列
+_PERSON_ROLES = ("顾客", "店员", "咖啡师", "消费者", "用户",
+                 "老人", "孩子", "少年", "大学生", "学生",
+                 "女子", "女人", "女性", "女孩", "女生",
+                 "男子", "男人", "男性", "男生",
+                 "上班族", "白领", "程序员", "设计师", "博主",
+                 "创业者", "主播", "演员", "舞者", "歌手", "厨师",
+                 "司机", "医生", "教师", "主持人", "嘉宾", "模特")
 
 
 def _is_person_shot(subject: str) -> bool:
     return any(h in str(subject or "") for h in _PERSON_HINTS)
+
+
+def _person_pair(a: dict, b: dict) -> bool:
+    """相邻两镜是否应做跨镜身份判定(轮16 重写配对判据)。
+
+    旧规则只认主体词元精确重叠——「主角端起咖啡杯」vs「主角」这类
+    同人不同写的相邻镜被跳过(coffee-v7 实证:S05→S05b 正是换人的
+    镜界,却从未进过跨镜门,只有镜内通道兜到)。新规则:
+      1) 两镜都是人物镜(_PERSON_HINTS);
+      2) 不构成「不同角色」——双方各有无交集的具体角色词时跳过
+         (顾客vs店员的合理切换不误判);一方或双方只用泛称
+         (主角/主人公…) → 判定为同一主人公,比。
+    """
+    sa, sb = str(a.get("subject") or ""), str(b.get("subject") or "")
+    if not _is_person_shot(sa) or not _is_person_shot(sb):
+        return False
+    ta, tb = _subject_tokens(sa), _subject_tokens(sb)
+    if ta & tb:
+        return True  # 旧规则:词元重叠(同一描述的重复写法)
+    roles_a = {r for r in _PERSON_ROLES if r in sa}
+    roles_b = {r for r in _PERSON_ROLES if r in sb}
+    if roles_a and roles_b and not (roles_a & roles_b):
+        return False  # 双方明确不同角色(顾客vs店员)
+    return True
 
 
 def _compare_person(video: Path, ta: float, tb: float, key: str) -> dict:
@@ -506,23 +548,25 @@ def _identity_finding(a_label: str, b_label: str, r: dict, intra: bool) -> dict:
 
 def _identity_gate(video: Path, shots: list[dict], key: str) -> dict:
     """人物一致性双通道:
-    1) 跨镜:相邻两镜「主体词元一致」时才要求同一人(不同角色则跳过,
-       避免把『顾客』vs『店员』的合理切换误判为换头)。每对镜各抽中帧问 VLM;
+    1) 跨镜:相邻两镜按 _person_pair 判定是否需要比(都是人物镜且不
+       构成不同角色即比——「顾客」vs「店员」的合理切换仍跳过,
+       「主角端起咖啡杯」vs「主角」的同人不同写不再被漏掉)。
+       每对镜各抽中帧问 VLM;
     2) 镜内(轮11a):主体为「人」且时长≥1.5s 的镜头,抽首帧(15%)与末帧
-       (85%)对比——coffee-v7 实测 S02 在 t=4.03s 镜内换装、S06 在
-       19.89→21.5s 镜内换人,这类同一镜头内部的更换此前只能靠跨镜中帧
-       间接撞见且归属错位(报成 S06→S07 边界),现在直接钉在该镜上。
+       (85%)对比——coffee-v7 实测 S02 在 t=4.03s 镜内换装、S05b 窗口
+       头部换人,这类同一镜头内部的更换此前只能靠跨镜中帧间接撞见且
+       归属错位,现在直接钉在该镜上。
     只有在 VLM 判定"不是同一人"时输出 findings。审计盲区①(A 节)的落地。"""
     pairs, checked, findings = [], 0, []
     for i in range(len(shots) - 1):
         a, b = shots[i], shots[i + 1]
         if not isinstance(a, dict) or not isinstance(b, dict):
             continue
-        ta = _subject_tokens(a.get("subject"))
-        tb = _subject_tokens(b.get("subject"))
-        if not ta or not tb or not (ta & tb):
-            continue  # 主体无共享词元 = 分镜本意是不同人/物,不做跨镜身份判定
-        pairs.append((i, i + 1))
+        # 轮16:配对判据从「主体词元精确重叠」升级为 _person_pair——
+        # 同人不同写(「主角端起咖啡杯」vs「主角」)的相邻镜必须比,
+        # 明确不同角色(顾客vs店员)仍跳过
+        if _person_pair(a, b):
+            pairs.append((i, i + 1))
     for i, j in pairs:
         a, b = shots[i], shots[j]
         # 两镜的镜头中帧(绝对时间):镜头起点=此前所有窗口时长之和

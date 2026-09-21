@@ -609,6 +609,68 @@ class TestIdentityGate:
         assert r["identity"]["checked"] == 0
         assert "IDENTITY_SWITCH" not in {f["code"] for f in r["findings"]}
 
+    # ── 轮16:跨镜配对判据重写(_person_pair) ──────────────────────────
+    # 旧规则只认主体词元精确重叠:「主角端起咖啡杯」vs「主角」的同人
+    # 不同写被跳过(coffee-v7 实证 S05→S05b 换人镜界从未进过跨镜门);
+    # 「男生」「程序员」等主体不在旧 _PERSON_HINTS 表内,整镜被静默跳过。
+
+    def test_generic_subject_variants_now_paired(self, monkeypatch, tmp_path):
+        """同人不同写(动作描述 vs 泛称)必须比——旧规则整个跳过。"""
+        _vlm_stub(monkeypatch)
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "p1.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S05", "duration_sec": 2.0, "subject": "主角端起咖啡杯"},
+            {"shot_id": "S05b", "duration_sec": 2.0, "subject": "主角"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        assert r["identity"]["checked"] == 1, r["identity"]
+
+    def test_same_role_variants_paired(self, monkeypatch, tmp_path):
+        """同一角色的不同动作描述同样要比(咖啡师注水 → 咖啡师递杯)。"""
+        _vlm_stub(monkeypatch)
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "p2.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "咖啡师注水冲泡"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "咖啡师递出咖啡杯"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        assert r["identity"]["checked"] == 1, r["identity"]
+
+    def test_distinct_roles_still_skipped(self, monkeypatch, tmp_path):
+        """双方明确不同角色(咖啡师 vs 顾客)仍跳过——合理切换不误判。"""
+        _vlm_stub(monkeypatch)
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "p3.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "咖啡师在吧台冲煮"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "顾客坐在座位区"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        assert r["identity"]["checked"] == 0, r["identity"]
+
+    def test_expanded_person_hints_paired(self, monkeypatch, tmp_path):
+        """轮16 补表:『男生』这类主体此前不在表内,整镜身份判定被跳过。"""
+        _vlm_stub(monkeypatch)
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "p4.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "男生在深夜街头独行"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "男生坐在咖啡店里"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        assert r["identity"]["checked"] == 1, r["identity"]
+        assert r["identity"]["intra_checked"] == 2
+
+    def test_non_person_subject_still_skipped(self, monkeypatch, tmp_path):
+        """商品镜(女包特写)不能因单字『女』被当人物镜——只用复合词。"""
+        _vlm_stub(monkeypatch)
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "p5.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "红色女包特写"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "男装陈列架"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        assert r["identity"]["checked"] == 0
+        assert r["identity"]["intra_checked"] == 0
+
     # ── 轮11a:镜内人物一致性(首帧 vs 末帧) ─────────────────────────
     # coffee-v7 实测教训:S02 在 t=4.03s 镜内换装、S06 在 19.89→21.5s
     # 镜内换人——同一镜头内部的更换此前只能靠跨镜中帧间接撞见,且归属
