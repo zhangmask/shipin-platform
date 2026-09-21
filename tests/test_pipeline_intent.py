@@ -97,6 +97,48 @@ class TestFitDuration:
         assert [s["duration_sec"] for s in out["shots"]] == [9.5, 10.5]
 
 
+class TestLlmReviewUnavailable:
+    """轮28:语义审片不可用时不得静默放行。
+
+    旧代码 llm_stage_review 返回 available=False 时什么都不记——
+    纯规则引擎 pass 就直接进花钱的生成阶段,故事四拍结构/单动作可拍性/
+    镜间连续性/主角一致性/品牌贯穿整轮无人审(端点 5xx/key 中途失效/
+    输出两次不可解析都会触发)。「审不了」≠「审过了」。"""
+
+    def _script(self, n: int, per: float) -> dict:
+        return {"shots": [{"shot_id": f"S{i:02d}", "duration_sec": per,
+                           "shot_size": "中景", "camera": "固定机位",
+                           "spatial": "画面中央", "subject": "主角",
+                           "scene": "咖啡店", "motion": "端起咖啡杯",
+                           "narration": "深夜街头冷色如冰", "dialogue": ""}
+                          for i in range(1, n + 1)]}
+
+    def test_unavailable_recorded_and_never_passes(self, monkeypatch):
+        from shipin_platform.orchestration.stage_store import ProjectStageStore
+        pid = "llm-unavail"
+        store = ProjectStageStore(":memory:")
+        store.create_project(pid)
+        pr._save(pid, "brief.json", {"product_info": "测试咖啡",
+                                     "duration_sec": 24,
+                                     "slogan": "享受每一刻"})
+        monkeypatch.setattr(
+            pr, "llm_stage_review",
+            lambda stage, data, brief=None: {
+                "available": False, "reason": "测试:端点 500",
+                "findings": [], "scores": {}, "raw": ""})
+        r = pr._iterate("script", self._script(8, 3), pid, store,
+                        use_llm=True)
+        rev = pr._load(pid, "script_review.json")
+        warn = [f for rnd in rev["rounds"] for f in rnd["findings"]
+                if f.get("dimension") == "llm_review"]
+        assert warn, "语义审片不可用必须落 warning finding"
+        assert "端点 500" in warn[0]["issue"]
+        assert rev["llm"].get("available") is False
+        assert "端点 500" in rev["llm"].get("reason", "")
+        # 「审不了」不得算过:决策绝不能是 pass/pass_with_warnings
+        assert r["decision"] not in ("pass", "pass_with_warnings"), r
+
+
 class TestIterateDurationLoop:
     """轮25 回归:_iterate 的时长闭环收尾块曾引用三个从未赋名的变量
     (fitted_total/dev/llm_meta)——stage="script" 且 brief 带

@@ -428,6 +428,24 @@ def _iterate(stage: str, data: dict, project_id: str, store,
                 1 for f in final["findings"] if f["severity"] == "critical")
             if final["stats"]["critical"] > 0 and final["decision"] in ("pass", "pass_with_warnings"):
                 final["decision"] = "revise"
+        else:
+            # 轮28:语义审片不可用(key 中途失效/端点 5xx/输出两次不可解析)
+            # 时,旧代码静默降级——纯规则 pass 就进花钱的生成阶段,故事四拍
+            # 结构/单动作可拍性/镜间连续性/主角一致性/品牌贯穿整轮无人审。
+            # 「审不了」≠「审过了」:记 warning finding + 决策不得 pass
+            # (revise 重试;max_rounds 后 stop 人工介入),reason 落 llm_info。
+            llm_info = {"available": False,
+                        "reason": str(llm.get("reason") or "")[:200]}
+            final["findings"].append({
+                "dimension": "llm_review", "severity": "warning",
+                "issue": (f"语义审片不可用({llm_info['reason']})——本阶段只过了"
+                          f"规则引擎,故事结构/可拍性/连续性/主角一致性未经语义审查"),
+                "evidence": "llm_stage_review available=False",
+                "failure_mode": "external", "revision_strategy": "retry",
+                "proposed_fix": "检查 AGNES_KEY 与端点可用性后重跑本阶段审查",
+                "status": "pending"})
+            if final["decision"] in ("pass", "pass_with_warnings"):
+                final["decision"] = "revise"
 
         # LLM critical 的 fix 同步进 revision_plan（否则 _repair 只修规则项，
         # 语义项原样保留 → 纯 LLM 循环不收敛，real-guard-8 实证）
