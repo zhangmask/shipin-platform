@@ -1198,7 +1198,25 @@ def run_assemble_phase(project_id: str, store) -> dict:
                     margin_v=int(comp_sub.get("margin_v", 96)))
     if not burn.get("ok"):
         return {"ok": False, "phase": "assemble", "reason": f"burn: {burn.get('error', burn)}"}
-    out["burn"] = {"violations": burn.get("violations")}
+    # 轮27:§10.6 字幕验收硬门挂主链路——此前只存在于手工 /burn 端点,
+    # assemble 烧完直接放行(violations 恒 None),无墨迹/超宽的不可读
+    # 字幕直达终审。found=false 与宽度超红线=不可读缺陷,硬拦;y 带记
+    # 警告不拦(验收规则与 margin_v 默认排版的矛盾,见共享函数注释)。
+    from shipin_platform.tools.subtitle_renderer import check_subtitle_cues
+    _viol = check_subtitle_cues(burn.get("cues") or [],
+                                str((work / "subtitled.mp4").resolve()))
+    _viol_crit = [v for v in _viol if v.get("severity") == "critical"]
+    out["burn"] = {"violations": _viol or None}
+    if _viol_crit:
+        _save(project_id, "subtitle_check.json",
+              {"verdict": "fix", "violations": _viol})
+        return {"ok": False, "phase": "assemble",
+                "reason": ("字幕验收未过(§10.6): "
+                           + "; ".join(f"cue{v['cue']}:{'/'.join(v['issues'])}"
+                                       for v in _viol_crit[:3])),
+                "burn": out["burn"]}
+    _save(project_id, "subtitle_check.json",
+          {"verdict": "ok", "violations": _viol})
 
     # 5) 声音设计：旁白轨 + 台词轨(role 音色) 全部落点,台词在前旁白在后
     events = []

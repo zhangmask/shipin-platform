@@ -1476,34 +1476,14 @@ def burn_subtitle(req: BurnSubtitleRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
     # ── AGENT_GUIDE §10.6 字幕验收硬门 ────────────────────────────────
-    # 所有 cue 必须 found=true && width_pct ≤ 62 && 下缘 ≥ 屏高−110px
-    # 任一不满足 → ok=False，禁止"无字幕却返回成功"的假通过
-    max_width_pct = 62.0
-    margin_allowance = 110  # 底部安全区预留 px
-    violations: list[dict] = []
-    if result.get("cues"):
-        # probe video dimensions for y_range check
-        _probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height",
-             "-of", "csv=p=0", str(req.video_path)],
-            capture_output=True, text=True)
-        _dims = _probe.stdout.strip().split(",") if _probe.stdout.strip() else ["", ""]
-        _video_h = int(_dims[1]) if len(_dims) > 1 and _dims[1].isdigit() else 1080
-        _y_threshold = _video_h - margin_allowance
-        for cue in result["cues"]:
-            issues = []
-            if not cue.get("found"):
-                issues.append("未检测到墨迹(found=false)")
-            if cue.get("width_pct", 0) > max_width_pct:
-                issues.append(f"宽度{cue['width_pct']}%超红线≤62%")
-            yb = (cue.get("y_range") or [0, 0])[1] if cue.get("y_range") else 0
-            if yb > 0 and yb < _y_threshold:
-                issues.append(f"下缘{yb}px低于安全线({_y_threshold}px)")
-            if issues:
-                violations.append({"cue": cue["index"], "issues": issues})
-        if violations:
-            result = {**result, "ok": False, "violations": violations}
+    # 轮27:内联实现提取为 subtitle_renderer.check_subtitle_cues 共享函数
+    # (assemble 主链路同用);found=false 与宽度超红线 = critical 硬拦，
+    # y 带问题为 warning(验收规则与 margin_v 默认排版的矛盾,不拦)。
+    from shipin_platform.tools.subtitle_renderer import check_subtitle_cues
+    violations = check_subtitle_cues(result.get("cues") or [],
+                                     str(req.video_path))
+    if any(v.get("severity") == "critical" for v in violations):
+        result = {**result, "ok": False, "violations": violations}
 
     return {"ok": result["ok"], "output": result["output"],
             "strategy": result["strategy"], "font": result["font"],

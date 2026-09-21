@@ -644,8 +644,59 @@ def render_subtitles_best(video_path, srt_path, output_path,
     return result
 
 
+# ── 轮27:字幕验收硬门(§10.6)共享实现 ────────────────────────────────
+# 此前只在 api.py 的手工 /burn 端点内联,主链路 assemble 烧完字幕直接
+# 放行(out["burn"]["violations"] 恒为 None)——无墨迹/超宽/越安全区的
+# 不可读字幕直达终审。提取为共享函数,两端同用。
+# 严重级划分(轮27 实测后定):found=false 与 width>红线 是明确的不可读
+# 缺陷 → critical;y 带(下缘与屏底距离)记 warning——AGENT_GUIDE 的
+# 「下缘≥屏高−110px」与 margin_v=96 的默认排版互相矛盾(实测底缘落在
+# ~h-116,按现规则每个项目都会"违规"),属排版参数问题,不硬拦。
+
+
+def check_subtitle_cues(cues: list, video_path: str,
+                        max_width_pct: float = 62.0,
+                        margin_allowance: int = 110) -> list[dict]:
+    """字幕验收:返回 violations 列表(空=通过)。never raises。
+
+    每项 {"cue": idx, "severity": "critical"|"warning", "issues": [...]}:
+      - found=false            → critical(无墨迹,字幕没烧上)
+      - width_pct > max_width  → critical(超宽出屏/被裁)
+      - y 带越界              → warning(排版安全区,见上方说明)
+    """
+    violations: list[dict] = []
+    if not cues:
+        return violations
+    try:
+        w, h = _ffprobe_size(_Path(video_path))
+    except Exception:
+        w, h = 0, 0
+    _video_h = h or 1080
+    _y_threshold = _video_h - margin_allowance
+    for cue in cues:
+        if not isinstance(cue, dict):
+            continue
+        crit, warn = [], []
+        if not cue.get("found"):
+            crit.append("未检测到墨迹(found=false)")
+        if float(cue.get("width_pct", 0) or 0) > max_width_pct:
+            crit.append(f"宽度{cue.get('width_pct')}%超红线≤{max_width_pct:.0f}%")
+        yr = cue.get("y_range") or [0, 0]
+        yb = yr[1] if len(yr) > 1 else 0
+        if yb > 0 and yb < _y_threshold:
+            warn.append(f"下缘{yb}px高于安全线({_y_threshold}px,距屏底"
+                        f"{_video_h - yb}px<{margin_allowance}px)")
+        if crit:
+            violations.append({"cue": cue.get("index"),
+                               "severity": "critical", "issues": crit})
+        elif warn:
+            violations.append({"cue": cue.get("index"),
+                               "severity": "warning", "issues": warn})
+    return violations
+
+
 __all__ = ["hex_to_ass_color", "build_ass_style", "generate_srt",
            "generate_ass_from_srt", "escape_subtitles_path",
            "parse_srt_cues", "probe_libass", "render_subtitles_best",
-           "verify_subtitle_cues",
+           "verify_subtitles_cues", "check_subtitle_cues",
            "build_karaoke_ass_header", "generate_karaoke_ass"]

@@ -1170,6 +1170,58 @@ class TestBlackFrameGate:
                                             for f in r["findings"]}
 
 
+class TestSubtitleAcceptance:
+    """轮27:§10.6 字幕验收硬门——此前只存在于手工 /burn 端点,assemble
+    烧完字幕直接放行(violations 恒 None),无墨迹/超宽的不可读字幕直达
+    终审。found=false 与宽度超红线=critical;y 带=warning(验收规则与
+    margin_v 默认排版的矛盾:实测底缘 ~h-116,按原规则每个项目都"违规")。"""
+
+    def test_missing_ink_is_critical(self, tmp_path):
+        from shipin_platform.tools.subtitle_renderer import (
+            check_subtitle_cues)
+        clip = _make_motion_clip(tmp_path / "s.mp4", 2.0)
+        cues = [{"index": 1, "found": False, "width_pct": 20.0,
+                 "y_range": [500, 560]}]
+        v = check_subtitle_cues(cues, str(clip))
+        assert v and v[0]["severity"] == "critical"
+        assert any("墨迹" in i for i in v[0]["issues"])
+
+    def test_over_width_is_critical(self, tmp_path):
+        from shipin_platform.tools.subtitle_renderer import (
+            check_subtitle_cues)
+        clip = _make_motion_clip(tmp_path / "s2.mp4", 2.0)
+        cues = [{"index": 2, "found": True, "width_pct": 71.5,
+                 "y_range": [500, 560]}]
+        v = check_subtitle_cues(cues, str(clip))
+        assert v and v[0]["severity"] == "critical"
+        assert any("宽度" in i for i in v[0]["issues"])
+
+    def test_y_band_is_warning_only(self, tmp_path):
+        """y 带问题只警告——原验收规则与 margin_v=96 默认排版互相矛盾
+        (coffee-v7 实测全部 10 条 cue 底缘 ~604px < 720−110=610),硬拦
+        会误伤每个正常项目。"""
+        from shipin_platform.tools.subtitle_renderer import (
+            check_subtitle_cues)
+        clip = tmp_path / "s720.mp4"
+        subprocess.run(
+            [FFMPEG, "-y", "-loglevel", "error", "-f", "lavfi",
+             "-i", "testsrc2=duration=2:size=1280x720:r=24",
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", str(clip)],
+            capture_output=True, text=True, check=True)
+        cues = [{"index": 3, "found": True, "width_pct": 30.0,
+                 "y_range": [549, 604]}]  # 720 高:604 < 610 触发 y 警告
+        v = check_subtitle_cues(cues, str(clip))
+        assert v and v[0]["severity"] == "warning"
+
+    def test_clean_cues_pass(self, tmp_path):
+        from shipin_platform.tools.subtitle_renderer import (
+            check_subtitle_cues)
+        clip = _make_motion_clip(tmp_path / "s4.mp4", 2.0)
+        cues = [{"index": i, "found": True, "width_pct": 30.0,
+                 "y_range": [549, 604]} for i in range(1, 4)]
+        assert check_subtitle_cues(cues, str(clip)) == []
+
+
 class TestKeyframeGate:
     """轮21:关键帧 vs 分镜文本门——视频模型以 first_frame 为条件生成,
     关键帧跑偏整镜必歪;qc_clip 的 dHash 只比 clip 首帧 vs 参考图(同源
