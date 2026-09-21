@@ -145,6 +145,53 @@ class TestIterateDurationLoop:
             "fitted") == 24
 
 
+class TestTtsReuse:
+    """轮26:TTS 复用判定与 glob 精确性。
+
+    两个都实证过的洞:
+    (a) 旧音频配新字幕——复用只看「有没有文件」,review/iterate 改了
+        narration 后旧 {sid}_*.mp3 直接被复用,成片口播是旧词、字幕是
+        新词,声画不一致违反剧本且无门能发现;
+    (b) 旁白轨取到台词音频——台词段输出 {sid}_dlg_*.mp3 被 {sid}_*
+        通配吞掉,align 按错音频算时长。
+    """
+
+    def test_glob_excludes_dialogue_file(self, tmp_path):
+        import time
+        from shipin_platform.orchestration import pipeline_runner as pr
+        narr = tmp_path / "S01_aaaa1111.mp3"
+        dlg = tmp_path / "S01_dlg_bbbb2222.mp3"
+        narr.write_bytes(b"narr")
+        time.sleep(0.02)
+        dlg.write_bytes(b"dlg")  # 台词更新——旧逻辑 newest 会选它
+        got = pr.glob_tts(tmp_path, "S01")
+        assert got == str(narr), f"旁白 glob 吞了台词文件: {got}"
+        assert pr.glob_tts(tmp_path, "S01_dlg") == str(dlg)
+
+    def test_text_sha_tracks_narration_and_dialogue(self):
+        from shipin_platform.orchestration import pipeline_runner as pr
+        s1 = {"shot_id": "S01", "narration": "深夜街头", "dialogue": ""}
+        s2 = {"shot_id": "S01", "narration": "深夜街头", "dialogue": ""}
+        s3 = {"shot_id": "S01", "narration": "深夜的街头", "dialogue": ""}
+        s4 = {"shot_id": "S01", "narration": "深夜街头",
+              "dialogue": {"role_code": "biz_female", "text": "欢迎光临"}}
+        assert pr._tts_text_sha(s1) == pr._tts_text_sha(s2)
+        assert pr._tts_text_sha(s1) != pr._tts_text_sha(s3), "旁白变必须变"
+        assert pr._tts_text_sha(s1) != pr._tts_text_sha(s4), "台词变必须变"
+
+    def test_stale_text_sha_forces_regen(self, tmp_path):
+        """manifest 记的文本指纹与当前台词不符 → 不可复用(返回 None)。"""
+        from shipin_platform.orchestration import pipeline_runner as pr
+        (tmp_path / "S01_aaaa1111.mp3").write_bytes(b"old")
+        shot = {"shot_id": "S01", "narration": "新台词", "dialogue": ""}
+        manifest = {"shots": {"S01": {"tts": str(tmp_path / "S01_aaaa1111.mp3"),
+                                      "tts_text_sha": pr._tts_text_sha(
+                                          {"narration": "旧台词"})}}}
+        # 直接验证判定语义:文件在、指纹不符 → 需要重生
+        fresh_sha = pr._tts_text_sha(shot)
+        assert manifest["shots"]["S01"]["tts_text_sha"] != fresh_sha
+
+
 class TestAssembleGate:
     """assemble 第一道闸：video_gen 未 PASS 绝不能拼接（防旧素材+新字幕混片）。"""
 

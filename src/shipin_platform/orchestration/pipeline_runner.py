@@ -922,7 +922,19 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
             return local
         ref = (manifest["shots"].get(sid) or {}).get("tts")
         return ref if (ref and Path(ref).is_file()) else None
-    need = [s["shot_id"] for s in shots if not _tts_of(s["shot_id"])]
+
+    def _tts_fresh(sid: str, s: dict) -> Optional[str]:
+        """轮26:复用必须过文本指纹——台词变了旧音频作废,不能旧词配
+        新字幕(声画不一致违反剧本,且无门能发现)。"""
+        p = _tts_of(sid)
+        if not p:
+            return None
+        rec = manifest["shots"].get(sid) or {}
+        if str(rec.get("tts_text_sha") or "") != _tts_text_sha(s):
+            return None
+        return p
+
+    need = [s["shot_id"] for s in shots if not _tts_fresh(s["shot_id"], s)]
     if need:
         segs = []
         # 台词镜:角色先开口(role_code→音色),旁白随后跟;无台词镜只有旁白
@@ -948,6 +960,8 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
         if not p:
             return {"ok": False, "phase": "generate", "reason": f"{s['shot_id']} TTS 缺失"}
         manifest["shots"][s["shot_id"]]["tts"] = p
+        # 轮26:记下口播内容指纹——下次重跑凭它判断旧音频是否还有效
+        manifest["shots"][s["shot_id"]]["tts_text_sha"] = _tts_text_sha(s)
         dlg = s.get("dialogue")
         if isinstance(dlg, dict) and dlg.get("text"):
             dv = glob_tts(work, f"{s['shot_id']}_dlg")
@@ -981,7 +995,26 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
 def glob_tts(work: Path, shot_id: str) -> Optional[str]:
     import glob as _g
     fs = sorted(_g.glob(str(work / f"{shot_id}_*.mp3")), key=_mtime)
+    # 轮26:台词段输出是 {sid}_dlg_<uuid>.mp3,会被 {sid}_* 通配吞掉——
+    # 旁白 glob 必须排除它,否则旁白轨取到台词音频(align 按错音频算
+    # 时长、成片声画错配),此类错配无任何门能发现。
+    if not shot_id.endswith("_dlg"):
+        fs = [f for f in fs
+              if not Path(f).name.startswith(f"{shot_id}_dlg")]
     return fs[-1] if fs else None
+
+
+def _tts_text_sha(s: dict) -> str:
+    """轮26:口播内容指纹(旁白+台词文本)。TTS 复用判定从「有没有
+    文件」升级为「文本有没有变」——review/iterate 改了 narration 后,
+    旧 {sid}_*.mp3 会被直接复用,成片口播是旧词、字幕是新词,
+    声画不一致直接违反剧本,且全链路没有门能发现。"""
+    import hashlib as _hl3
+    dlg = s.get("dialogue")
+    dtext = (str(dlg.get("text") or "") if isinstance(dlg, dict)
+             else str(dlg or ""))
+    payload = f"{str(s.get('narration') or '')}\x00{dtext}"
+    return _hl3.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _mtime(p: str) -> float:
