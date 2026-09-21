@@ -1035,6 +1035,26 @@ def run_assemble_phase(project_id: str, store) -> dict:
         manifest["shots"][last_sid]["clip"] = kb["output"]
         manifest["shots"][last_sid]["master"] = kb["output"]
         out["kenburns"] = kb
+        # 轮15:落版镜单镜诊断——outro_card 在 generate 阶段被跳过,kenburns
+        # 产物到此才生成,此前从未进入单镜诊断(品牌落版恰是最关键镜头:
+        # 终审 BRAND_MISSING 只兜"品牌有没有出现",不兜"落版画面是否
+        # 符合分镜")。补一次 focused 审查,critical 走 shots_review 既有
+        # 合并通道并入终审。
+        try:
+            from shipin_platform.review.hard_gates import vlm_review_shot
+            _sr = _load(project_id, "shots_review.json") or {}
+            _kr = vlm_review_shot(kb["output"],
+                                  dict(last_shot,
+                                       duration_sec=round(w9 + DEFAULT_TD, 2)),
+                                  frames_count=4)
+            _sr[last_sid] = {"verdict": _kr.get("verdict"),
+                             "findings": _kr.get("findings") or []}
+            _save(project_id, "shots_review.json", _sr)
+        except Exception as e:
+            _sr = _load(project_id, "shots_review.json") or {}
+            _sr[last_sid] = {"verdict": "error", "findings": [],
+                             "error": str(e)[:160]}
+            _save(project_id, "shots_review.json", _sr)
 
     # 2) 逐边界转场拼接(clip 路径缺失时回退到约定命名)
     clips = [_clip_src(manifest, s, work) for s in sids]
