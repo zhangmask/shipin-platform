@@ -1050,6 +1050,38 @@ def run_assemble_phase(project_id: str, store) -> dict:
     out["stitch"] = {k: st.get(k) for k in ("duration", "expected_sec",
                                             "boundary_preserved", "warnings")}
     _save(project_id, "stitch_result.json", st)
+    # 轮13:part 来源透明化——align 窗口 > clip 时长时 stitch 从 master 裁料
+    # 补足,该 part 内容从未过审(clip 审的是另一份),G5 的 clip_sha256 只盯
+    # clip 文件管不到。这里对 master 补料的 part 按**实际入拼片段**补单镜
+    # 诊断,critical 落 parts_review.json,终审合并时统一阻断。
+    _parts = st.get("parts") or []
+    _save(project_id, "stitch_parts.json", _parts)
+    _parts_review = _load(project_id, "parts_review.json") or {}
+    for pm in _parts:
+        if pm.get("source") != "master" or not pm.get("part_path"):
+            continue
+        i = pm.get("idx")
+        sid = sids[i] if isinstance(i, int) and i < len(sids) else None
+        srow = next((x for x in shots if x["shot_id"] == sid), None)
+        if not sid or not srow:
+            continue
+        try:
+            from shipin_platform.review.hard_gates import vlm_review_shot
+            pr = vlm_review_shot(pm["part_path"],
+                                 dict(srow,
+                                      duration_sec=pm.get("want_sec")),
+                                 frames_count=4)
+            _parts_review[str(i)] = {
+                "shot_id": sid, "source": pm.get("source"),
+                "part_path": pm.get("part_path"),
+                "verdict": pr.get("verdict"),
+                "findings": pr.get("findings") or []}
+        except Exception as e:
+            _parts_review[str(i)] = {"shot_id": sid, "verdict": "error",
+                                     "findings": [],
+                                     "error": str(e)[:160]}
+    if _parts_review:
+        _save(project_id, "parts_review.json", _parts_review)
 
     # 3) 调色
     graded = str(work / "graded.mp4")
@@ -1163,8 +1195,10 @@ def run_assemble_phase(project_id: str, store) -> dict:
     # 轮12:单镜 VLM 诊断(每镜独立 ctx 逐帧对照分镜预期)的 critical 并入
     # 终验——clip 自身演错剧本/镜内换人在此统一阻断,不随 assemble 的
     # master 补帧溜进终片。缺文件(旧项目/未跑 generate)时无操作。
+    # 轮13:master 补料 part 的实际入拼片段复审(parts_review.json)同一范式。
     _sr_all = _load(project_id, "shots_review.json") or {}
-    _sr_crit = [f for _r in _sr_all.values()
+    _pr_all = _load(project_id, "parts_review.json") or {}
+    _sr_crit = [f for _r in list(_sr_all.values()) + list(_pr_all.values())
                 for f in (_r.get("findings") or [])
                 if f.get("severity") == "critical"]
     if _sr_crit:

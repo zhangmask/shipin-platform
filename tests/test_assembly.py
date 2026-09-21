@@ -111,6 +111,42 @@ class TestTransitionStitch:
                                     transition="cut")
         assert r["ok"] and r["duration"] == pytest.approx(4.0, abs=0.1)
 
+    # ── 轮13:part 来源透明化(堵"审A拼B") ─────────────────────────
+    # align 窗口 > clip 时长时 stitch 从 master 裁料补足——该 part 的
+    # 内容从未过审(clip 审的是另一份),必须记 source 并落盘供复审。
+
+    def test_master_sourced_part_recorded(self, tmp_path):
+        clips = [str(_color_clip(tmp_path / f"sc{i}.mp4", c, 2.0))
+                 for i, c in enumerate(("red", "blue"))]
+        masters = [str(_color_clip(tmp_path / f"sm{i}.mp4", c, 6.0))
+                   for i, c in enumerate(("red", "blue"))]
+        r = build_transition_stitch(clips, [3.25, 2.0],
+                                    str(tmp_path / "o4.mp4"),
+                                    transition="dissolve",
+                                    transition_duration=0.4, masters=masters)
+        assert r["ok"], r.get("error")
+        parts = r["parts"]
+        assert len(parts) == 2
+        assert all(p["source"] == "master" for p in parts), parts
+        assert parts[0]["src"] == masters[0] and parts[0]["want_sec"] == 3.25
+        for p in parts:
+            assert Path(p["part_path"]).is_file()
+            assert Path(p["part_path"]).parent.name == "parts"
+
+    def test_clip_sourced_part_recorded(self, tmp_path):
+        clips = [str(_color_clip(tmp_path / f"cc{i}.mp4", c, 4.0))
+                 for i, c in enumerate(("red", "blue"))]
+        masters = [str(_color_clip(tmp_path / f"cm{i}.mp4", c, 6.0))
+                   for i, c in enumerate(("red", "blue"))]
+        r = build_transition_stitch(clips, [2.0, 2.0],
+                                    str(tmp_path / "o5.mp4"),
+                                    transition="dissolve",
+                                    transition_duration=0.4, masters=masters)
+        assert r["ok"], r.get("error")
+        parts = r["parts"]
+        assert all(p["source"] == "clip" for p in parts), parts
+        assert parts[0]["src"] == clips[0]
+
 
 class TestMasterAudio:
     def test_narration_events_bgm_sfx(self, tmp_path):

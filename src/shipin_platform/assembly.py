@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -188,6 +189,12 @@ def build_transition_stitch(clips: list[str], windows: list[float],
             bts[k] = "cut"
 
     tmp = Path(tempfile.mkdtemp(prefix="stitch2_"))
+    # 轮13:part 来源透明化——align 窗口 > clip 时长时从 master 裁料补足,
+    # 该 part 的内容从未过审(clip 审的是另一份)。part 落盘到 output 同级
+    # parts/ 并记 source,供 assemble 对 master 补料镜位按实际入拼片段复审
+    # (堵"审A拼B":G5 的 clip_sha256 只盯 clip 文件,管不到 master 补料)。
+    parts_dir = Path(output).parent / "parts"
+    parts_meta: list[dict] = []
     try:
         parts: list[Path] = []
         for i in range(n):
@@ -195,9 +202,20 @@ def build_transition_stitch(clips: list[str], windows: list[float],
             pad = td if (i > 0 and bts[i - 1] != "cut") else 0.0
             want = windows[i] + pad
             m = Path(masters[i]) if masters and i < len(masters) and masters[i] else None
+            source = "clip"
             if want > _ffprobe_duration(src) + 0.05 and m and m.exists():
                 src = _trim(m, tmp / f"m{i:02d}.mp4", want)
+                source = "master"
             parts.append(_trim(src, tmp / f"p{i:02d}.mp4", want))
+            parts_meta.append({"idx": i, "source": source,
+                               "src": str(m if source == "master"
+                                          else Path(clips[i])),
+                               "want_sec": round(want, 3)})
+        parts_dir.mkdir(parents=True, exist_ok=True)
+        for i, p in enumerate(parts):
+            dst = parts_dir / f"p{i:02d}.mp4"
+            shutil.copyfile(p, dst)
+            parts_meta[i]["part_path"] = str(dst)
 
         # 分组：xfade 边界连接的 part 为一组（组内 xfade 链），组间 concat
         groups: list[list[int]] = [[0]]
@@ -249,6 +267,7 @@ def build_transition_stitch(clips: list[str], windows: list[float],
         out = {"ok": True, "output": str(output), "duration": round(dur, 2),
                "expected_sec": round(sum(windows), 2),
                "transitions": bts, "transition_duration": td,
+               "parts": parts_meta,
                "boundary_preserved": abs(dur - sum(windows)) <= 0.25}
         if warnings:
             out["warnings"] = warnings
