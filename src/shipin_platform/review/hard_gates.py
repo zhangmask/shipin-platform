@@ -312,11 +312,19 @@ def _subject_tokens(subject: str) -> set:
 
 
 def _same_person(imgs: list, key: str) -> dict:
-    """VLM 成对判定跨镜头是否为同一人。never raises."""
+    """VLM 成对判定是否为同一人。never raises.
+
+    轮11a 修正(实测教训):响应里没有 "same" 字段——协议错配、载荷被路由到
+    别的提示词、JSON 截断——一律判 available=False 跳过。绝不让「解析失败」
+    冒充「不是同一人」的 critical 判决:那会让一次 VLM  hiccup 直接变成
+    「镜内身份已更换,禁止交付」,协议错误不该阻断交付。"""
     try:
         resp = _ask_vlm(imgs, SAME_PERSON_PROMPT, key, max_tokens=300)
         m = re.search(r"\{.*\}", resp, re.S)
         parsed = json.loads(m.group(0)) if m else {}
+        if "same" not in parsed:
+            return {"available": False, "same": None,
+                    "reason": "VLM 未返回 same 字段(载荷不匹配),跳过本次判定"}
         return {"available": True, "same": bool(parsed.get("same")),
                 "spec": str(parsed.get("spec", ""))[:80],
                 "reason": str(parsed.get("reason", ""))[:200]}
@@ -325,50 +333,112 @@ def _same_person(imgs: list, key: str) -> dict:
                 "reason": f"VLM 跨镜身份判定失败: {type(e).__name__}: {e}"[:200]}
 
 
+# ── 轮11a(2026-09-21):镜内人物一致性判定所需的「人物镜头」识别 ─────────
+# 只有主体描述指向「人」的镜头才做首末帧对比:手冲特写、logo 落版等
+# 无人物画面交给 VLM 判"是否同一人"只会得到无意义结论。
+_PERSON_HINTS = ("主角", "女子", "女人", "女性", "女孩",
+                 "男子", "男人", "男性", "咖啡师", "店员", "顾客", "老人",
+                 "孩子", "少年", "青年", "人物", "模特", "上班族", "白领")
+
+
+def _is_person_shot(subject: str) -> bool:
+    return any(h in str(subject or "") for h in _PERSON_HINTS)
+
+
+def _compare_person(video: Path, ta: float, tb: float, key: str) -> dict:
+    """抽 ta/tb 两帧问 VLM 是否同一人。返回 {"captured", "available",
+    "result"};抽帧失败时 captured=False(调用方不计入 checked)。"""
+    pa, pb = _capture(video, ta), _capture(video, tb)
+    if not pa or not pb:
+        return {"captured": False, "available": False, "result": {}}
+    imgs = []
+    for fp in (pa, pb):
+        with open(fp, "rb") as fh:
+            b64 = base64.b64encode(fh.read()).decode()
+        imgs.append({"type": "image_url",
+                     "image_url": {"url": f"data:image/png;base64,{b64}"}})
+    r = _same_person(imgs, key)
+    return {"captured": True, "available": bool(r.get("available")),
+            "result": r}
+
+
+def _identity_finding(a_label: str, b_label: str, r: dict, intra: bool) -> dict:
+    """换人/换装 finding;intra=True 时为镜头内部(首帧 vs 末帧)判定。"""
+    spec = str(r.get("spec") or "")
+    is_face = ("脸" in spec or "发" in spec)
+    where = ("镜头%s 内部(首帧 vs 末帧)" % a_label if intra
+             else "镜头%s→镜头%s" % (a_label, b_label))
+    return {
+        "severity": "critical" if is_face else "warning",
+        "code": "IDENTITY_SWITCH" if is_face else "COSTUME_SWAP",
+        "scope": "intra" if intra else "cross",
+        "message": (f"{where} VLM 判定不是同一人"
+                    f"(不一致点:{spec or str(r.get('reason') or '')[:60]})——"
+                    f"{'镜内' if intra else '跨镜'}身份"
+                    f"{'已更换,禁止交付' if is_face else '被换装,需复核'}")}
+
+
 def _identity_gate(video: Path, shots: list[dict], key: str) -> dict:
-    """跨镜人物一致性:相邻两镜「主体词元一致」时才要求同一人(不同角色则跳过,
-    避免把『顾客』vs『店员』的合理切换误判为换头)。每对镜各抽中帧问 VLM;
+    """人物一致性双通道:
+    1) 跨镜:相邻两镜「主体词元一致」时才要求同一人(不同角色则跳过,
+       避免把『顾客』vs『店员』的合理切换误判为换头)。每对镜各抽中帧问 VLM;
+    2) 镜内(轮11a):主体为「人」且时长≥1.5s 的镜头,抽首帧(15%)与末帧
+       (85%)对比——coffee-v7 实测 S02 在 t=4.03s 镜内换装、S06 在
+       19.89→21.5s 镜内换人,这类同一镜头内部的更换此前只能靠跨镜中帧
+       间接撞见且归属错位(报成 S06→S07 边界),现在直接钉在该镜上。
     只有在 VLM 判定"不是同一人"时输出 findings。审计盲区①(A 节)的落地。"""
     pairs, checked, findings = [], 0, []
     for i in range(len(shots) - 1):
         a, b = shots[i], shots[i + 1]
-        ta = _subject_tokens(a.get("subject")
-                if isinstance(a, dict) else str(a or ""))
-        tb = _subject_tokens(b.get("subject")
-                if isinstance(b, dict) else str(b or ""))
+        if not isinstance(a, dict) or not isinstance(b, dict):
+            continue
+        ta = _subject_tokens(a.get("subject"))
+        tb = _subject_tokens(b.get("subject"))
         if not ta or not tb or not (ta & tb):
             continue  # 主体无共享词元 = 分镜本意是不同人/物,不做跨镜身份判定
         pairs.append((i, i + 1))
     for i, j in pairs:
         a, b = shots[i], shots[j]
-        # 两镜的镜头中帧(绝对时间):镜像起点=此前所有窗口时长之和
-        t0a = sum(float(s.get("duration_sec") or 0) for s in shots[:i])
-        t0b = t0a + float(a.get("duration_sec") or 0)
-        pa = _capture(video, t0a + float(a.get("duration_sec") or 0) / 2)
-        pb = _capture(video, t0b + float(b.get("duration_sec") or 0) / 2)
-        if not pa or not pb:
+        # 两镜的镜头中帧(绝对时间):镜头起点=此前所有窗口时长之和
+        t0a = sum(float(s.get("duration_sec") or 0) for s in shots[:i]
+                  if isinstance(s, dict))
+        da = float(a.get("duration_sec") or 0)
+        cmp = _compare_person(video, t0a + da / 2,
+                              t0a + da + float(b.get("duration_sec") or 0) / 2,
+                              key)
+        if not cmp["captured"]:
             continue
         checked += 1
-        imgs = []
-        for fp in (pa, pb):
-            with open(fp, "rb") as fh:
-                b64 = base64.b64encode(fh.read()).decode()
-            imgs.append({"type": "image_url",
-                         "image_url": {"url": f"data:image/png;base64,{b64}"}})
-        r = _same_person(imgs, key)
-        if not r.get("available"):
+        r = cmp["result"]
+        if not cmp["available"]:
             continue
         if not r["same"]:
-            spec = str(r.get("spec") or "")
-            is_face = ("脸" in spec or "发" in spec)
-            findings.append({
-                "severity": "critical" if is_face else "warning",
-                "code": "IDENTITY_SWITCH" if is_face else "COSTUME_SWAP",
-                "message": (f"镜头{a.get('shot_id', i + 1)}→镜头"
-                            f"{b.get('shot_id', j + 1)} VLM 判定不是同一人"
-                            f"(不一致点:{spec or r.get('reason')[:60]})——跨镜身份"
-                            f"{'已更换,禁止交付' if is_face else '被换装,需复核'}")})
-    return {"pairs": pairs, "checked": checked, "findings": findings}
+            findings.append(_identity_finding(
+                str(a.get("shot_id", i + 1)),
+                str(b.get("shot_id", j + 1)), r, False))
+    # ── 镜内首/末帧对比(轮11a) ─────────────────────────────────────
+    intra_pairs, intra_checked = [], 0
+    for i, s in enumerate(shots):
+        if not isinstance(s, dict):
+            continue
+        dur = float(s.get("duration_sec") or 0)
+        if dur < 1.5 or not _is_person_shot(s.get("subject")):
+            continue
+        t0 = sum(float(x.get("duration_sec") or 0) for x in shots[:i]
+                 if isinstance(x, dict))
+        cmp = _compare_person(video, t0 + dur * 0.15, t0 + dur * 0.85, key)
+        if not cmp["captured"]:
+            continue
+        intra_pairs.append(i)
+        intra_checked += 1
+        r = cmp["result"]
+        if not cmp["available"]:
+            continue
+        if not r["same"]:
+            findings.append(_identity_finding(
+                str(s.get("shot_id", i + 1)), "", r, True))
+    return {"pairs": pairs, "checked": checked, "findings": findings,
+            "intra_pairs": intra_pairs, "intra_checked": intra_checked}
 
 
 def _batch_prompt(times: str, n: int, context: Optional[dict] = None,
@@ -787,9 +857,12 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
             if isinstance(si, dict) and str(si.get("shot") or "").strip():
                 shot_issues.append(si)
 
-    # ── 跨镜人物一致性(VBench-2.0 human_identity 思路的 VLM 落地) ─────
-    identity = {"pairs": [], "checked": 0, "findings": []}
-    if shots and len(shots) > 1:
+    # ── 人物一致性(跨镜 + 镜内双通道,VBench-2.0 human_identity 思路) ──
+    # 轮11a:守卫从 len(shots)>1 放宽到 shots 非空——单镜视频同样可能
+    # 镜内换人(整片一镜到底的广告),此前被直接跳过。
+    identity = {"pairs": [], "checked": 0, "findings": [],
+                "intra_pairs": [], "intra_checked": 0}
+    if shots and key:
         identity = _identity_gate(video, shots, key)
 
     all_findings = det_findings + [

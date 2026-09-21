@@ -609,6 +609,66 @@ class TestIdentityGate:
         assert r["identity"]["checked"] == 0
         assert "IDENTITY_SWITCH" not in {f["code"] for f in r["findings"]}
 
+    # ── 轮11a:镜内人物一致性(首帧 vs 末帧) ─────────────────────────
+    # coffee-v7 实测教训:S02 在 t=4.03s 镜内换装、S06 在 19.89→21.5s
+    # 镜内换人——同一镜头内部的更换此前只能靠跨镜中帧间接撞见,且归属
+    # 错位(报成 S06→S07 边界)。镜内通道把这类更换直接钉在该镜上。
+
+    def test_intra_shot_switch_caught(self, monkeypatch, tmp_path):
+        """单镜内首/末帧判定不是同一人 → 该镜被钉 IDENTITY_SWITCH。"""
+        _vlm_stub(monkeypatch, same_person=False)
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "intra.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 4.0, "subject": "女主角在咖啡店"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        hits = [f for f in r["findings"] if f.get("scope") == "intra"]
+        assert hits, r["findings"]
+        assert hits[0]["code"] == "IDENTITY_SWITCH"
+        assert "S01 内部" in hits[0]["message"]
+        assert r["identity"]["intra_checked"] == 1
+        assert r["identity"]["checked"] == 0  # 单镜无跨镜对
+
+    def test_intra_shot_same_person_clean(self, monkeypatch, tmp_path):
+        """镜内首/末帧是同一人 → 不报 finding,但仍记 intra_checked。"""
+        _vlm_stub(monkeypatch)
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "intra_ok.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 4.0, "subject": "主角走位"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        assert r["identity"]["intra_checked"] == 1
+        assert not [f for f in r["findings"] if f.get("scope") == "intra"]
+
+    def test_intra_skipped_for_non_person_subject(self, monkeypatch, tmp_path):
+        """手冲特写/logo 落版等无人物画面不做镜内判定(问也白问)。"""
+        _vlm_stub(monkeypatch, same_person=False)
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "intra_np.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 4.0, "subject": "手冲咖啡壶与滤杯"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        assert r["identity"]["intra_checked"] == 0
+        assert r["identity"]["checked"] == 0
+
+    def test_malformed_same_person_payload_not_a_verdict(self, monkeypatch,
+                                                         tmp_path):
+        """轮11a 回归:身份提问拿到不含 same 字段的载荷(协议错配/被路由到
+        别的提示词/JSON 截断)→ available=False 跳过,不得冒充「不是同一人」
+        的 critical(那会让一次 VLM hiccup 直接禁止交付)。"""
+        from shipin_platform.review import hard_gates
+        monkeypatch.setattr(hard_gates, "_vlm_credentials", lambda: "fake-key")
+        monkeypatch.setattr(
+            hard_gates, "_ask_vlm",
+            lambda *a, **k: '{"breaks": [], "brand_seen": true}')
+        clip = _make_motion_clip(tmp_path / "mal.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 4.0, "subject": "主角独行"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        assert r["identity"]["intra_checked"] == 1
+        assert not [f for f in r["findings"] if f.get("scope") == "intra"]
+        assert "IDENTITY_SWITCH" not in {f["code"] for f in r["findings"]}
+
 
 class TestTimelineAccounting:
     def test_missing_shot_is_critical(self):
