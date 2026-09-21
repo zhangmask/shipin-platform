@@ -348,3 +348,98 @@ def _fake_report(mode: str):
         dimension="x", severity=Severity.CRITICAL, issue=mode, evidence="",
         failure_mode=mode, revision_strategy=cls["strategy"]))
     return r
+
+
+# ── 抽象审核维度:旁白重复 / 相邻机位雷同 / 占位符泄漏 ──────────
+# 实证来源 e2e-f3e40f87 成片(曾连过全部审核):同一句旁白两镜复用、
+# 相邻镜头 camera 逐字相同、品牌占位符"XX"漏进旁白——结构审核查
+# 不出,语义 LLM 审查也会放行。这三条确定性规则是『看起来正常』
+# 的最低门槛,必须从引擎层拦下,不许再漏进成片。
+
+NARR1 = "晨光落在一杯手冲咖啡上"
+NARR2 = "热气从杯口缓缓升起"
+
+
+def _mk_storyboard(cameras, narrations, **overrides):
+    """构造分镜:camera/narration 逐镜给定,其余字段齐全避免无关告警。"""
+    sizes = ["ws", "cu", "ms", "ecu"]
+    shots = []
+    for i, cam in enumerate(cameras):
+        shots.append({
+            "shot_id": f"S{i+1:02d}", "shot_size": sizes[i % len(sizes)],
+            "beat": "hook", "rhythm": "medium", "sfx": f"sfx_{i}",
+            "subject": "一只冒着热气的白瓷咖啡杯",
+            "subject_en": "a porcelain coffee cup with steam",
+            "motion": "缓缓推向镜头中央",
+            "motion_en": "slowly drifts toward the lens",
+            "scene": "清晨的木质早餐桌",
+            "scene_en": "wooden breakfast table at dawn",
+            "spatial": "中景微侧,主体占左三分之一",
+            "spatial_en": "medium wide, subject on left third",
+            "camera": cam,
+            "narration": narrations[i],
+        })
+    board = {"hero_shot": "S04", "shots": shots}
+    for k, v in overrides.items():
+        board[k] = v
+    return board
+
+
+def _mk_script(narrations, duration_per_shot=4):
+    shots = [
+        {"shot_id": f"S{i+1:02d}", "duration_sec": duration_per_shot,
+         "narration": n, "scene": "晨间厨房"} for i, n in enumerate(narrations)]
+    return {"duration_sec": len(shots) * duration_per_shot, "shots": shots}
+
+
+class TestAbstractQualityGates:
+    """『看起来正常』类毛病必须被确定性规则拦下,不许放行进成片。"""
+
+    def test_script_narration_duplicated_flagged(self):
+        report = ReviewEngine().run_review("script", _mk_script([NARR1, NARR1, NARR2]))
+        assert any(f.failure_mode == "NARRATION_DUPLICATED" for f in report.findings)
+
+    def test_script_clean_no_narration_duplicate(self):
+        report = ReviewEngine().run_review("script", _mk_script([NARR1, NARR2]))
+        assert not any(f.failure_mode == "NARRATION_DUPLICATED" for f in report.findings)
+
+    def test_script_placeholder_leak_flagged(self):
+        report = ReviewEngine().run_review("script", _mk_script([NARR1, "XX咖啡的夜香飘进街角"]))
+        assert any(f.failure_mode == "PLACEHOLDER_LEAK" for f in report.findings)
+
+    def test_script_clean_no_placeholder(self):
+        report = ReviewEngine().run_review("script", _mk_script([NARR1, "杯壁上的水珠细密如雾气"]))
+        assert not any(f.failure_mode == "PLACEHOLDER_LEAK" for f in report.findings)
+
+    def test_storyboard_adjacent_camera_same_flagged(self):
+        sb = _mk_storyboard(["dolly in", "dolly in", "truck right", "static"],
+                            [NARR1, NARR2, "蒸汽在指缝间缠绕", "双手捧住杯底"])
+        report = ReviewEngine().run_review("storyboard", sb)
+        cams = [f for f in report.findings if f.failure_mode == "CAMERA_SAME_ADJACENT"]
+        assert cams, [f.failure_mode for f in report.findings]
+        assert "S01" in cams[0].evidence  # 指认具体相邻镜对
+
+    def test_storyboard_brand_outro_static_exempted(self):
+        # 落版镜(scene 含 logo/背景)允许与上一镜同机位收尾,不算雷同
+        sb = _mk_storyboard(["dolly in", "static"], [NARR1, NARR2])
+        sb["shots"][1]["scene"] = "纯黑背景,居中一枚品牌 logo"
+        report = ReviewEngine().run_review("storyboard", sb)
+        assert not any(f.failure_mode == "CAMERA_SAME_ADJACENT" for f in report.findings)
+
+    def test_storyboard_cameras_varied_pass(self):
+        sb = _mk_storyboard(["dolly in", "truck right", "pedestal up", "crane down"],
+                            [NARR1, NARR2, "热气在玻璃上凝结", "原木台面映着晨光"])
+        report = ReviewEngine().run_review("storyboard", sb)
+        assert not any(f.failure_mode == "CAMERA_SAME_ADJACENT" for f in report.findings)
+
+    def test_storyboard_narration_duplicated_flagged(self):
+        sb = _mk_storyboard(["dolly in", "truck right", "static", "crane down"],
+                            [NARR1, NARR2, NARR1, "指尖搭上杯沿"])
+        report = ReviewEngine().run_review("storyboard", sb)
+        assert any(f.failure_mode == "NARRATION_DUPLICATED" for f in report.findings)
+
+    def test_storyboard_placeholder_leak_flagged(self):
+        sb = _mk_storyboard(["dolly in", "static"], [NARR1, NARR2])
+        sb["shots"][0]["subject"] = "XX 牌咖啡豆倾泻而下"
+        report = ReviewEngine().run_review("storyboard", sb)
+        assert any(f.failure_mode == "PLACEHOLDER_LEAK" for f in report.findings)

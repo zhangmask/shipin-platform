@@ -132,13 +132,53 @@ class TestFinalReviewContext:
         assert "笔记本" not in p2
 
     def test_shot_boundaries_and_frames(self):
+        """_context_frames: 每镜全覆盖采样——不丢镜头、帧落在镜内、含中段。"""
         from shipin_platform.review.hard_gates import (_shot_boundaries,
                                                        _context_frames)
         shots = [{"duration_sec": 5}, {"duration_sec": 5}, {"duration_sec": 3}]
         assert _shot_boundaries(shots) == [0.0, 5.0, 10.0]
         frames = _context_frames(13.0, shots, 12)
-        assert all(0 <= t <= 13.0 for t in frames)
+        # 返回 [(t, shot_idx)...], t 不越界,帧数不超预算
+        assert all(0 <= t <= 13.0 for t, _ in frames)
         assert len(frames) <= 12
+        # 每镜至少 3 帧(开/中/合),且帧时间落在对应镜头区间内
+        by_shot: dict[int, list[float]] = {}
+        bounds = _shot_boundaries(shots)
+        for t, idx in frames:
+            by_shot.setdefault(idx, []).append(t)
+            assert bounds[idx] <= t <= bounds[idx] + shots[idx]["duration_sec"]
+        assert len(by_shot) == 3, "任何镜头都不允许被整体遗漏"
+        for idx, ts in by_shot.items():
+            assert len(ts) >= 3
+            # 中段采样:同一镜内帧间距 ≥0.3s(不是同一帧,也不是贴边两帧)
+            assert max(ts) - min(ts) >= 0.3
+
+    def test_drop_prefers_boundary_frames_keeps_middle(self):
+        """超预算丢帧时丢「紧贴镜头边界」的帧,中段最容易崩坏的帧必须留下。"""
+        from shipin_platform.review.hard_gates import _context_frames
+        shots = [{"duration_sec": 7} for _ in range(3)]   # 3 镜×7s,各铺 5 帧
+        frames = _context_frames(21.0, shots, 12)          # 15 帧超预算 → 丢到 12
+        assert len(frames) == 12
+        by_shot: dict[int, list[float]] = {}
+        for t, idx in frames:
+            by_shot.setdefault(idx, []).append(t)
+        for idx, ts in by_shot.items():
+            assert len(ts) >= 3
+            start, end = idx * 7.0, (idx + 1) * 7.0
+            # 每镜头中段三分之一区间必须有帧(丢的是边界帧,不是中段帧)
+            assert any(start + 7.0 / 3 < t < end - 7.0 / 3 for t in ts), \
+                f"镜头{idx} 中段无帧,丢帧策略错误"
+
+    def test_long_board_scales_frames_per_shot(self):
+        """镜头多时按每镜配额扩容预算,而非一刀切 16 帧封顶。"""
+        from shipin_platform.review.hard_gates import _context_frames
+        shots = [{"duration_sec": 4} for _ in range(9)]   # 9 镜 36s
+        frames = _context_frames(36.0, shots, 12)
+        assert len(frames) >= 9 * 2, "每镜至少 2 帧,9 镜不下于 18 帧"
+        by_shot = {}
+        for t, idx in frames:
+            by_shot.setdefault(idx, []).append(t)
+        assert len(by_shot) == 9
 
     def test_blocked_without_key(self, monkeypatch, tmp_path):
         from shipin_platform.review import hard_gates
@@ -187,10 +227,21 @@ VALID_BRIEF = {
 }
 
 
+# 每镜一句不重复的旁白（旁白查重门：同一句只能出现一次）
+NARRATIONS = [
+    "夜色下的城市街道闪着点微光",
+    "加班的人拖着步子走向公交站",
+    "街角的咖啡店还亮着那盏灯",
+    "推门进去，暖气迎面涌过来",
+    "一杯热咖啡，正好接到电话",
+    "这就是今天下班后的好时光",
+]
+
+
 VALID_SCRIPT = {
     "duration_sec": 30,
     "shots": [{"shot_id": f"S{i+1:02d}", "duration_sec": 5,
-               "narration": "夜色下的城市街道闪着点微光",
+               "narration": NARRATIONS[i],
                "scene": "夜色街道"} for i in range(6)],
 }
 # 台词门(§10.7):全片 ≥2 镜合规 dialogue——测试样本跟上新 schema
@@ -203,16 +254,18 @@ VALID_SCRIPT["shots"][3]["dialogue"] = {"role_code": "hero_male",
 def _valid_storyboard() -> dict:
     beats = ["hook", "pain", "turn", "value", "outro", "落版"]
     sizes = ["ws", "cu", "ms", "ecu", "ws", "cu"]
+    cams = ["dolly in", "truck right", "pedestal up", "crane down",
+            "dolly out", "static"]
     return {"hero_shot": "S04",
             "shots": [{"shot_id": f"S{i+1:02d}", "duration_sec": 5,
                        "beat": beats[i], "rhythm": "slow" if i % 2 else "medium",
                        "sfx": f"sfx_{i}", "shot_size": sizes[i],
-                       "narration": "夜色下的城市街道闪着点微光",
+                       "narration": VALID_SCRIPT["shots"][i]["narration"],
                        "subject": "a young woman in a wool coat",
                        "motion": "walks forward slowly",
                        "scene": "neon street then warm cafe",
                        "spatial": "medium wide, subject left third",
-                       "camera": "dolly in"} for i in range(6)]}
+                       "camera": cams[i]} for i in range(6)]}
 
 
 class TestApiGates:
@@ -367,7 +420,7 @@ class TestApiGates:
         assert any("narration" in c for c in codes)
         # 补上 narration 后通过
         for i, s in enumerate(sb["shots"]):
-            s["narration"] = "夜色下的城市街道闪着点微光"
+            s["narration"] = NARRATIONS[i]
         r2 = client.post("/api/review/iterate",
                          json={"stage": "storyboard", "data": sb, "project_id": "p9"})
         assert r2.json()["decision"] in ("pass", "pass_with_warnings")
@@ -384,3 +437,203 @@ def test_gate_endpoints_require_project_id(client):
     r = client.post("/api/tts/narrate", json={
         "script": {"shots": []}, "output_dir": "./outputs"})
     assert r.status_code == 422
+
+
+class TestClipSrcFallback:
+    """时间轴红线与拼接共用 _clip_src 回退：旧项目 manifest 缺 clip 字段
+    （或空串）时按约定命名解析，不得算成全员复用空串而误杀 REUSE 红线
+    （轮6 e2e 实战发现并修复的回归）。"""
+
+    def test_recorded_clip_wins(self, tmp_path):
+        from shipin_platform.orchestration.pipeline_runner import _clip_src
+        m = {"shots": {"S01": {"clip": r"E:/v/shots/a.mp4"}}}
+        assert _clip_src(m, "S01", tmp_path) == r"E:/v/shots/a.mp4"
+
+    def test_missing_clip_falls_back_to_convention(self, tmp_path):
+        from shipin_platform.orchestration.pipeline_runner import _clip_src
+        m = {"shots": {"S01": {}}}
+        assert _clip_src(m, "S01", tmp_path) == str(
+            tmp_path / "S01_clip.mp4")
+
+    def test_empty_clip_field_falls_back(self, tmp_path):
+        from shipin_platform.orchestration.pipeline_runner import _clip_src
+        m = {"shots": {"S01": {"clip": ""}}}
+        assert _clip_src(m, "S01", tmp_path) == str(
+            tmp_path / "S01_clip.mp4")
+
+    def test_legacy_manifest_no_shots_record(self, tmp_path):
+        from shipin_platform.orchestration.pipeline_runner import _clip_src
+        assert _clip_src({}, "S01", tmp_path) == str(
+            tmp_path / "S01_clip.mp4")
+
+    def test_distinct_fallback_sources_do_not_trip_reuse(self, tmp_path):
+        """9 镜各自回退到约定命名 → 9 个不同 src，REUSE 红线必须放行。"""
+        from shipin_platform.orchestration.pipeline_runner import _clip_src
+        from shipin_platform.review.hard_gates import check_timeline
+        sids = [f"S{i:02d}" for i in range(1, 10)]
+        tl = [{"src": _clip_src({}, s, tmp_path),
+               "start": float(i), "end": float(i + 1), "at": float(i)}
+              for i, s in enumerate(sids)]
+        r = check_timeline(tl, duration_sec=9.0)
+        assert r["verdict"] == "ok"
+
+
+# ── 轮8e:审查升级门(瞬变闪帧 / 分镜符合度 / 跨镜身份 / 时间轴对账) ─────
+
+
+def _make_flash_clip(out, bands: list[tuple[float, float]],
+                     dur: float = 4.0) -> Path:
+    """灰度底 + 指定时间段整帧闪白(如 [(1.0,1.4),(2.6,3.0)])。"""
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    enables = ["between(t,{a},{b})".format(a=a, b=b) for a, b in bands]
+    subprocess.run(
+        [FFMPEG, "-y", "-f", "lavfi", "-t", str(dur),
+         "-i", f"color=c=gray:s=320x240:r=24",
+         "-vf", "drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill:"
+                f"enable='{'+'.join(enables)}'",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out)],
+        capture_output=True, text=True, check=True)
+    return Path(out)
+
+
+def _vlm_stub(monkeypatch, *, shot_issues=None, same_person=None):
+    """替换 hard_gates 的 VLM 通道:按提示词分派 SAME_PERSON 与批次问题。"""
+    import json as _json
+    from shipin_platform.review import hard_gates
+
+    def ask(images, prompt, key, max_tokens=1800):
+        if "同一人" in prompt:  # 跨镜身份成对判定(SAME_PERSON_PROMPT)
+            if same_person is None:
+                return '{"same": true, "spec": "", "reason": ""}'
+            return _json.dumps({"same": False, "spec": "脸换了",
+                                "reason": "两镜不是同一张脸"},
+                               ensure_ascii=False)
+        body = {"frames": [], "breaks": [], "brand_seen": True,
+                "shot_issues": [] if shot_issues is None else shot_issues}
+        return _json.dumps(body, ensure_ascii=False)
+
+    monkeypatch.setattr(hard_gates, "_vlm_credentials", lambda: "fake-key")
+    monkeypatch.setattr(hard_gates, "_ask_vlm", ask)
+
+
+class TestTransientGate:
+    def test_flash_bands_caught_on_clip(self, tmp_path):
+        from shipin_platform.review.clip_qc import qc_clip
+        flash = _make_flash_clip(str(tmp_path / "flash.mp4"),
+                                 [(1.0, 1.4), (2.6, 3.0)])
+        r = qc_clip(str(flash), shot_id="S01")
+        codes = {f["code"] for f in r["findings"]}
+        assert "TRANSIENT_FLASH" in codes, r["findings"]
+        assert r["checks"]["transient"]["count"] >= 2
+        assert r["verdict"] == "fix"
+
+    def test_clean_clip_has_no_transient(self, tmp_path):
+        from shipin_platform.review.clip_qc import qc_clip
+        clip = _make_motion_clip(tmp_path / "ok.mp4", 4.0)
+        r = qc_clip(str(clip), shot_id="S01", check_motion=True)
+        assert r["checks"]["transient"]["count"] == 0
+        codes = {f["code"] for f in r["findings"]}
+        assert "TRANSIENT_FLASH" not in codes
+
+    def test_final_transient_flags_flash_frames(self, monkeypatch, tmp_path):
+        _vlm_stub(monkeypatch)
+        from shipin_platform.review import hard_gates
+        flash = _make_flash_clip(tmp_path / "final.mp4",
+                                 [(1.0, 1.4), (2.6, 3.0)])
+        ctx = {"shots": [{"shot_id": "S01", "duration_sec": 4.0,
+                          "subject": "产品", "scene": "演播室"}]}
+        r = hard_gates.vlm_review_final(str(flash), frames_count=4, context=ctx)
+        codes = {f["code"] for f in r["findings"]}
+        assert "FINAL_TRANSIENT_SPIKES" in codes, r["findings"]
+        assert r["deterministic"]["transient_spikes"]
+
+
+class TestStoryMismatchGate:
+    def test_shot_issue_is_critical(self, monkeypatch, tmp_path):
+        _vlm_stub(monkeypatch, shot_issues=[
+            {"shot": "S01", "issue": "分镜写办公室,画面是厨房"}])
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "m.mp4", 4.0)
+        ctx = {"shots": [{"shot_id": "S01", "duration_sec": 4.0,
+                          "subject": "女主角", "scene": "办公室"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        codes = {f["code"] for f in r["findings"]}
+        assert "SHOT_STORY_MISMATCH" in codes, r["findings"]
+
+    def test_clean_board_no_shot_issues(self, monkeypatch, tmp_path):
+        _vlm_stub(monkeypatch)
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "m2.mp4", 4.0)
+        ctx = {"shots": [{"shot_id": "S01", "duration_sec": 4.0,
+                          "subject": "女主角", "scene": "办公室"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        assert "SHOT_STORY_MISMATCH" not in {f["code"] for f in r["findings"]}
+
+    def test_prompt_carries_story_expectations(self):
+        from shipin_platform.review.hard_gates import _batch_prompt
+        ctx = {"shots": [{"shot_id": "S01", "duration_sec": 4.0,
+                          "subject": "女主角", "scene": "办公室",
+                          "motion": "推门走进来"}]}
+        batch = [{"t": 1.0, "shot": "镜头S01", "shot_idx": 0}]
+        p = _batch_prompt("1.0", 1, ctx, batch)
+        assert "分镜预期" in p
+        assert "场景[办公室]" in p
+        assert "主体[女主角]" in p
+        assert "shot_issues" in p
+
+
+class TestIdentityGate:
+    def test_identity_switch_caught(self, monkeypatch, tmp_path):
+        _vlm_stub(monkeypatch, same_person=False)
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "i.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "女主角"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "女主角"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        codes = {f["code"] for f in r["findings"]}
+        assert "IDENTITY_SWITCH" in codes, r["findings"]
+        assert r["identity"]["checked"] == 1
+
+    def test_distinct_subjects_skipped(self, monkeypatch, tmp_path):
+        """『顾客』vs『店员』不同角色,不做身份判定,不误报换头。"""
+        _vlm_stub(monkeypatch)
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "i2.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "顾客"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "店员"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        assert r["identity"]["checked"] == 0
+        assert "IDENTITY_SWITCH" not in {f["code"] for f in r["findings"]}
+
+
+class TestTimelineAccounting:
+    def test_missing_shot_is_critical(self):
+        from shipin_platform.review.hard_gates import check_timeline
+        tl = [{"shot_id": "S01", "start": 0, "end": 2, "at": 0},
+              {"shot_id": "S02", "start": 0, "end": 2, "at": 2}]
+        r = check_timeline(tl, duration_sec=4.0,
+                           expected_shot_ids=["S01", "S02", "S03"])
+        codes = {f["code"] for f in r["findings"]}
+        assert "SHOT_MISSING" in codes
+        assert r["verdict"] == "fix"
+
+    def test_injected_shot_is_critical(self):
+        from shipin_platform.review.hard_gates import check_timeline
+        tl = [{"shot_id": "S01", "start": 0, "end": 2, "at": 0},
+              {"shot_id": "S02", "start": 0, "end": 2, "at": 2},
+              {"shot_id": "S09", "start": 0, "end": 2, "at": 4}]
+        r = check_timeline(tl, duration_sec=6.0,
+                           expected_shot_ids=["S01", "S02"])
+        codes = {f["code"] for f in r["findings"]}
+        assert "SHOT_INJECTED" in codes
+
+    def test_full_cover_ok(self):
+        from shipin_platform.review.hard_gates import check_timeline
+        tl = [{"shot_id": "S01", "src": "a.mp4", "start": 0, "end": 2, "at": 0},
+              {"shot_id": "S02", "src": "b.mp4", "start": 0, "end": 2, "at": 2}]
+        r = check_timeline(tl, duration_sec=4.0,
+                           expected_shot_ids=["S01", "S02"])
+        assert r["verdict"] == "ok", r["findings"]

@@ -120,6 +120,9 @@ export default function ProjectList() {
             <button className="primary" onClick={() => nav("/graph")}>
               ⚡ 节点画布
             </button>
+            <button className="primary" onClick={() => nav("/ref")}>
+              🎬 参考复刻
+            </button>
           </div>
         </div>
 

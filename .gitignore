@@ -38,4 +38,5 @@ assets/
 
 # 本地工具缓存
 .mimosa/
-._cues_*/
+._cues_*/data/references/
+data/references/

@@ -121,6 +121,8 @@ class FailureClassifier:
         "THEN_CONNECTION": ("language", "连接词错误", "S5"),
         "NARRATION_TOO_LONG": ("length", "旁白过长", "S6"),
         "INFEASIBLE_SCENE": ("feasibility", "不可行场景", "S7"),
+        "NARRATION_DUPLICATED": ("language", "旁白重复", "S8"),
+        "PLACEHOLDER_LEAK": ("language", "占位符", "S9"),
     }
 
     # ── Storyboard failures ────────────────────────────────────────
@@ -133,7 +135,10 @@ class FailureClassifier:
         "INCOMPLETE_5ASPECT": ("completeness", "5-Aspect不完整", "ST6"),
         "ARC_INCOMPLETE": ("story", "五幕骨架缺失", "ST7"),
         "BEAT_FIELDS_MISSING": ("arc", "质感三字段缺失", "ST8"),
-        "SHOT_REUSED": ("reuse", "素材复月超限", "ST9"),
+        "SHOT_REUSED": ("reuse", "素材复用超限", "ST9"),
+        "NARRATION_DUPLICATED": ("language", "旁白重复", "ST10"),
+        "CAMERA_SAME_ADJACENT": ("camera", "机位重复", "ST11"),
+        "PLACEHOLDER_LEAK": ("language", "占位符", "ST12"),
     }
     # 素材复用红线的模型值(§10.7.1):同一 shot 变量 ≥3 次即危急。
     _REUSE_HARD_LIMIT = 3
@@ -204,6 +209,7 @@ class FailureClassifier:
         "CONTRADICTION", "AMBIGUOUS_TYPE",
         "ARC_INCOMPLETE", "BEAT_FIELDS_MISSING", "SHOT_REUSED",
         "NARRATION_TOO_LONG", "REUSE_LIMIT_EXCEEDED",
+        "NARRATION_DUPLICATED", "CAMERA_SAME_ADJACENT", "PLACEHOLDER_LEAK",
     })
 
     def classify(self, stage: str, finding_text: str, evidence: str = "",
@@ -903,6 +909,63 @@ class ReviewEngine:
                 proposed_fix="给至少 2 镜加 dialogue(角色开口说话, 内容口语短句, ≤20 字), 与旁白信息互补不重复",
             ))
 
+        # ── 抽象审核 · 旁白跨镜重复 ─────────────────────────────────
+        # e2e-f3e40f87 实证:同一句旁白(如"暖灯、木质、咖啡香")被两镜
+        # 原样复用,审核连过五关漏进成片——配音会念两遍,观众直接出戏。
+        # 一句旁白全片只允许出现一次,逐字重复即 critical。
+        seen_narration: dict[str, list[str]] = {}
+        for s in shots:
+            n = s.get("narration")
+            if not isinstance(n, str) or not n.strip():
+                continue
+            key = re.sub(r"\s+", "", n)
+            seen_narration.setdefault(key, []).append(
+                str(s.get("shot_id") or "?"))
+        for key, ids in seen_narration.items():
+            if len(ids) >= 2:
+                cls = self.classifier.classify(
+                    "script", "narration_duplicated", ids[0])
+                findings.append(Finding(
+                    dimension="language", severity=Severity.CRITICAL,
+                    issue=f"旁白「{key[:40]}」在镜头 {', '.join(ids)} 重复出现——同一句配音要念两遍",
+                    evidence=f"shots with identical narration: {ids}",
+                    failure_mode=cls["mode"], revision_strategy=cls["strategy"],
+                    proposed_fix="保留一处,另一镜改写为语义不同、节奏相衬的新旁白(一句一个信息点)",
+                ))
+
+        # ── 抽象审核:占位符泄漏 ─────────────────────────────────────
+        # brief 里"XX咖啡"这类占位符一旦穿过剧本/分镜直接进旁白,成品
+        # 字幕与配音都会念出"XX"——人工一看就"不正常",规则必须拦下。
+        def _placeholder_hit(text: str, patterns: tuple) -> str:
+            for pat in patterns:
+                if re.search(pat, text):
+                    return pat
+            return ""
+
+        _PLACEHOLDER_PATTERNS = (r"XX\d*|xx\d*", r"占位|placeholder|TBD|TODO",
+                                 r"\{[\u4e00-\u9fff:：]{1,12}\}", r"[【】]",
+                                 r"<品牌|\[品牌")
+        for s in shots:
+            samples = {
+                "narration": s.get("narration", ""),
+                "dialogue": str((s.get("dialogue") or {}).get("text", ""))
+                if isinstance(s.get("dialogue"), dict) else s.get("dialogue", ""),
+            }
+            for field, text in samples.items():
+                if not isinstance(text, str):
+                    continue
+                hit = _placeholder_hit(text, _PLACEHOLDER_PATTERNS)
+                if hit:
+                    cls = self.classifier.classify(
+                        "script", "placeholder_leak", hit)
+                    findings.append(Finding(
+                        dimension="language", severity=Severity.CRITICAL,
+                        issue=f"镜头{s.get('shot_id', '?')}的{field}含占位符'{hit}'——会原样进配音/字幕",
+                        evidence=f"{field}: {str(text)[:60]}",
+                        failure_mode=cls["mode"], revision_strategy=cls["strategy"],
+                        proposed_fix="替换为真实品牌名/产品名等具体内容,禁止把模板占位符带入台词",
+                    ))
+
         return findings
 
     def _review_storyboard(self, storyboard: dict) -> list[Finding]:
@@ -1077,7 +1140,7 @@ proposed_fix="补齐 beat/rhythm/sfx 三字段(TVC 质感必备,AGENT_GUIDE §10
                     proposed_fix="为该镜补 narration(一句 ≤14 字);剧本/分镜必须同步改并保持镜数一致",
                 ))
 
-        # ── Soft gate:收束落版必须存在于末段(§10.7 第3条)──────────
+# ── Soft gate:收束落版必须存在于末段(§10.7 第3条)──────────
         if len(shots) >= 4:
             last3 = shots[-3:]
             has_outro = any(
@@ -1089,12 +1152,86 @@ proposed_fix="补齐 beat/rhythm/sfx 三字段(TVC 质感必备,AGENT_GUIDE §10
                 findings.append(Finding(
                     dimension="story",
                     severity=Severity.SUGGESTION,
-                    issue="落版拍不在最后3镜:品牌 slogan/logo 需要片尾专用空间(§10.7 第3条)",
+                    issue="落版拍不在最后3镜:品牌 slogan/logo 需要片尾专用空间(§3 第 10.7 条)",
                     evidence=f"outro marks at {beat_marks.get('outro', [])}",
                     failure_mode=cls["mode"],
                     revision_strategy=cls["strategy"],
                     proposed_fix="把落版镜头移到末段 2-5s,保证旁白不争夺落版气口",
                 ))
+
+        # ── 抽象审核 · 相邻镜头机位雷同 ──────────────────────────────
+        # e2e-f3e40f87 实证:S01-S05 camera 全是 static/dolly in 交替重复,
+        # shot_size 逐镜不同所以 ST2 查不出——成片观感"每镜都差不多"。
+        # 机位(camera)是镜头语言差异的直接载体:相邻镜 camera 逐字相同
+        # (允许的例外:品牌落版末镜静态 logo,其 scene 含 logo/品牌/背景)。
+        _cam_cache: list[str] = []
+        for i, s in enumerate(shots):
+            cam = str(s.get("camera") or "").strip().lower()
+            if not cam:
+                continue
+            _cam_cache.append(cam)
+        for i in range(1, len(_cam_cache)):
+            prev = shots[i - 1]
+            cur = shots[i]
+            # 落版专用镜头(纯色背景+logo/slogan)允许 static,不判机位重复
+            cscene = str(cur.get("scene") or "")
+            pscene = str(prev.get("scene") or "")
+            if _cam_cache[i] == _cam_cache[i - 1] and not \
+                    any(mark in cscene for mark in ("logo", "slogan", "落版", "背景")):
+                cls = self.classifier.classify(
+                    "storyboard", "camera_duplicated",
+                    f"{prev.get('shot_id', i)}->{cur.get('shot_id', i + 1)}")
+                findings.append(Finding(
+                    dimension="variation",
+                    severity=Severity.CRITICAL,
+                    issue=f"镜头{cur.get('shot_id', i + 1)}与上一镜同为机位'{_cam_cache[i]}'——镜头语言无差异",
+                    evidence=f"consecutive camera='{_cam_cache[i]}' (S{prev.get('shot_id', i)} -> S{cur.get('shot_id', i + 1)})",
+                    failure_mode=cls["mode"],
+                    revision_strategy=cls["strategy"],
+                    proposed_fix="相邻镜头换用不同机位(dolly/truck/crane/pedestal 交替),景别也尽量跨档;品牌落版镜除外",
+                ))
+
+        # ── 抽象审核:旁白跨镜重复 + 占位符泄漏(剧本同款规则) ──────
+        seen_narr: dict[str, list[str]] = {}
+        for s in shots:
+            n = s.get("narration")
+            if isinstance(n, str) and n.strip():
+                seen_narr.setdefault(re.sub(r"\s+", "", n), []).append(
+                    str(s.get("shot_id") or "?"))
+        for key, ids in seen_narr.items():
+            if len(ids) >= 2:
+                cls = self.classifier.classify(
+                    "storyboard", "narration_duplicated", ids[0])
+                findings.append(Finding(
+                    dimension="language", severity=Severity.CRITICAL,
+                    issue=f"旁白「{key[:40]}」在镜头 {', '.join(ids)} 重复出现——同一句配音要念两遍",
+                    evidence=f"shots with identical narration: {ids}",
+                    failure_mode=cls["mode"], revision_strategy=cls["strategy"],
+                    proposed_fix="保留一处,另一镜改写为语义不同的旁白",
+                ))
+
+        for s in shots:
+            samples = {
+                "narration": s.get("narration", ""),
+                "subject": s.get("subject", ""),
+                "motion": s.get("motion", ""),
+                "scene": s.get("scene", ""),
+            }
+            for field, text in samples.items():
+                if not isinstance(text, str):
+                    continue
+                for pat in ("XX", "占位", "placeholder", "TBD", "TODO"):
+                    if pat in text:
+                        cls = self.classifier.classify(
+                            "storyboard", "placeholder_leak", pat)
+                        findings.append(Finding(
+                            dimension="language", severity=Severity.CRITICAL,
+                            issue=f"镜头{s.get('shot_id', '?')}的{field}含占位符'{pat}'",
+                            evidence=f"{field}: {text[:60]}",
+                            failure_mode=cls["mode"],
+                            revision_strategy=cls["strategy"],
+                            proposed_fix="替换为具体视觉描述/真实品牌名,禁止模板占位符",
+                        ))
 
         return findings
 

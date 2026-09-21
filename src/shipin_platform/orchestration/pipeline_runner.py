@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import time
 from pathlib import Path
 from shipin_platform import roots
@@ -62,6 +63,7 @@ LOCATION_TOKENS = ["写字楼", "办公室", "会议室", "办公桌", "工位",
 SCRIPT_PROMPT = """你是严格的 TVC 编剧。依据 brief 创作剧本,输出严格 JSON(无 markdown、无解释):
 {"duration_sec": <int>, "shots": [{"shot_id": "S01", "duration_sec": <2-5>, "narration": "<一句≤14字的画外旁白,可空串>", "dialogue": {"role_code": "hero_male|colleague_male|assistant_female", "text": "<该角色在镜头内说出口的台词,≤20字>"} 或省略, "scene": "<单一地点单一事件,≤30字>"}]}
 硬规则:镜头 5-10 个(短片取下限,保证每镜 ≥2.5s);结构 hook→pain→turn→value→outro(末镜=品牌落版);每镜必须有 narration 或 dialogue 之一(两拍换声,忌双轨同压);**全片至少 2 镜必须有 dialogue**(真人开口说话,禁全片只剩话外音旁白);总字数(旁白+台词 words) ≈ duration×2.7;台词必须口语短句、一句一个意思、≤20字,禁书面腔;台词与旁白不得重复同一句话(同一信息二选一);说话角色每镜至多一个,ROLE_CODE 只取自列表;禁"然后"与旁白覆盖产品价值句;每个 scene 只有一个地点一个事件(单镜头必须可连续拍完);品牌元素≥3镜。
+台词质感红线:dialogue 必须像真人开口说话——口语短句(如"你喝一口试试""等我三分钟"),禁书面语长句、禁宣传口号腔;全片任意两句 narration 禁止逐字重复(同一句画外旁白全片只能出现一次);全片 narration/dialogue 禁止出现 XX/xxx/占位符/TBD/TODO/【】 等任何模板占位符,品牌名一律用 brief 中的真实名称;旁白念出来必须自然,有停顿有语气,禁诗歌腔。
 落版镜专项:末镜必须是【静态可拍画面】--暖色调背景上产品静置,品牌名与 slogan 以字幕/台词呈现(不在 scene 里写"叠加/浮现/多景切换"等非拍摄描述);末镜 narration=品牌名+slogan(不再设 dialogue)。
 
 brief:
@@ -69,12 +71,12 @@ brief:
 
 STORYBOARD_PROMPT = """你是严格的 TVC 分镜师。把剧本展开为分镜，输出严格 JSON（无 markdown、无解释）：
 {"hero_shot": "<shot_id>", "shots": [{"shot_id": "...", "duration_sec": <秒>, "beat": "hook|pain|turn|value|outro", "rhythm": "slow|medium|fast", "sfx": "sfx_<n>", "shot_size": "ecu|cu|mcu|cs|ms|ws|ows", "subject": "<与全片逐字一致的主角锚定>", "motion": "<英文运动短语，必含具体动作动词+速度/幅度词，如 slowly lifts the cup / turns her head gently / steam rises softly，禁中文>", "scene": "<单一地点>", "spatial": "<构图>", "camera": "<机位/运动术语：dolly/truck/crane/pedestal，禁zoom表移动>", "cause": "<承接上一镜的可拍视觉过渡>", "effect": "<给下一镜的可拍衔接点>", "narration": "<逐字复制剧本旁白,无旁白则空串>", "dialogue": "<逐字复制剧本台词,无台词则空串>", "speaking": "<仅当有 dialogue 时:该角色说话时的面部与口型英文描述,如 speaks the line with lips moving clearly, mouth shapes visible; 无台词则为空串>"}]}
-硬规则：每镜只一个连续动作；motion 必须是英文且含动作动词与速度/幅度副词（i2v 规则强校验）；**有 dialogue 的镜头 motion 必须含明显的说话/口型动作（speaks naturally / talking while doing X），并且 subject 必须保持说话人开口；无台词则 speaking 留空**；相邻镜 shot_size 必须不同档；主角锚定逐字一致（第一镜的 subject 后续镜逐字复制）；相邻镜间 cause/effect 必须可拍（动作接力/视线/光线）；末镜为品牌落版（静态画面+大字 logo，motion 写 static product shot with soft light drift，dialogue/speaking 留空）；品牌元素≥3镜。
+硬规则：每镜只一个连续动作；motion 必须是英文且含动作动词与速度/幅度副词（i2v 规则强校验）；**有 dialogue 的镜头 motion 必须含明显的说话/口型动作（speaks naturally / talking while doing X），并且 subject 必须保持说话人开口；无台词则 speaking 留空**；相邻镜 shot_size 必须不同档；主角锚定逐字一致（第一镜的 subject 后续镜逐字复制）；相邻镜间 cause/effect 必须可拍（动作接力/视线/光线）；**相邻镜头 camera 必须换机位（dolly/truck/crane/pedestal 交替使用，禁连镜重复同一机位）——仅在末镜品牌落版（scene 含 logo/纯色背景）允许 static 收尾**；**narration 逐字复制剧本且全片唯一，禁止把同一句旁白重复给两镜**；**全片 subject/scene/motion/narration 禁止出现 XX/占位符/TBD/TODO 等模板残留，品牌名用剧本真实名称**；末镜为品牌落版（静态画面+大字 logo，motion 写 static product shot with soft light drift，dialogue/speaking 留空）；品牌元素≥3镜。
 
 剧本(含台词):
 {script}
 
-主角锚定模板(第一镜 subject 用它,后续逐字复制):主角:25岁左右年轻女性,黑色长直发披肩、米白色针织开衫、深灰色围巾"""
+主角锚定模板(第一镜 subject 用它,后续逐字复制):{actor_anchor}"""
 
 
 def _project_dir(project_id: str) -> Path:
@@ -99,6 +101,221 @@ def _save(project_id: str, name: str, data) -> Path:
 def _load(project_id: str, name: str):
     p = _project_dir(project_id) / name
     return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+
+
+# ---------------------------------------------------------------------------
+# 品牌落版确定性通道（2026-09-21 阶梯实测定论）
+# ---------------------------------------------------------------------------
+# 5 档真实生成实测：agnes-video-2.5-flash 的 on-screen 品牌文字渲染
+# 不可依赖（5 档仅 1 档出品牌且伴随主体消失 VLM_BREAK；其余全 brand_seen
+# False）。品牌必须走**确定性通道**——名末镜旁白(TTS) + 字幕烧录(SRT)，
+# 这两路 100% 可控。但 LLM 分镜常把 brief 里的「XX咖啡/XX品牌」占位符逐字
+# 抄进 narration（e2e 实证：S08 narration='XX咖啡'，S09='享受每一刻'——
+# 真品牌名从未进入任何文本通道 → 终验 brand_seen=False）。
+# _bind_brand 在分镜过审后立即全字段绑实品牌名，并兜底强制落版镜旁白 =
+# 品牌名+slogan（模板已有此硬规则，这里做确定性落地）。
+
+_PH_RE = re.compile(
+    r"[Xx]{2,6}(?:咖啡|品牌|茶|饮|食品|奶|cafe|brand|coffee)?|xxx|XXXX")
+
+# 「品牌『XX』」在 product_info 里的常见形态：『』「」“”《》成对出现
+_BRAND_LITERAL_RE = re.compile(
+    r"品牌[\s]*[「『“\"《]([^」』”\"》]{1,16}?)[」』”\"》]")
+
+
+def _resolve_brand(brief: Optional[dict] = None) -> str:
+    """从 brief 解析唯一可信的品牌名（供绑定/入画/终验三处共用）。
+
+    实测教训（2026-09-21）：旧代码在缺 brand_name 时用「中文字符串 2-12
+    个」正则抓 product_info 首段，把「精品咖啡，手工烘焙…」开头的品类词
+    当品牌名 → 终验 BRAND_MISSING 判定/落版绑定全部对准错误目标。这里改
+    为三级精确解析，宁缺毋滥：
+      1) 显式 brand_name / product_name；
+      2) product_info 里的「品牌『XX』」字面（广告业务问卷的标准形态）；
+      3) 都没有 → ""（不猜测，纯信息展示项目无需品牌门）。
+    """
+    b = brief or {}
+    for k in ("brand_name", "product_name"):
+        v = str(b.get(k) or "").strip()
+        if v:
+            return v
+    info = str(b.get("product_info") or "")
+    m = _BRAND_LITERAL_RE.search(info)
+    return m.group(1).strip() if m else ""
+
+
+def _bind_brand(storyboard: dict, brief: dict) -> dict:
+    """把分镜文本里的 XX* 占位符绑为真实品牌名（幂等），并兜底落版镜口播。
+
+    只处理 'XX' 系占位（LLM 抄简占位的常见形态），不误伤正文；无品牌名时
+    原样返回。作用于 narration / dialogue / scene / subject 等全部文本位。
+    """
+    brand = _resolve_brand(brief)
+    if not brand:
+        return storyboard
+    shots = storyboard.get("shots", [])
+    if not isinstance(shots, list):
+        return storyboard
+
+    def _sub(text) -> str:
+        if not isinstance(text, str):
+            return text
+        return _PH_RE.sub(brand, text)
+
+    for s in shots:
+        d = s.get("dialogue")
+        if isinstance(d, dict) and isinstance(d.get("text"), str):
+            d["text"] = _sub(d["text"])
+        for k in ("narration", "scene", "subject", "spatial", "cause",
+                  "effect", "motion", "speaking"):
+            s[k] = _sub(s.get(k))
+
+    # 落版镜（末镜）旁白兜底：必须含品牌名（模板规则「末镜旁白=品牌名+slogan」）。
+    if shots:
+        last = shots[-1]
+        narr = str(last.get("narration") or "").strip()
+        slogan = str(brief.get("slogan") or "").strip()
+        last["narration"] = f"{brand}，{slogan or narr}"[:36] if brand not in narr \
+            else narr
+    return storyboard
+
+
+# ---------------------------------------------------------------------------
+# 意图传导 helper：brief 的字段必须真的「传导」到下游，而不是被散落常量截断
+# ---------------------------------------------------------------------------
+
+_STYLE_BY_TONE = {
+    "暖": "warm golden palette, cozy intimate lighting",
+    "治愈": "soft warm tones, gentle airy atmosphere",
+    "高级": "premium elegant aesthetic, refined subtle lighting",
+    "简约": "minimalist clean composition, soft daylight",
+    "活力": "bright vibrant colors, energetic dynamic lighting",
+    "科技": "sleek cool tones, futuristic clean lighting",
+    "清新": "fresh natural colors, bright airy look",
+    "复古": "vintage film look, warm nostalgic grade",
+}
+
+_VERTICAL_PLATFORMS = ("抖音", "快手", "小红书", "视频号", "douyin", "kuaishou",
+                       "xiaohongshu", "rednote", "sph", "竖屏")
+
+
+def _style_anchor(brief: Optional[dict]) -> str:
+    """风格锚派生：显式 style_anchor > brief.tone/creative_direction 语调映射 > 兜底。
+
+    之前的管线只认 style_anchor，用户填的 tone/creative_direction 到不了
+    生图 prompt——意图在 brief 即丢失。这里把中文基调映射成英文视觉短语，
+    保证用户可感知的「语气」贯穿到提示词。
+    """
+    b = brief or {}
+    explicit = str(b.get("style_anchor") or "").strip()
+    if explicit:
+        return explicit
+    raw = f"{b.get('tone') or ''} {b.get('creative_direction') or ''}"
+    for kw, en in _STYLE_BY_TONE.items():
+        if kw in raw:
+            return f"{en}, cinematic, soft natural light"
+    return "cinematic, soft natural light"
+
+
+def _canvas_for_brief(brief: Optional[dict]) -> tuple[int, int, str]:
+    """target_platform → (图像宽, 高, kenburns 输出尺寸)。
+
+    竖屏平台（抖音/快手/小红书/视频号）出 9:16 素材；其余出 16:9。
+    这是竖版出片的唯一决策点——首帧图、自末帧、kenburns 落版卡全部
+    从这里取画幅，杜绝「brief 说要竖屏、产出却是 16:9 横剪」。
+    """
+    plat = str((brief or {}).get("target_platform") or "").lower()
+    if any(k in plat for k in _VERTICAL_PLATFORMS):
+        return 720, 1280, "720x1280"
+    return 1280, 720, "1280x704"
+
+
+def _canvas_size_for(manifest: dict, brief: Optional[dict]) -> str:
+    """kenburns 输出尺寸跟随**实际在链素材**的画幅,而非只读 brief。
+
+    stitch 的 xfade 链要求全部入镜尺寸一致。变体复用基准素材池时,媒体
+    文件仍是基准当时生成的画幅(如 1280x704),而 brief 可能是竖屏平台
+    或新改的画幅参数——此时卡片若按 brief 出 9:16,与池里 16:9 主材
+    拼接必然尺寸不匹配报错。所以优先 ffprobe 探测链上镜头生成的 clip,
+    其次 master(变体共享 dataRoot 时会引用基准 master),都没有才回退
+    brief 画幅决策(全新竖屏项目在 generate 阶段已把 clip 建成 720x1280)。
+    """
+    shots = (manifest or {}).get("shots") or {}
+    for mrec in shots.values():
+        cp = mrec.get("clip")
+        if cp and Path(cp).is_file():
+            size = _ffprobe_size(cp)
+            if size:
+                return f"{size[0]}x{size[1]}"
+    for mrec in shots.values():
+        mp = mrec.get("master")
+        if mp and Path(mp).is_file():
+            size = _ffprobe_size(mp)
+            if size:
+                return f"{size[0]}x{size[1]}"
+    return _canvas_for_brief(brief)[2]
+
+
+def _ffprobe_size(path: str) -> Optional[tuple[int, int]]:
+    """ffprobe 视频/图片宽高；异常/文件缺失返回 None。"""
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "json", str(path)],
+        capture_output=True, text=True, shell=False)
+    try:
+        s = json.loads(r.stdout)["streams"][0]
+        return int(s["width"]), int(s["height"])
+    except Exception:  # noqa: BLE001 - 探测失败按未知尺寸处理
+        return None
+
+
+def _normalize_canvas(src: Path, dst: Path, w: int, h: int) -> bool:
+    """把任意画幅素材统一到目标画幅（比例不符时中心裁剪+黑边）。
+
+    stitch 的 xfade 链要求全部入镜尺寸一致；AGNES 固定输出 720p 横屏，
+    9:16 项目必须显式归一化，否则拼接阶段报尺寸不匹配。尺寸已吻合时
+    直接返回 False（不转码，零开销）。
+    """
+    size = _ffprobe_size(src)
+    if size == (w, h):
+        return False
+    vf = (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+          f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1")
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-i", str(src), "-vf", vf,
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an", str(dst)],
+        capture_output=True, text=True, shell=False)
+    return r.returncode == 0 and dst.exists()
+
+
+def _fit_duration_to_target(data: dict, target: float) -> tuple[dict, bool]:
+    """将剧本总时长等比逼近 brief 目标（tol 12%），返回 (data, 可达?)。
+
+    原管线不比对 brief.duration_sec——用户在表单写「30 秒」，剧本却
+    播 48 秒，成片时长完全不受意图约束。这里按比例缩放每镜（钳制在
+    2.0-8.0s 的可拍区间），缩放后仍够不着的（时长差太多钳完还差）返回
+    不可达，由调用方把该 finding 升级为 critical 阻断。
+    """
+    shots = data.get("shots")
+    if not isinstance(shots, list) or not shots:
+        return data, False
+    total = sum(float(s.get("duration_sec") or 0) for s in shots)
+    if total <= 0:
+        return data, False
+    dev = abs(total - target) / max(target, 0.001)
+    if dev <= 0.12:
+        return data, True
+    factor = target / total
+    new_shots = []
+    for s in shots:
+        d = float(s.get("duration_sec") or 0) * factor
+        new_shots.append({**s, "duration_sec": round(min(max(d, 2.0), 8.0), 1)})
+    fitted = sum(s["duration_sec"] for s in new_shots)
+    reachable = abs(fitted - target) / max(target, 0.001) <= 0.12
+    out = {**data, "shots": new_shots}
+    if isinstance(data.get("duration_sec"), (int, float)):
+        out["duration_sec"] = round(fitted, 1)
+    return out, reachable
 
 
 SCRIPT_REPAIR_PROMPT = """你是严格的 TVC 编剧。下面是一份剧本 JSON 和审片意见。逐条修复所有"必改"项(其余内容与字段保持原样不动),输出修复后的完整剧本 JSON(同一 schema,无 markdown、无解释)。
@@ -157,8 +374,19 @@ def _iterate(stage: str, data: dict, project_id: str, store,
     if stage == "script":
         b = _load(project_id, "brief.json")
         brief_ctx = b
+    # 意图闭环:剧本总时长必须贴合 brief.duration_sec(±12%)。
+    # 可达性在收敛后复查,钳制到极限仍不达标 → 升级 critical 阻断。
+    dur_target = 0.0
+    dur_reachable = True
+    if stage == "script" and brief_ctx:
+        try:
+            dur_target = float(brief_ctx.get("duration_sec") or 0)
+        except (TypeError, ValueError):
+            dur_target = 0.0
     llm_info = {}
     for round_num in range(1, max_rounds + 1):
+        if dur_target > 0:
+            data, dur_reachable = _fit_duration_to_target(data, dur_target)
         report = engine.run_review(stage, data, round_num=round_num)
         rounds.append(report.to_dict())
         if report.decision.value in ("pass", "pass_with_warnings", "stall", "stop"):
@@ -190,6 +418,25 @@ def _iterate(stage: str, data: dict, project_id: str, store,
                     final["revision_plan"].insert(
                         0, f"[LLM审片] {f['dimension']}: {f['issue'][:80]} "
                            f"→ 修复: {f['proposed_fix'][:150]}")
+
+    # 时长意图闭环收尾：钳制后仍凑不拢 brief 目标（如 10s 目标被钳到
+    # 8s×3 镜=24s）→ 升级 critical 阻断，绝不静默放行与用户时长意图
+    # 偏差 >12% 的剧本。
+    if dur_target > 0:
+        if not dur_reachable:
+            final["findings"].append({
+                "dimension": "duration", "severity": "critical",
+                "issue": f"总时长拟合后仍为{fitted_total:.1f}s,目标{dur_target:.1f}s(偏差{dev:.0%}),单镜 2-8s 限度内无法收敛",
+                "evidence": f"target={dur_target}, fitted={fitted_total}",
+                "failure_mode": "manual", "revision_strategy": "restructure",
+                "proposed_fix": "缩短台词/拆分镜头或调整 brief duration_sec 后再提交",
+                "status": "pending"})
+            final["stats"]["critical"] = (
+                final["stats"].get("critical", 0) + 1)
+            if final["decision"] in ("pass", "pass_with_warnings"):
+                final["decision"] = "revise"
+        final["metadata"] = {**(final.get("metadata") or {}),
+                             "duration": llm_meta}
 
     decision = final["decision"]
     h = stable_artifact_hash(data)
@@ -240,6 +487,13 @@ def run_text_phase(project_id: str, brief: dict, store,
     """brief→剧本→分镜 全部服务端生成+审核。LLM 生成失败或审核不收敛时
     返回 blocked 与原因(agent 只转述,不自行创作)。"""
     steps = []
+    # 前置检查:LLM key 未配置 → 明确报「未配置」而非 6 次生成失败后
+    # 报「审核未通过」——后者浪费时间且误导（真实原因是配置缺位）。
+    from shipin_platform.review.llm_review import _llm_key as _runner_llm_key
+    if not _runner_llm_key():
+        return {"ok": False, "phase": "text", "steps": steps,
+                "reason": "服务端未配置 LLM API Key(AGENTS_KEY 或 OPENAI_API_KEY)"
+                          "——生成的文案/分镜需要服务端大模型,配置后重试 /api/pipeline/text"}
     # brief 审核(无 LLM)
     b = _iterate("brief", brief, project_id, store, use_llm=False)
     steps.append({"stage": "brief", "decision": b["decision"]})
@@ -272,14 +526,22 @@ def run_text_phase(project_id: str, brief: dict, store,
         return {"ok": False, "phase": "text", "steps": steps,
                 "reason": "剧本 6 次生成/修复未通过审核(LLM+规则),需要人工介入"}
 
-    # 分镜:同样定向修复
+    # 分镜:同样定向修复。主角锚定优先取 brief.actor_anchor/hero_anchor/
+    # character(用户在产品里写了「男主角45岁」「穿蓝西装」就要用上),
+    # 无显式锚定才回落默认人设——不再把「25岁女主演」写死进每部片。
+    actor_anchor = (str(brief.get("actor_anchor")
+                        or brief.get("hero_anchor")
+                        or brief.get("character") or "").strip()
+                    or "主角为 25 岁左右年轻女性,黑色长直发披肩、米白色针织开衫、深灰色围巾")
     storyboard = None
     draft = None
     last_plan = []
     for attempt in range(6):
         if draft is None:
             draft = _llm_json(STORYBOARD_PROMPT.replace("{script}",
-                              json.dumps(script, ensure_ascii=False)), max_tokens=5000)
+                              json.dumps(script, ensure_ascii=False))
+                              .replace("{actor_anchor}", actor_anchor),
+                              max_tokens=5000)
         else:
             draft = _repair("storyboard", draft, last_plan) or draft
         if not draft or "shots" not in draft:
@@ -297,6 +559,9 @@ def run_text_phase(project_id: str, brief: dict, store,
         last_plan = r["revision_plan"]
         if r["decision"] in ("pass", "pass_with_warnings"):
             storyboard = r["data"]
+            # 占位符规避：LLM 会把 brief 里的「XX咖啡」抄进分镜(2026-09-21
+            # e2e 实证)，这里绑为真实品牌名再落盘；无品牌名时幂等不变。
+            storyboard = _bind_brand(storyboard, b["data"])
             break
     if storyboard is None:
         return {"ok": False, "phase": "text", "steps": steps,
@@ -378,13 +643,28 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
         except Exception as e:
             return {"ok": False, "phase": "generate", "reason": str(e)}
     storyboard = _load(project_id, "storyboard.json")
+    brief0 = _load(project_id, "brief.json") or {}
+    storyboard = _bind_brand(storyboard, brief0)
+    # 绑后落盘：assemble/UI 读盘即得规范版，不依赖再跑 generate 时重绑
+    _save(project_id, "storyboard.json", storyboard)
 
     # 提示词:从分镜确定性派生(无 LLM,无漂移空间)。放 generate 阶段:
     # BLOCKED 时本阶段会自动重派生并重审(动词表扩容后自愈)。
-    style = str((_load(project_id, "brief.json") or {}).get("style_anchor")
-                or "cinematic, soft natural light")
+    style = _style_anchor(_load(project_id, "brief.json"))
+    canvas_w, canvas_h, kb_size = _canvas_for_brief(
+        _load(project_id, "brief.json"))
+    brief0 = _load(project_id, "brief.json")
+    brand_name0 = _resolve_brand(brief0)
+    # C 变体实测(2026-09-21):提示词里给出品牌名+落点(杯身/物件)
+    # 即可驱动品牌入画(brand_seen False→True)。无品牌名不注入。
+    brand_shot = (f" The brand name {brand_name0!r} printed on a small "
+                  f"product label or cup, readable, softly lit." if brand_name0 else "")
     img_prompts, vid_prompts = [], []
-    for s in storyboard["shots"]:
+    _n_shots = len(storyboard["shots"])
+    for _i, s in enumerate(storyboard["shots"]):
+        # 品牌入画只放首/尾镜(广告惯例:开场亮牌、结尾收牌);中段镜头
+        # 不加,否则品牌文字在每镜都出现显假。
+        _brand = brand_shot if (_i == 0 or _i == _n_shots - 1) else ""
         dlg = s.get("dialogue")
         spk = (str(s.get("speaking") or "").strip()
                if isinstance(dlg, dict) and dlg.get("text") else "")
@@ -394,9 +674,20 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                             f"Scene: {s['scene']}. "
                             f"{s['spatial']}. {s['camera']}. {style}, no text"})
         vid_prompts.append({"shot_id": s["shot_id"],
-                            "prompt_text": f"{s['motion']}{speaking_en} "
-                                           f"Camera: {s['camera']}. "
-                                           f"Single continuous take, no cuts."})
+                            # 模板升级(2026-09-21 A/B 实测):A(中文短模板)在 2.5s
+                            # 出现主体变形;英文长模板(scene+固定机位+景深+主体居中
+                            # +禁止形变)verdict=pass 且运动能量 ×2。赢点固化在这里:
+                            "prompt_text": (f"{s['motion']}{speaking_en} "
+                                            f"Scene: {s['scene']}. "
+                                            f"Camera: {s['camera']}, fixed at "
+                                            f"medium close-up, shallow depth of "
+                                            f"field, subject stays centered. "
+                                            f"One single continuous take — no "
+                                            f"camera cut, no scene change, no "
+                                            f"morphing or shape change of the "
+                                            f"subject, natural stable motion, "
+                                            f"smooth ending."
+                                            f"{_brand}")})
     for stage, data in (("image_prompt", {"style_anchor": style, "shot_prompts": img_prompts}),
                         ("video_prompt", {"shot_prompts": vid_prompts})):
         row = store.get_stage(project_id, stage)
@@ -427,7 +718,7 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
             continue  # 素材池命中(base dataRoot 共享),无需重生成
         fp = work / f"{sid}.jpg"
         if not fp.exists():
-            r = generate_image_agnes(img_map[sid], 1280, 720, str(fp))
+            r = generate_image_agnes(img_map[sid], canvas_w, canvas_h, str(fp))
             if not r.get("ok"):
                 return {"ok": False, "phase": "generate",
                         "reason": f"{sid} 首帧图生成失败", "report": report}
@@ -452,7 +743,7 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                 pass  # 素材池命中,沿用基准末帧
             elif not lp.exists() and mode == "own_end":
                 base = img_map[sid]
-                r = generate_image_agnes(base + " , the action completed, end state of this exact shot, same framing and lighting", 1280, 720, str(lp))
+                r = generate_image_agnes(base + " , the action completed, end state of this exact shot, same framing and lighting", canvas_w, canvas_h, str(lp))
                 if not r.get("ok"):
                     return {"ok": False, "phase": "generate",
                             "reason": f"{sid} 末帧图生成失败", "report": report}
@@ -460,6 +751,21 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                             units=1.0, note=f"{sid} 自末帧")
             manifest["shots"][sid]["last_frame"] = str(ref_lp) if (ref_lp and Path(ref_lp).is_file()) else str(lp)
         manifest["shots"][sid]["boundary"] = by_id[sid]["boundary"]
+
+    # 2.5) image_gen 落账:哈希 = 首/末帧文件路径+字节数(内容重生成则失效)。
+    # 之前 image_gen 阶段从不 record_artifact → finalize 的 required=…video_gen
+    # 永远 NOT_STARTED,发布硬闸形同虚设。这里把每镜关键帧的实体指纹打进
+    # 状态机,重跑/替换素材都会让 hash 变化。
+    from shipin_platform.contracts import stable_artifact_hash as _sah
+    img_fp = {}
+    for sid, mrec in manifest["shots"].items():
+        for k in ("first_frame", "last_frame"):
+            p = mrec.get(k)
+            fp = Path(p) if p else None
+            img_fp[f"{sid}:{k}"] = (
+                str(fp) if fp and fp.is_file() else "",
+                fp.stat().st_size if fp and fp.is_file() else -1)
+    store.record_artifact(project_id, "image_gen", _sah(img_fp))
 
     # 3) 视频 + QC + 重试(落版卡留给 assemble 的 kenburns,不跑 agnes)
     for i, s in enumerate(shots):
@@ -509,12 +815,31 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                         units=round(max(dur, 2), 1), note=sid)
             qc = qc_clip(str(clip), shot_id=sid,
                          expected_duration_sec=dur,
-                         reference_image=mrec["first_frame"])
+                         reference_image=mrec["first_frame"],
+                         use_vlm=True)  # M5(2026-09-21 审计):dHash 盲区用 VLM 补
             attempts.append({"attempt": attempt + 1, "qc": qc["verdict"],
                              "cuts": qc["checks"]["internal_cuts"]["value"]})
             if qc["verdict"] == "ok":
                 mrec["qc"] = "ok"
+                # 画布归一化:AGNES 固定出 720p 横屏,9:16 项目必须统一到目标
+                # 画幅(中心裁剪+黑边),否则 stitch 的 xfade 链因尺寸不一致失败;
+                # master 也要同步归一化(转场会从 master 借帧补时长)。
+                cvp = work / f"{sid}_canvas.mp4"
+                if _normalize_canvas(str(clip), cvp, canvas_w, canvas_h):
+                    clip = str(cvp)
+                if (mrec.get("master") and Path(mrec["master"]).is_file()
+                        and _normalize_canvas(Path(mrec["master"]),
+                                              work / f"{sid}_canvas_master.mp4",
+                                              canvas_w, canvas_h)):
+                    mrec["master"] = str(work / f"{sid}_canvas_master.mp4")
                 mrec["clip"] = str(clip)
+                # 审计 G5:clip 内容哈希落账——assemble 时代验同一文件名是否
+                # 被换过内容(拼接阶段会按此清单逐片核对,防"审A拼B")
+                import hashlib as _hl
+                try:
+                    mrec["clip_sha256"] = _hl.sha256(Path(clip).read_bytes()).hexdigest()
+                except OSError:
+                    mrec.pop("clip_sha256", None)
                 store.record_clip_qc(project_id, sid, str(clip), "ok", {"attempts": attempts})
                 _save(project_id, "manifest.json", manifest)
                 break
@@ -572,9 +897,21 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                               "narration_path": manifest["shots"][s["shot_id"]]["tts"],
                               "dialogue_path": manifest["shots"][s["shot_id"]].get("dlg")}
                              for s in shots])
+    if align["verdict"] != "ok":
+        # 对齐失败必须阻断——原代码把 fix verdict 静默写进 manifest 继续
+        # assemble,旁白超窗/缺失的片子在拼接阶段才爆或干脆产错位片。
+        criticals = [f["message"] for f in align["findings"]
+                     if f.get("severity") == "critical"]
+        return {"ok": False, "phase": "generate",
+                "reason": f"旁白对齐未通过: {'; '.join(criticals)[:240]}",
+                "report": report,
+                "align": {"verdict": align["verdict"],
+                          "findings": align["findings"]}}
     manifest["align"] = align
     _save(project_id, "manifest.json", manifest)
-    bad = [t["shot_id"] for t in align["timeline"]]
+    # video_gen 落账:哈希 = 整份 manifest(含剪辑/QC/TTS/对齐)——assemble 前置
+    # 校验会比对同哈希,素材被改动或重新生成后 hash 变化 → 拒绝旧链条混拼。
+    store.record_artifact(project_id, "video_gen", _sah(manifest))
     return {"ok": True, "phase": "generate", "report": report,
             "align": {"verdict": align["verdict"], "total_sec": align["total_sec"],
                       "findings": align["findings"]}}
@@ -603,14 +940,57 @@ def _component_defaults(component_id: str) -> dict:
 
 
 def run_assemble_phase(project_id: str, store) -> dict:
-    """对齐→落版卡→逐边界转场拼接→调色→字幕→声音设计→mux→归一化→终验→发布。"""
+    """对齐→落版卡→逐边界转场拼接→调色→字幕→声音设计→mux→归一化→终验→发布。
+
+    硬闸门:storyboard 必须确认+PASS,且 manifest 与 video_gen 阶段记录的
+    artifact_hash 一致——杜绝「改了分镜/换素材不重跑 generate 就拼接」的
+    混料出片(v4 病根:assemble 在 storyboard 改写后仍引用旧镜头)。"""
+    # ── 闸门:人工确认 → 上游 PASS → manifest 与已验收素材哈希一致 ──
+    for gate in ("storyboard",):
+        try:
+            store.assert_confirmed(project_id, gate)
+        except Exception as e:
+            return {"ok": False, "phase": "assemble", "reason": str(e)}
+        try:
+            store.assert_stage_pass(project_id, gate)
+        except Exception as e:
+            return {"ok": False, "phase": "assemble", "reason": str(e)}
+    from shipin_platform.contracts import stable_artifact_hash as _sah
+    vg = store.get_stage(project_id, "video_gen")
+    if vg is None or vg["status"] != "PASS":
+        return {"ok": False, "phase": "assemble",
+                "reason": "video_gen 未通过——先跑 generate 阶段生成并验收全部镜头素材"}
     manifest = _load(project_id, "manifest.json")
     storyboard = _load(project_id, "storyboard.json")
+    storyboard = _bind_brand(storyboard, _load(project_id, "brief.json") or {})
     if not manifest or not manifest.get("align"):
         return {"ok": False, "phase": "assemble", "reason": "先跑 generate 阶段"}
+    if vg["artifact_hash"] != _sah(manifest):
+        return {"ok": False, "phase": "assemble",
+                "reason": "manifest 内容与 video_gen 验收时不一致(素材/分镜已变更)"
+                          "——请重新运行 generate 阶段后再拼接"}
     work = _project_dir(project_id)
+    brief = _load(project_id, "brief.json") or {}
     shots = storyboard["shots"]
     tl = manifest["align"]["timeline"]
+    # 审计 G5:clip 内容哈希一致性——generate 验收过的素材在拼接前必须字节一致,
+    # 防「审查通过的是 A 文件,拼接用的是换过的 B 文件」类狸猫换太子
+    import hashlib as _hl2
+    for _sid in sids:
+        _rec = (manifest.get("shots") or {}).get(_sid) or {}
+        _exp = _rec.get("clip_sha256")
+        if not _exp:
+            continue  # 旧项目无哈希记录,不做追溯
+        _cp = Path(_clip_src(manifest, _sid, work))
+        try:
+            if _hl2.sha256(_cp.read_bytes()).hexdigest() != _exp:
+                return {"ok": False, "phase": "assemble",
+                        "reason": (f"{_sid} 素材内容与 generate 阶段验收时不一致"
+                                   f"(clip_sha256 变更)——素材被替换,禁止拼接"),
+                        "clip_hash_mismatch": str(_cp)}
+        except OSError as _e:
+            return {"ok": False, "phase": "assemble",
+                    "reason": f"{_sid} 素材读取失败: {_e}"}
     windows = [t["window_sec"] for t in tl]
     sids = [t["shot_id"] for t in tl]
     # 组件配方默认值(远期3:散落常量升为可覆盖参数;异常时回退原常量)
@@ -632,7 +1012,8 @@ def run_assemble_phase(project_id: str, store) -> dict:
             kb_src = str(work / f"{last_sid}.jpg")
         kb = kenburns(kb_src, round(w9 + DEFAULT_TD, 2),
                       str(work / f"{last_sid}_clip.mp4"),
-                      zoom_to=comp_outro.get("zoom_to", 1.18))
+                      zoom_to=comp_outro.get("zoom_to", 1.18),
+                      size=_canvas_size_for(manifest, brief))
         if not kb.get("ok"):
             return {"ok": False, "phase": "assemble", "reason": f"kenburns: {kb.get('error')}"}
         manifest["shots"][last_sid]["clip"] = kb["output"]
@@ -640,8 +1021,7 @@ def run_assemble_phase(project_id: str, store) -> dict:
         out["kenburns"] = kb
 
     # 2) 逐边界转场拼接(clip 路径缺失时回退到约定命名)
-    clips = [manifest["shots"][s].get("clip") or str(work / f"{s}_clip.mp4")
-             for s in sids]
+    clips = [_clip_src(manifest, s, work) for s in sids]
     masters = [manifest["shots"][s].get("master") for s in sids]
     bts = [manifest["shots"][s].get("boundary", "dissolve") for s in sids[1:]]
     st = build_transition_stitch(clips, windows, str(work / "stitched.mp4"),
@@ -713,15 +1093,57 @@ def run_assemble_phase(project_id: str, store) -> dict:
     lm = loudness_measure(str(work / "final.mp4"))
     out["lufs"] = lm.get("input_i")
 
-    # 7) 终验 + 发布
-    ctx = {"product_info": str((_load(project_id, "brief.json") or {}).get("product_info", "")),
-           "brand_name": "XX咖啡", "slogan": "享受每一刻",
+    # 7) 终验 + 发布(品牌/口号从 brief 与落版镜台词派生,不再写死"XX咖啡")
+    last_narr = ""
+    if shots:
+        last_narr = str(shots[-1].get("narration") or "").strip()
+    brand_name = _resolve_brand(brief)
+    slogan = (str(brief.get("slogan") or "").strip() or last_narr
+              or "享受每一刻")[:40]
+    ctx = {"product_info": str(brief.get("product_info", "")),
+           "brand_name": brand_name, "slogan": slogan,
            "duration_sec": round(sum(windows), 2),
+           # G4(2026-09-21 审计):终验 VLM 逐帧对照分镜预期(场景/主体/动作),
+           # 缺这些字段时「画面演错剧本」在审查里无从谈起
            "shots": [{"shot_id": s["shot_id"], "duration_sec": t["window_sec"],
-                      "subject": str(s.get("subject"))[:40]}
+                      "subject": str(s.get("subject"))[:40],
+                      "scene": str(s.get("scene"))[:48],
+                      "motion": str(s.get("motion"))[:40],
+                      "narration": str(s.get("narration") or "")[:40]}
                      for s, t in zip(shots, tl)]}
-    from shipin_platform.review.hard_gates import vlm_review_final
+    from shipin_platform.review.hard_gates import vlm_review_final, check_timeline
+    # M7(2026-09-21 审计):成片层的素材复用/时序红线在此自动挂载为硬门,
+    # 不再是工厂手动 API 端点。timeline 按 align 窗口构造:每镜一条,
+    # at=该镜绝对开始时间、end=start+window,dur=window_sec。
+    tl_entries = []
+    _t_cursor = 0.0
+    for s, t in zip(sids, tl):
+        _dur = float(t.get("window_sec") or 0)
+        # 与拼接步骤同一回退（_clip_src）：manifest 未记 clip 时用约定命名，
+        # 否则时间轴会把缺失字段算成全员复用空串，误杀 REUSE 红线
+        _clip = _clip_src(manifest, s, work)
+        tl_entries.append({
+            "shot_id": s,
+            "src": _clip,
+            "start": round(_t_cursor, 3),
+            "end": round(_t_cursor + _dur, 3),
+            "at": round(float(t.get("narr_at") or t.get("audio_start_sec")
+                              or _t_cursor), 3)})
+        _t_cursor += _dur
+    # 审计 C2:剧本镜号全集 vs 时间线对账——漏镜/插镜由确定性门拦截
+    tchk = check_timeline(tl_entries, duration_sec=a_total(tl),
+                          expected_shot_ids=sids)
+    _save(project_id, "timeline_check.json", tchk)
+    out["timeline_check"] = {"verdict": tchk.get("verdict"),
+                             "findings": tchk.get("findings", [])}
     fv = vlm_review_final(str(work / "final.mp4"), frames_count=16, context=ctx)
+    if tchk.get("verdict") == "fix":
+        # timeline 红线(fix)直接并入终验——不能只靠 VLM 软提示
+        fv = dict(fv)
+        fv["findings"] = list(fv.get("findings") or []) + list(
+            tchk.get("findings") or [])
+        fv["verdict"] = "fix"
+        fv["reason"] = (fv.get("reason") or "") + "；timeline 门未过"
     _save(project_id, "final_review.json", fv)
     out["final_review"] = {"verdict": fv.get("verdict"),
                            "deterministic": fv.get("deterministic"),
@@ -729,7 +1151,12 @@ def run_assemble_phase(project_id: str, store) -> dict:
     if fv.get("verdict") != "pass":
         return {"ok": True, "phase": "assemble", "released": False,
                 "reason": "终验未通过,按 findings 修复后重跑 assemble", **out}
-    fin = store.record_artifact(project_id, "post_production", "RELEASED", status="RELEASED")
+    # 发布:post_production 阶段已在第 6 步用成片内容哈希记 PASS(finalize 的
+    # required 检查要求 status=PASS)——这里只留发布事件,不再覆盖成 RELEASED
+    # 状态(此前把 hash 覆盖成字面量"RELEASED"导致 finalize 永远 409)。
+    store.record_event(project_id, "released", "成片已发布(终验通过)",
+                       stage="post_production",
+                       detail=str(work / "final.mp4"))
     out["released"] = True
     out["final_path"] = str(work / "final.mp4")
     return {"ok": True, "phase": "assemble", **out}
@@ -737,6 +1164,19 @@ def run_assemble_phase(project_id: str, store) -> dict:
 
 def a_total(tl: list[dict]) -> float:
     return round(sum(t["window_sec"] for t in tl), 2)
+
+
+def _clip_src(manifest: dict, shot_id: str, work: Path) -> str:
+    """镜头源文件：manifest 记了 clip 用其路径，否则回退约定命名。
+
+    拼接与时间轴红线共用同一回退——旧项目 manifest 缺 clip 字段时，
+    若时间轴各自为政会把它算成「全员复用空串」，误杀 REUSE 红线。
+    """
+    rec = (manifest.get("shots") or {}).get(shot_id) or {}
+    p = rec.get("clip")
+    if p and str(p).strip():
+        return str(p)
+    return str(work / f"{shot_id}_clip.mp4")
 
 
 def _build_srt(storyboard: dict, tl: list[dict], manifest: Optional[dict] = None) -> str:

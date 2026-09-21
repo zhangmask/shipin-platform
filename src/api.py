@@ -840,6 +840,24 @@ def review_iterate(req: IterateRequest):
         else:
             store.record_artifact(req.project_id, req.stage, artifact_hash,
                                   status="BLOCKED")
+        # ── 产物落盘 + 内容变更时下游失效（与 /rewrite 同语义）──────
+        # 原来只记状态不写盘：AI 修复的 script/storyboard 落到响应里但不写
+        # script.json/storyboard.json，下游 generate 读磁盘旧稿 → 状态机
+        # PASS 与磁盘内容对不上，改了个寂寞。这里把迭代结果写回文件；哈希
+        # 变化说明内容真变了 → 清确认 + 失效下游，杜绝「改完旧链条继续花钱」。
+        if req.stage in ("script", "storyboard"):
+            from shipin_platform.orchestration.pipeline_runner import (
+                _save as _runner_save)
+            prev = store.get_stage(req.project_id, req.stage)
+            changed = prev is None or prev["artifact_hash"] != artifact_hash
+            _runner_save(req.project_id, f"{req.stage}.json", data)
+            if changed and final["decision"] in ("pass", "pass_with_warnings"):
+                store.clear_confirmation(req.project_id, req.stage)
+                n = store.invalidate_downstream(req.project_id, req.stage)
+                store.record_event(req.project_id, "stage_rewritten",
+                                   f"iterate 修正 {req.stage} 已写回，需重新确认",
+                                   stage=req.stage,
+                                   detail=f"下游 {n} 个阶段已失效")
 
     return {
         "stage": req.stage,
@@ -2912,6 +2930,10 @@ def platform_audit_events(limit: int = 500, request: Request = None):
 # 节点画布（手操编排）路由——图 CRUD + 节点真实执行
 from api_graph import router as _graph_router
 app.include_router(_graph_router)
+
+# 参考视频复刻路由——搜索/解析/下载/反推/注入画布
+from api_reference import router as _reference_router
+app.include_router(_reference_router)
 
 
 if __name__ == "__main__":

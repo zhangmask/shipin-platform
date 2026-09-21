@@ -108,10 +108,12 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def safe_fetch(url: str, timeout: int = 30,
-               allow_hosts: Optional[frozenset] = None) -> bytes:
+               allow_hosts: Optional[frozenset] = None,
+               headers: Optional[dict] = None) -> bytes:
     """统一出站抓取:协议+host 双重校验,不跟随重定向。
 
     allow_hosts: 可选白名单(host 必须命中),例如现有 _IMG_HOSTS。
+    headers: 可选附加请求头(如 Authorization),合并进 UA 头。
     """
     u = urlparse(url)
     if u.scheme not in ("http", "https"):
@@ -125,7 +127,8 @@ def safe_fetch(url: str, timeout: int = 30,
         raise ProviderSecurityError(
             f"host {u.hostname!r} 被安全网拒绝(non-routable IP)")
     opener = urllib.request.build_opener(_NoRedirect)
-    req = urllib.request.Request(url, headers={"User-Agent": "shipin-platform/1.0"})
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "shipin-platform/1.0", **(headers or {})})
     try:
         with opener.open(req, timeout=timeout) as resp:
             return resp.read()

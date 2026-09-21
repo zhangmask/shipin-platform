@@ -1,4 +1,4 @@
-/* 节点画布 —— ComfyUI 风格手操编排（GraphView.jsx） */
+/* 节点画布 —— ComfyUI 风格手操编排（GraphView.jsx，React Flow 渲染层） */
 
 .gv-root { display: flex; flex-direction: column; height: 100vh; background: #0f1117; color: #e2e8f0; }
 
@@ -30,33 +30,48 @@
 .gv-lib small { color: #8b94a7; margin-left: auto; font-size: 11px; }
 .gv-libdot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
 .gv-libs-load { color: #8b94a7; font-size: 12px; padding: 8px; }
+.gv-libs-title { color: #8b94a7; font-size: 12px; margin: 2px 0 2px; }
 
 .gv-canvas {
   flex: 1; position: relative; overflow: hidden; cursor: default;
-  background:
-    radial-gradient(circle at 1px 1px, #23283866 1px, transparent 0) 0 0 / 26px 26px,
-    #0f111a;
   user-select: none;
 }
-.gv-canvas:active { cursor: grabbing; }
+.gv-canvas::after { content: ""; position: absolute; inset: 0; pointer-events: none; }
 
-.gv-wires { }
-.gv-wire { fill: none; stroke: #5b6b9e; stroke-width: 2.5; transition: stroke 0.15s; }
-.gv-wire:hover { stroke: #93b4ff; stroke-width: 3.5; }
-.gv-wire.temp { stroke: #7aa2ff; stroke-dasharray: 7 5; }
-.gv-wireg.sel .gv-wire { stroke: #ffd479; stroke-width: 3.5; filter: drop-shadow(0 0 4px #f59e0b88); }
-
-/* 框选（Shift/中键拖拽） */
-.gv-marquee {
-  position: absolute; z-index: 20; border: 1px solid #93b4ff;
-  background: rgba(63, 84, 158, 0.18); pointer-events: none;
+/* ---- React Flow 容器覆盖（ComfyUI 式暗色主题） ---- */
+.react-flow { background: #0f111a; }
+.react-flow__pane { cursor: default; }
+.react-flow__node { width: auto; }
+.react-flow__node-gbox {
+  background: transparent; border: none; padding: 0;
+  filter: drop-shadow(0 6px 14px rgba(0, 0, 0, 0.35));
 }
+.react-flow__edge-path { stroke-width: 2.5; }
+.react-flow__edge:hover .react-flow__edge-path { stroke: #93b4ff; stroke-width: 3.5; }
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke: #ffd479; stroke-width: 3.5;
+  filter: drop-shadow(0 0 4px #f59e0b88);
+}
+.react-flow__connection-line { stroke: #7aa2ff; stroke-width: 2.5; stroke-dasharray: 7 5; }
+.react-flow__connection-path { fill: none; }
 
-/* 连线中的端口高亮：同 kind 可连（hot）／ 类型不符（cold 禁用感） */
-.gv-port.hot i { border-color: #34d399; box-shadow: 0 0 0 2px #34d39966; }
-.gv-port.hot em { color: #6ee7b7; }
-.gv-port.cold { opacity: 0.42; }
-.gv-port.cold i { cursor: not-allowed; }
+/* 端口（React Flow Handle 视觉）—— 节点左右缘的横向芯片 */
+.gv-handle {
+  width: 11px; min-width: 0; left: 0; height: 11px; min-height: 0;
+  border-radius: 50%; border: 2px solid #1d2130;
+  box-shadow: 0 0 0 1.5px #565f78; cursor: crosshair;
+  transition: transform 0.12s;
+}
+.gv-handle:hover { transform: scale(1.25); }
+.gv-handle em { display: none; }
+
+/* MiniMap / Controls 暗色适配 */
+.react-flow__minimap { border-radius: 8px; border: 1px solid #2a2f40; }
+.react-flow__controls { box-shadow: 0 6px 16px rgba(0,0,0,0.4); border-radius: 8px; overflow: hidden; }
+.react-flow__controls-button {
+  background: #1d2130; border-bottom: 1px solid #2a2f40; fill: #c7d0e4; color: #c7d0e4;
+}
+.react-flow__controls-button:hover { background: #262c40; }
 
 /* 节点标题内联重命名输入框（双击标题） */
 .gv-title-edit {
@@ -65,21 +80,20 @@
   outline: none;
 }
 
-.gv-libs-title { color: #8b94a7; font-size: 12px; margin: 2px 0 2px; }
-
 .gv-empty {
   position: absolute; inset: 0; display: flex; flex-direction: column; gap: 8px;
   align-items: center; justify-content: center; color: #6b7488; font-size: 14px; text-align: center;
+  pointer-events: none; z-index: 5;
 }
 
 .gv-node {
-  position: absolute; width: 236px; background: #1d2130; border: 1px solid #343b52;
-  border-radius: 10px; box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35); overflow: hidden;
-  cursor: grab;
+  position: relative; width: 236px; background: #1d2130; border: 1px solid #343b52;
+  border-radius: 10px; overflow: hidden; cursor: grab;
 }
 .gv-node.sel { border-color: #93b4ff; box-shadow: 0 0 0 2px #93b4ff33, 0 8px 22px rgba(0,0,0,0.4); }
 .gv-node:active { cursor: grabbing; }
 .gv-node.run { box-shadow: 0 0 0 2px #f59e0b66; }
+.gv-node.unknown { color: #f87171; padding: 12px; font-size: 12px; }
 
 .gv-node-head {
   display: flex; align-items: center; justify-content: space-between;

@@ -326,7 +326,8 @@ def _exec_qc(graph: dict, node: dict, nodemap: dict[str, dict]) -> dict:
     exp = float(p.get("expected_duration", 5) or 5)
     r = qc_clip(str(video), shot_id=node.get("id", ""),
                 expected_duration_sec=exp if exp > 0 else None,
-                max_internal_cuts=int(p.get("max_internal_cuts", 0)))
+                max_internal_cuts=int(p.get("max_internal_cuts", 0)),
+                use_vlm=True)  # M5:逐镜同场验证默认开启,无 key 自动优雅降级
     rep = _artifact_path(graph["id"], node["id"], "json")
     rep.write_text(json.dumps(r, ensure_ascii=False, indent=1),
                    encoding="utf-8")

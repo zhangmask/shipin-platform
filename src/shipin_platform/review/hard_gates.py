@@ -34,6 +34,11 @@ from typing import Optional
 CHAT_URL = "https://apihub.agnes-ai.com/v1/chat/completions"
 ALLOWED_HOST = {"apihub.agnes-ai.com"}
 DEFAULT_FRAMES = 12
+# 每镜采样配额（帧/镜）：3 = 开-中-合四段全覆盖。成片时长越长帧数越多,
+# 修改: 布的 '只抽查了某几帧不完整' 即源于 2 帧/镜的 '点检' 采样。
+FRAMES_PER_SHOT = 3
+FRAMES_PER_SHOT_MAX = 5
+MAX_REVIEW_FRAMES = 64
 
 # ── timeline gate (deterministic) ──────────────────────────────────
 
@@ -52,18 +57,22 @@ def _norm_timeline(timeline):
         if isinstance(it, dict):
             src = str(it.get("src") or it.get("source") or it.get("clip") or "")
             vals = [it.get("start", 0), it.get("end", 0), it.get("at", it.get("start_sec", 0))]
+            sid = str(it.get("shot_id") or "")
         else:
             src = str(it[0] if it else "")
             vals = list(it[1:4]) if len(it) >= 4 else (list(it[1:]) + [0])
+            sid = ""
         try:
             start, end, at = float(vals[0]), float(vals[1]), float(vals[2])
         except (TypeError, ValueError, IndexError):
             start = end = at = 0.0
-        out.append({"src": src, "start": start, "end": end, "at": at})
+        out.append({"src": src, "start": start, "end": end, "at": at,
+                    "shot_id": sid})
     return out, float(total), float(freeze)
 
 
-def check_timeline(timeline, duration_sec: Optional[float] = None) -> dict:
+def check_timeline(timeline, duration_sec: Optional[float] = None,
+                   expected_shot_ids: Optional[list] = None) -> dict:
     """Reuse-limit + duration + ordering gate.
 
     Rules (all deterministic, no LLM):
@@ -73,6 +82,10 @@ def check_timeline(timeline, duration_sec: Optional[float] = None) -> dict:
     - timeline entries must be monotonic in ``at``        -> critical
     - coverage: total expected duration vs last edge      -> critical if off
       by more than 3% unless the caller did not give a target
+    - shot accounting: when ``expected_shot_ids`` is given, any scripted shot
+      missing from the timeline (``SHOT_MISSING``) or any entry whose shot_id
+      was not scripted (``SHOT_INJECTED``) is critical — a video cannot
+      silently drop or smuggle shots.
     Returns {"verdict": "ok"|"fix", "findings": [...], "stats": {...}}
     """
     clips, total, _freeze = _norm_timeline(timeline)
@@ -133,10 +146,29 @@ def check_timeline(timeline, duration_sec: Optional[float] = None) -> dict:
             "evidence": f"覆盖到 {cov:.1f}s",
         })
 
+    # 4) shot accounting (审计 C2):剧本镜号全集 vs 时间线实际镜号
     stats = {"clips": len(clips),
              "unique_src": len(by_src),
              "coverage_sec": round(cov or 0, 2),
              "target_sec": total}
+    if expected_shot_ids:
+        expected = [str(x) for x in expected_shot_ids if str(x).strip()]
+        on_timeline = [c["shot_id"] for c in clips if c["shot_id"]]
+        missing = sorted(set(expected) - set(on_timeline))
+        injected = sorted(set(on_timeline) - set(expected))
+        if missing:
+            findings.append({
+                "severity": "critical", "code": "SHOT_MISSING",
+                "message": f"剧本有 {len(missing)} 个镜头未进入时间线: {missing}",
+                "evidence": f"时间线实际镜号={on_timeline}"})
+        if injected:
+            findings.append({
+                "severity": "critical", "code": "SHOT_INJECTED",
+                "message": f"时间线含剧本未声明的镜头: {injected}",
+                "evidence": f"时间线实际镜号={on_timeline}"})
+        stats["expected_shots"] = len(expected)
+        stats["on_timeline"] = on_timeline
+
     verdict = "ok" if not any(f["severity"] == "critical" for f in findings) else "fix"
     return {"verdict": verdict, "findings": findings, "stats": stats}
 
@@ -221,13 +253,105 @@ def _ask_vlm(images, prompt, key: str, max_tokens: int = 1800) -> str:
     return resp.json()["choices"][0]["message"]["content"]
 
 
-def _batch_prompt(times: str, n: int, context: Optional[dict] = None) -> str:
+# ── cross-shot identity gate (审计:A.4 模板,VBench-2.0 human_identity 思路) ─
+
+
+SAME_PERSON_PROMPT = (
+    "图1、图2 是同一部影片中先后两个镜头里的人物。仅依据画面事实判断："
+    "是否为同一人（同一张脸，同一发型；着装有 90% 以上一致可接受微差）。"
+    "注意：构图、景别、光线差异不考虑；换人、换发型、换服装颜色/款型均为不一致。"
+    '返回严格 JSON：{"same": true/false, "spec": "<不一致的点：脸/发型/服装/身材>", "reason": "..."}'
+)
+
+
+def _capture(video: Path, t: float) -> str:
+    """抽一帧图存临时文件,返回路径(失败返回空串)。"""
+    tmp = tempfile.mkdtemp(prefix="vlm_identity_")
+    p = Path(tmp) / f"f_{t:06.2f}.png"
+    r = subprocess.run(
+        ["ffmpeg", "-v", "error", "-ss", f"{t:.3f}", "-i", str(video),
+         "-frames:v", "1", "-vf", "scale=960:-2", "-y", str(p)],
+        capture_output=True, text=True)
+    return str(p) if p.exists() and p.stat().st_size > 1000 else ""
+
+
+def _subject_tokens(subject: str) -> set:
+    """主体描述里的判别性词元:两位及以上连续汉字,或常见人物单字词。"""
+    han = re.findall(r"[\u4e00-\u9fff]{2,}", subject or "")
+    han += [ch for ch in (subject or "") if ch in "他她女男"] * 2
+    return set(han)
+
+
+def _same_person(imgs: list, key: str) -> dict:
+    """VLM 成对判定跨镜头是否为同一人。never raises."""
+    try:
+        resp = _ask_vlm(imgs, SAME_PERSON_PROMPT, key, max_tokens=300)
+        m = re.search(r"\{.*\}", resp, re.S)
+        parsed = json.loads(m.group(0)) if m else {}
+        return {"available": True, "same": bool(parsed.get("same")),
+                "spec": str(parsed.get("spec", ""))[:80],
+                "reason": str(parsed.get("reason", ""))[:200]}
+    except Exception as e:
+        return {"available": False, "same": None,
+                "reason": f"VLM 跨镜身份判定失败: {type(e).__name__}: {e}"[:200]}
+
+
+def _identity_gate(video: Path, shots: list[dict], key: str) -> dict:
+    """跨镜人物一致性:相邻两镜「主体词元一致」时才要求同一人(不同角色则跳过,
+    避免把『顾客』vs『店员』的合理切换误判为换头)。每对镜各抽中帧问 VLM;
+    只有在 VLM 判定"不是同一人"时输出 findings。审计盲区①(A 节)的落地。"""
+    pairs, checked, findings = [], 0, []
+    for i in range(len(shots) - 1):
+        a, b = shots[i], shots[i + 1]
+        ta = _subject_tokens(a.get("subject")
+                if isinstance(a, dict) else str(a or ""))
+        tb = _subject_tokens(b.get("subject")
+                if isinstance(b, dict) else str(b or ""))
+        if not ta or not tb or not (ta & tb):
+            continue  # 主体无共享词元 = 分镜本意是不同人/物,不做跨镜身份判定
+        pairs.append((i, i + 1))
+    for i, j in pairs:
+        a, b = shots[i], shots[j]
+        # 两镜的镜头中帧(绝对时间):镜像起点=此前所有窗口时长之和
+        t0a = sum(float(s.get("duration_sec") or 0) for s in shots[:i])
+        t0b = t0a + float(a.get("duration_sec") or 0)
+        pa = _capture(video, t0a + float(a.get("duration_sec") or 0) / 2)
+        pb = _capture(video, t0b + float(b.get("duration_sec") or 0) / 2)
+        if not pa or not pb:
+            continue
+        checked += 1
+        imgs = []
+        for fp in (pa, pb):
+            with open(fp, "rb") as fh:
+                b64 = base64.b64encode(fh.read()).decode()
+            imgs.append({"type": "image_url",
+                         "image_url": {"url": f"data:image/png;base64,{b64}"}})
+        r = _same_person(imgs, key)
+        if not r.get("available"):
+            continue
+        if not r["same"]:
+            spec = str(r.get("spec") or "")
+            is_face = ("脸" in spec or "发" in spec)
+            findings.append({
+                "severity": "critical" if is_face else "warning",
+                "code": "IDENTITY_SWITCH" if is_face else "COSTUME_SWAP",
+                "message": (f"镜头{a.get('shot_id', i + 1)}→镜头"
+                            f"{b.get('shot_id', j + 1)} VLM 判定不是同一人"
+                            f"(不一致点:{spec or r.get('reason')[:60]})——跨镜身份"
+                            f"{'已更换,禁止交付' if is_face else '被换装,需复核'}")})
+    return {"pairs": pairs, "checked": checked, "findings": findings}
+
+
+def _batch_prompt(times: str, n: int, context: Optional[dict] = None,
+                  batch: Optional[list[dict]] = None) -> str:
     """Build the VLM walk-through prompt from the actual project context.
 
-    历史教训：这里曾经写死「这是同一支 60 秒笔记本 TVC」——咖啡广告、短剧
-    一律被套上错误前提，VLM 终验等于从未对准过本片。现在一切从 context
-    参数化注入；没有 context 时退化为中性描述，绝不再出现写死的产品。"""
-    ctx = context or {}
+    历史教训：这里曾写死「这是同一支 60 秒笔记本 TVC」——咖啡广告、短剧
+    一律被套上错误前提，VLM 终验从未对准过本片。现在 context 参数化注入，
+    且 batch 携带每帧所属镜头（shot 标签），VLM 据镜头归属检查连续性，
+    避免「只见帧序、不知镜头」导致把同镜头采样帧误判为断点。"""
+    from copy import deepcopy
+    ctx = deepcopy(context or {})
     product = str(ctx.get("product_info") or ctx.get("brand_name") or "本项目成片").strip()
     duration = ctx.get("duration_sec")
     shots = ctx.get("shots") or []
@@ -243,19 +367,52 @@ def _batch_prompt(times: str, n: int, context: Optional[dict] = None) -> str:
             rows.append(f"- {s.get('shot_id', '?')} {t0:.1f}s~{t0 + d:.1f}s："
                         f"{str(s.get('subject') or s.get('scene') or '')[:60]}")
             t0 += d
-        lines.append("分镜表（每个分镜应为一个连续镜头，镜与镜之间才允许切换）：\n"
+        lines.append("分镜表（每个分镜应为一个连续镜头，镜与镜之间才允许切换）："
                      + "\n".join(rows))
     else:
         lines.append("影片应为连贯叙事（钩子→发展→转折→收束），无与主题无关的插入画面。")
+    if batch:
+        shot_seq = ", ".join(f"{f.get('t')}s→{f.get('shot', '?')}" for f in batch)
+        lines.append(f"这批抽帧的镜头归属：{shot_seq}（归属相同 = 同一镜头内的多个时间点）。")
+    # 分镜符合度(G4):每帧给出其分镜预期的场景/主体/动作,让 VLM 逐帧核对
+    # 「画面是否真的在演剧本写的那一幕」——审计 G3 证明旧提示词(只说"镜头归属"
+    # 与"叙事连续")抓不住「画面与分镜不符」:模型生成的是另一幕却被放行。
+    if batch and shots:
+        expect = []
+        for f in batch:
+            s = shots[f.get("shot_idx") or 0] if f.get("shot_idx") is not None else None
+            if not s:
+                continue
+            exp = (f"{str(s.get('scene') or '')[:36]}".strip() or "—")
+            subj = (f"{str(s.get('subject') or '')[:24]}".strip() or "—")
+            mo = (f"{str(s.get('motion') or '')[:24]}".strip() or "—")
+            expect.append(f"  t={f.get('t')}s 镜{s.get('shot_id', '?')} 预期："
+                          f"场景[{exp}] 主体[{subj}] 动作[{mo}]")
+        if expect:
+            lines.append("分镜预期（逐帧必须与所属分镜的这一行一致，不一致就是『演错剧本』）："
+                         + "\n".join(expect))
     lines.append(
-        "请只依据画面事实回答：\n"
-        "1) 每个时间点：画面在讲什么、是否有白色字幕（逐字转写，无字幕写'无'）；\n"
-        "2) 从前往后是否有明显的叙事连续性，有无『突然跳到无关场景』的断帧或明显重复画面（帧间出现两次以上相同主体+背景也算重复）；\n"
-        "3) 这些帧里是否出现落版大字/品牌信息（如品牌名或 slogan 大字）。\n"
-        "返回严格 JSON，不要任何额外文字：{{\"frames\": [{{\"t\": <秒>, \"scene\": \"...\", \"subtitle\": \"...\"}}], "
-        "\"breaks\": [断点描述字符串, ...], \"brand_seen\": true/false}}\n"
-        "没有断点则 breaks 为空数组。"
+        "请只依据画面事实回答，核对每帧是否与其镜头归属一致、同镜头内部各帧是否前后衔接自然：\n"
+        "1) 每个时间点的画面在讲什么、是否有白色字幕（逐字转写，无字幕写'无'）；\n"
+        "2) 从前往后叙事是否连续，有无『突然跳到无关场景』、『同一镜头内画面突变/主体变形』、"
+        "『明显重复画面（两次以上相同主体+背景）』；注意力在镜头中段的抽帧上——那里最容易出现"
+        "画面崩坏（五官变形、多指、结构扭曲）；\n"
+        "3) 这些帧里是否出现落版大字/品牌信息（如品牌名或 slogan 大字）；\n"
+        "4) 对照『分镜预期』逐帧核对：画面里的场景/主体/动作与该镜剧本预期不符的帧，"
+        "必须列入 shot_issues（如分镜写『办公室』画面却是厨房、分镜主体是『女主角』"
+        "画面却出现其他主体）；能对上就不要写。\n"
+        "返回严格 JSON，不要任何额外文字：{\"frames\": [{\"t\": <秒>, \"scene\": \"...\", "
+        "\"subtitle\": \"...\", \"anomaly\": 0/1}], "
+        "\"breaks\": [断点描述字符串, ...], \"brand_seen\": true/false,"
+        " \"shot_issues\": [{\"shot\": \"S03\", \"issue\": \"...\"}]}\n"
+        "没有断点则 breaks 为空数组；有内容崩坏（变形/漂移/断帧）的帧在 anomaly 标记 1；"
+        "所有帧都符合分镜预期则 shot_issues 为空数组。"
     )
+    _bname = str(ctx.get("brand_name") or "").strip()
+    if _bname:
+        lines.append(f"提示：本片声明的品牌名是「{_bname}」——brand_seen 只在该文字"
+                     f"（或含该名称的落版大字）真实出现在画面中时才为 true，"
+                     f"其他品牌的字样不算。")
     return "\n".join(lines)
 
 
@@ -268,31 +425,72 @@ def _shot_boundaries(shots: list[dict]) -> list[float]:
     return bounds
 
 
-def _context_frames(video_dur: float, shots: list[dict], frames_count: int) -> list[float]:
-    """Per-shot first/last sampling. 首镜与末镜（品牌落版所在）的帧必须保留，
-    中间镜超预算时交替精简——曾经 sorted[:16] 把片尾品牌卡帧全部裁掉，
-    导致 brand_seen 误判 False。"""
-    per = []  # (t, shot_index)
+def _context_frames(video_dur: float, shots: list[dict], frames_count: int) -> list[tuple[float, int]]:
+    """Per-shot *coverage* sampling — every shot gets open/middle/close frames.
+
+    历史教训（AGENT_REVIEW vs 实片）:旧的「每镜首+尾各1帧、预算 ≤16」采样把
+    每个镜头中间约 60% 的画面整段漏掉,且镜头一多整镜裁掉——VLM 审片变成了
+    "抽查几帧",与『逐镜全覆盖』的要求相悖。继任两轮迭代后(2026-09-21 审计
+    报告 verified):
+    - 每镜最少 3 帧(开/中/合),覆盖标准 TVC 镜 2-8s 的全部中段;
+    - 帧避开镜头边界 0.45s 的叠化带,避免 dissolve 被 VLM 误判「重复画面」;
+    - 预算受 frames_count 钳制;超预算丢帧时优先丢「紧贴镜头边界的帧」
+      (叙事信息量最低),保住中段帧,每镜至少保留 budget_len(shots) 帧。
+    返回 [(t, shot_index), ...] 时间点+所属镜头。
+    """
+    per: list[tuple[float, int]] = []
     t = 0.0
-    td_margin = 0.65  # 采样避开边界叠化带（dissolve 0.4s + 余量），否则两帧
-                      # 天然相似会被 VLM 误判为「重复画面」
+    margin = 0.45
     for i, s in enumerate(shots):
-        d = max(float(s.get("duration_sec") or 0), 0.5)
-        opening = min(max(0.15 * d, td_margin), 0.9)
-        closing = min(max(0.12 * d, td_margin), d * 0.45)
-        per.append((t + opening, i))          # shot opening（避开入点叠化）
-        per.append((t + d - closing, i))      # shot closing（避开出点叠化）
+        d = float(s.get("duration_sec") or 0)
+        if d <= 0:
+            d = 0.6
+        # 帧数随镜长自适应:约 1 帧/秒(3~5 帧/镜),总帧数上限压在 MAX_REVIEW_FRAMES
+        n = max(3, min(FRAMES_PER_SHOT_MAX, int(round(d))))
+        span = max(d - 2 * margin, 0.2)
+        for j in range(n):
+            tt = margin + span * (j + 0.5) / n
+            # 不越界、落在视频时长内
+            if 0 <= tt <= d:
+                per.append((round(t + tt, 2), i))
         t += d
-    budget = max(8, min(frames_count, 24))
-    # 首镜+末镜的帧无条件保留，中间镜从前往后交替丢弃 closing/opening
-    first_last = {0, len(shots) - 1}
-    kept = [x for x in per if x[1] in first_last]
-    rest = [x for x in per if x[1] not in first_last]
-    while len(kept) + len(rest) > budget and rest:
-        # 交替从最靠后的中间镜丢起，保住叙事前段的帧密度
-        rest.pop(-2 if len(rest) > 1 else -1)
-    times = sorted({round(x[0], 2) for x in (kept + rest) if 0 <= x[0] <= video_dur})
-    return times[:max(budget, len(kept))]
+
+    # 超预算:从「紧贴边界的帧」开始丢(保住信息量最高的中段),每镜至少留 floor 帧
+    budget = max(8, min(frames_count, MAX_REVIEW_FRAMES))
+    if len(per) <= budget:
+        return per
+    per.sort(key=lambda x: x[0])
+    # 每镜保留下限:预算充裕时 3 帧,预算吃紧时退到 2 帧(绝不到 0)
+    floor = max(2, min(3, budget // max(len(shots), 1)))
+    keep_min = {i: floor for i in range(len(shots))}
+    while len(per) > budget:
+        # 优先丢弃「离镜头边界最近」的帧——丢的是开场/收尾过渡帧,
+        # 中段最容易崩坏(变形/多指)的帧一定留下
+        candidates = [k for k in range(len(per))
+                      if _drop_ok(per, k, keep_min)]
+        if not candidates:
+            break
+        per.pop(min(candidates, key=lambda k: _boundary_dist(per[k], shots)))
+    return per
+
+
+def _drop_ok(per, k, keep_min) -> bool:
+    """第 k 帧可丢条件:该镜头剩余帧数 ≥ 该镜头最少保留数。"""
+    _, idx = per[k]
+    cnt = sum(1 for _, i in per if i == idx)
+    return cnt > keep_min.get(idx, 2)
+
+
+def _boundary_dist(frame: tuple[float, int], shots) -> float:
+    """帧到所属镜头最近边界的距离(秒)——越小越靠近叠化带,信息量越低。"""
+    t, idx = frame
+    start = 0.0
+    for i, s in enumerate(shots):
+        d = float(s.get("duration_sec") or 0)
+        if i == idx:
+            return min(t - start, start + d - t)
+        start += d
+    return 0.0
 
 
 def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
@@ -348,30 +546,81 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
             det_findings.append({
                 "severity": "suggestion", "code": "CUT_DENSITY_HIGH",
                 "message": f"全片检测到 {len(cuts)} 处场景突变（无分镜上下文，仅提示）"})
+        # M6(2026-09-21 审计):成片层物理完整性扇区——音频流存在性 + 运动能量。
+        # 静态帧 VLM 看不到运动/冻结/J 帧,这是确定性层唯一能补的两块廉价检查。
+        from .clip_qc import _ffprobe, motion_energy as _motion_energy
+        _streams = _ffprobe(video).get("streams", [])
+        audio_ok = any(s.get("codec_type") == "audio"
+                       and float(s.get("duration", 0) or 0) > 0.3
+                       for s in _streams)
+        deterministic["audio_ok"] = audio_ok
+        if not audio_ok:
+            det_findings.append({
+                "severity": "warning", "code": "FINAL_NO_AUDIO",
+                "message": "成片无有效音轨（旁白/氛围声缺失）——音画审查不可用"})
+        me = _motion_energy(video)
+        deterministic["motion_energy"] = me
+        if me < 1.0:
+            det_findings.append({
+                "severity": "critical", "code": "FINAL_FROZEN",
+                "message": f"成片运动能量仅 {me:.2f}(<1.0)——疑似静帧幻灯/冻结画面"})
+        elif me < 2.5:
+            det_findings.append({
+                "severity": "warning", "code": "FINAL_MOTION_LOW",
+                "message": f"成片运动能量仅 {me:.2f}(<2.5)——运动不足,注意局部冻结帧"})
+        # 审计 G2:全片亮度瞬变(闪白/闪黑/单帧崩坏)。叠化拼接在镜头边界
+        # 前后 ~1s 内会有亮度过渡,属正常;边界之外的瞬变才是病。
+        from .clip_qc import transient_spikes as _transient_spikes
+        spikes = _transient_spikes(video)
+        if shots:
+            bounds = _shot_boundaries(shots)
+            spikes = [s for s in spikes
+                      if all(abs(s["t"] - b) > 1.5 for b in bounds)]
+        deterministic["transient_spikes"] = spikes
+        if len(spikes) >= 2 or any(s["delta"] >= 130 for s in spikes):
+            det_findings.append({
+                "severity": "critical", "code": "FINAL_TRANSIENT_SPIKES",
+                "message": (f"成片检测到 {len(spikes)} 处镜头边界外的亮度瞬变闪帧"
+                            f"(t={[s['t'] for s in spikes]})——单帧崩坏/闪场,"
+                            f"需定位到对应镜头重新生成")})
+        elif len(spikes) == 1:
+            det_findings.append({
+                "severity": "warning", "code": "FINAL_TRANSIENT_SPIKES",
+                "message": (f"成片检测到 1 处镜头边界外的亮度瞬变闪帧"
+                            f"(t={spikes[0]['t']}s)——建议复核该时刻")})
     except Exception as e:
         det_findings.append({"severity": "suggestion", "code": "DETERMINISTIC_PASS_ERROR",
                              "message": f"确定性结构检查失败: {e}"})
 
-    # ── layer 2: VLM walk-through ──────────────────────────────────
+    # ── layer 2: VLM walk-through (per-shot coverage sampling) ─────
     try:
         if shots:
-            times = _context_frames(video_dur, shots, max(8, min(frames_count, 16)))
+            # 预算按"每镜至少 FRAMES_PER_SHOT 帧"扩张,不再一戳到底的 16 帧封顶
+            budget = max(frames_count, len(shots) * FRAMES_PER_SHOT)
+            times = _context_frames(video_dur, shots, budget)
         else:
             times = None
     except Exception:
         times = None
+    dropped_frames: list[dict] = []
     try:
         if times:
             frames = []
             tmp = tempfile.mkdtemp(prefix="vlm_gate_")
-            for i, t in enumerate(times):
+            for i, (t, shot_idx) in enumerate(times):
                 p = Path(tmp) / f"f{i:02d}_t{t:06.2f}.png"
                 r = subprocess.run(
                     ["ffmpeg", "-v", "error", "-ss", f"{t}", "-i", str(video),
                      "-frames:v", "1", "-vf", "scale=960:-2", "-y", str(p)],
                     capture_output=True, text=True)
+                tag = f"镜头{shots[shot_idx].get('shot_id', shot_idx + 1)}"
                 if p.exists() and p.stat().st_size > 1000:
-                    frames.append({"t": round(t, 2), "path": str(p)})
+                    frames.append({"t": round(t, 2), "path": str(p),
+                                   "shot": tag, "shot_idx": shot_idx})
+                else:
+                    # M3: 抽帧失败不静默——记入 dropped_frames,覆盖断言可见
+                    dropped_frames.append({"t": round(t, 2), "shot": tag,
+                                           "shot_idx": shot_idx})
         else:
             frames = _extract_frames(video, max(4, min(frames_count, 16)))
     except Exception as e:
@@ -379,14 +628,49 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
     if not frames:
         return {"verdict": "blocked", "reason": "未能从视频抽取任何帧", "findings": []}
 
+    # ── M3: per-shot 覆盖可断言 ─────────────────────────────────────
+    # 每个镜头都有计划帧;实际进入 VLM 的帧数按镜头统计,0 帧镜头必须暴露。
+    shot_coverage: dict[str, int] = {}
+    coverage_gaps: list[dict] = []
+    if times:
+        for _, shot_idx in times:
+            tag = f"镜头{shots[shot_idx].get('shot_id', shot_idx + 1)}"
+            shot_coverage[tag] = shot_coverage.get(tag, 0)
+        for f in frames:
+            if "shot" in f:
+                shot_coverage[f["shot"]] = shot_coverage.get(f["shot"], 0) + 1
+        for tag, cnt in sorted(shot_coverage.items()):
+            if cnt == 0:
+                coverage_gaps.append({"shot": tag, "frames": cnt})
+                det_findings.append({
+                    "severity": "critical", "code": "COVERAGE_GAP",
+                    "message": f"镜头 {tag} 没有任何帧进入 VLM 审查——该镜头未审,禁止放行"})
+            elif cnt < 2:
+                coverage_gaps.append({"shot": tag, "frames": cnt})
+                det_findings.append({
+                    "severity": "warning", "code": "COVERAGE_THIN",
+                    "message": f"镜头 {tag} 仅 {cnt} 帧进入 VLM 审查(计划不足/抽帧失败)"})
+        if dropped_frames:
+            det_findings.append({
+                "severity": "warning", "code": "FRAMES_DROPPED",
+                "message": (f"{len(dropped_frames)} 个采样点抽帧失败(ffmpeg 无输出或过小)"
+                            f"——未被审查,见 dropped_frames 字段")})
+
     batch_results: list[dict] = []
     breaks: list[str] = []
     brand_seen = False
-    for i in range(0, len(frames), 4):
-        batch = frames[i:i + 4]
+    anomalies: list[dict] = []
+    shot_issues: list[dict] = []
+    # M4(2026-09-21 审计):批次间重叠 1 帧的滑动窗口——相邻批次共享一帧,
+    # 保证镜头边界两侧的帧对(镜尾 vs 邻镜镜首)必然同批可见,VLM 能审"镜间连接"
+    # M8(实测):上游端点硬限制 4 图/请求(>4 直接 400 Image count exceeds limit),
+    # 滑动窗必须钳在 4 帧以内,否则真实终片审查必然失败(测试桩看不出)。
+    for i in range(0, len(frames), 3):
+        batch = (frames[0:4] if i == 0
+                 else frames[max(0, i - 1): i + 4][:4])
         times_str = ", ".join(f"{f['t']}" for f in batch)
         resp = _ask_vlm(_frames_payload(batch),
-                        _batch_prompt(times_str, len(batch), ctx), key)
+                        _batch_prompt(times_str, len(batch), ctx, batch), key)
         batch_results.append({"t_range": f"{batch[0]['t']}~{batch[-1]['t']}", "vlm": resp})
         try:
             m = re.search(r"\{.*\}", resp, re.S)
@@ -398,18 +682,60 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
                 breaks.append(b)
         if parsed.get("brand_seen"):
             brand_seen = True
+        for fr in (parsed.get("frames") or []):
+            if isinstance(fr, dict) and fr.get("anomaly"):
+                anomalies.append({"t": fr.get("t"), "note": str(fr.get("scene") or "")[:80]})
+        for si in (parsed.get("shot_issues") or []):
+            if isinstance(si, dict) and str(si.get("shot") or "").strip():
+                shot_issues.append(si)
+
+    # ── 跨镜人物一致性(VBench-2.0 human_identity 思路的 VLM 落地) ─────
+    identity = {"pairs": [], "checked": 0, "findings": []}
+    if shots and len(shots) > 1:
+        identity = _identity_gate(video, shots, key)
 
     all_findings = det_findings + [
-        {"severity": "critical", "code": "VLM_BREAK", "message": b} for b in breaks]
+        {"severity": "critical", "code": "VLM_BREAK", "message": b} for b in breaks
+    ] + [
+        {"severity": "critical", "code": "VLM_FRAME_ANOMALY",
+         "message": f"t={a['t']}s 帧内容崩坏: {a['note']}"} for a in anomalies[:10]
+    ] + [
+        {"severity": "critical", "code": "SHOT_STORY_MISMATCH",
+         "message": (f"镜头{s['shot']} 画面与分镜剧本不符: {str(s.get('issue') or '')[:120]}"
+                     f"——生成的是另一幕却照常放行,必须重新生成该镜")}
+        for s in shot_issues[:10]
+    ] + identity.get("findings", [])
+    # M8(2026-09-21 审计):品牌承诺硬门。brief 声明品牌名时,
+    # "品牌全程未入画"=交付级缺陷,必须拦截("XX咖啡大字落版"是广告
+    # brief 的硬性交付物;实测 C 变体证明提示词可驱动 brand_seen,
+    # 所以未入画=生成失败,不是审查过严)。首/尾镜含品牌提示词的
+    # 项目在这里全面收口;无品牌名（纯信息展示）则不受影响。
+    if not brand_seen and str(ctx.get("brand_name") or "").strip():
+        _bn = ctx.get("brand_name")
+        all_findings.append({
+            "severity": "critical", "code": "BRAND_MISSING",
+            "message": (f"brief 声明的品牌「{_bn}」在成片全程未被 VLM 检测到"
+                        f"——品牌未落版，不能作为交付物。请在提示词中明确品牌"
+                        f"文字落点(杯身/灯箱/落版卡)后重生成")})
     verdict = "pass" if not all_findings else "fix"
+    _reason = (f"确定性 {len(det_findings)} + VLM 断帧 {len(breaks)}"
+               f" + 内容崩坏 {len([a for a in anomalies if a])}")
+    if not brand_seen and str(ctx.get("brand_name") or "").strip():
+        _reason += " + 品牌未入画"
     return {
         "verdict": verdict,
         "reason": ("终验通过" if not all_findings else
-                   f"终验发现 {len(all_findings)} 处问题（确定性 {len(det_findings)} + VLM {len(breaks)}）"),
+                   f"终验发现 {len(all_findings)} 处问题（{_reason}）"),
         "brand_seen": brand_seen,
         "breaks": breaks,
+        "anomalies": anomalies,
         "deterministic": deterministic,
         "findings": all_findings,
         "frames_reviewed": len(frames),
+        "shot_coverage": shot_coverage,
+        "coverage_gaps": coverage_gaps,
+        "dropped_frames": dropped_frames,
+        "shot_issues": shot_issues,
+        "identity": identity,
         "batches": batch_results,
     }

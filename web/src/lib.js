@@ -19,7 +19,8 @@ export const KIND_LABEL = {
   user_rewritten: "人工改写", gate_cleared: "确认作废", stage_reset: "阶段重置",
   phase_started: "阶段启动", phase_finished: "阶段结束",
   budget_set: "预算设置", budget_exceeded: "预算超限",
-  stage_restored: "版本回滚",
+  stage_restored: "版本回滚", released: "发布完成",
+  stage_rewritten: "迭代已写回",
 };
 
 export const KEY_STORAGE = "shipin.api_key";
