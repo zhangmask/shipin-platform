@@ -81,6 +81,9 @@ def _sample_gray_frames(video: Path, fps: float = 2.0, size=(64, 36),
             frames.append(Image.open(p).convert("L"))
         except OSError:
             continue
+    # 轮19:帧已全部读进内存,临时目录删除(此前只建不清)
+    from .hard_gates import _cleanup_tmp
+    _cleanup_tmp(tmp)
     return frames
 
 
@@ -182,8 +185,14 @@ def _first_frame_image(video: Path, t: float = 0.2):
          "-frames:v", "1", "-y", str(out)],
         capture_output=True, text=True)
     if not out.exists():
+        from .hard_gates import _cleanup_tmp
+        _cleanup_tmp(tmp)
         return None
-    return Image.open(out)
+    img = Image.open(out)
+    img.load()  # 轮19:PIL 懒加载,先读进内存再删临时目录
+    from .hard_gates import _cleanup_tmp
+    _cleanup_tmp(tmp)
+    return img
 
 
 # ── optional VLM same-scene check ─────────────────────────────────────
@@ -233,25 +242,32 @@ def vlm_morph_check(clip_path: str, samples: int = 3) -> dict:
     try:
         dur, _dims = _duration_and_dims(Path(clip_path))
         tmp = tempfile.mkdtemp(prefix="clipqc_morph_")
-        ts = [dur * (i + 0.5) / samples for i in range(samples)]
-        paths = []
-        for j, t in enumerate(ts):
-            p = Path(tmp) / f"m{j}.png"
-            subprocess.run(
-                ["ffmpeg", "-v", "error", "-ss", f"{t:.2f}", "-i", clip_path,
-                 "-frames:v", "1", "-y", str(p)],
-                capture_output=True, text=True)
-            if p.exists() and p.stat().st_size > 1000:
-                paths.append(p)
-        if not paths:
-            return {"available": False, "verdict": "unknown",
-                    "reason": "抽帧全部失败"}
-        imgs = []
-        for p in paths:
-            with open(p, "rb") as fh:
-                b64 = base64.b64encode(fh.read()).decode()
-            imgs.append({"type": "image_url",
-                         "image_url": {"url": f"data:image/png;base64,{b64}"}})
+        try:
+            ts = [dur * (i + 0.5) / samples for i in range(samples)]
+            paths = []
+            for j, t in enumerate(ts):
+                p = Path(tmp) / f"m{j}.png"
+                subprocess.run(
+                    ["ffmpeg", "-v", "error", "-ss", f"{t:.2f}",
+                     "-i", clip_path,
+                     "-frames:v", "1", "-y", str(p)],
+                    capture_output=True, text=True)
+                if p.exists() and p.stat().st_size > 1000:
+                    paths.append(p)
+            if not paths:
+                return {"available": False, "verdict": "unknown",
+                        "reason": "抽帧全部失败"}
+            imgs = []
+            for p in paths:
+                with open(p, "rb") as fh:
+                    b64 = base64.b64encode(fh.read()).decode()
+                imgs.append({"type": "image_url",
+                             "image_url": {
+                                 "url": f"data:image/png;base64,{b64}"}})
+        finally:
+            # 轮19:帧已编码进 base64,临时目录删除(此前只建不清)
+            from .hard_gates import _cleanup_tmp
+            _cleanup_tmp(tmp)
         prompt = (
             f"这是同一段视频按时间顺序采样的 {len(paths)} 帧(t 递增)。"
             "只依据画面事实回答：镜头内是否存在主体形态突变或物体变形"
@@ -394,7 +410,12 @@ def qc_clip(
                 if use_vlm:
                     tmp_ff = Path(tempfile.mkdtemp(prefix="clipqc_vlm_")) / "ff.png"
                     ff_img.save(tmp_ff)
-                    res = vlm_same_scene(ref, tmp_ff)
+                    try:
+                        res = vlm_same_scene(ref, tmp_ff)
+                    finally:
+                        # 轮19:vlm_same_scene 内部已编码,目录随即删除
+                        from .hard_gates import _cleanup_tmp
+                        _cleanup_tmp(tmp_ff.parent)
                     checks["reference_match"]["vlm"] = res
                     if res.get("available") and res.get("verdict") == "different":
                         findings.append({

@@ -725,6 +725,31 @@ class TestIdentityGate:
         hits = [f for f in r["findings"] if f["code"] == "COSTUME_SWAP"]
         assert hits and hits[0]["severity"] == "critical", r["findings"]
 
+    def test_pronoun_subject_paired(self, monkeypatch, tmp_path):
+        """轮18:主体写『她坐在窗边』(无"主角"字样)也要比——代词单字
+        『她』无商品词包含,可安全入表;『他』不行(『其他』误命中)。"""
+        _vlm_stub(monkeypatch)
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "pron.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "她坐在窗边喝咖啡"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "她站在街角"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        assert r["identity"]["checked"] == 1, r["identity"]
+        assert r["identity"]["intra_checked"] == 2
+
+    def test_ta_word_not_person(self, monkeypatch, tmp_path):
+        """『其他装饰特写』不能因『他』被当人物镜——表里刻意没有『他』。"""
+        _vlm_stub(monkeypatch)
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "ta.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "其他装饰特写"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "其他陈设"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        assert r["identity"]["checked"] == 0
+        assert r["identity"]["intra_checked"] == 0
+
     # ── 轮11a:镜内人物一致性(首帧 vs 末帧) ─────────────────────────
     # coffee-v7 实测教训:S02 在 t=4.03s 镜内换装、S06 在 19.89→21.5s
     # 镜内换人——同一镜头内部的更换此前只能靠跨镜中帧间接撞见,且归属
@@ -912,6 +937,35 @@ class TestNarrationPresence:
         r = check_narration_presence(str(clip), shots)
         assert r["verdict"] == "ok"
         assert r["stats"]["checked"] == 0
+
+
+class TestTempHygiene:
+    """轮19(磁盘打满事故回归):审查调用结束后不得在 TEMP 遗留抽帧/
+    身份判定临时目录。事故实证:真实审查一晚泄漏 2540 个目录/2.7G,
+    TEMP 盘 100% 满后 E2E 直接失败。"""
+
+    def test_no_temp_dir_leak_after_review(self, monkeypatch, tmp_path):
+        import glob
+        import tempfile as _tf
+        from shipin_platform.review import hard_gates
+        _vlm_stub(monkeypatch)
+        root = Path(_tf.gettempdir())
+        pats = ("vlm_gate_*", "vlm_identity_*", "vlm_shot_*", "clipqc_*")
+
+        def _snap():
+            return {p for pat in pats
+                    for p in glob.glob(str(root / pat))}
+
+        clip = _make_motion_clip(tmp_path / "leak.mp4", 4.0)
+        shot = {"shot_id": "S01", "duration_sec": 4.0, "subject": "主角"}
+        before = _snap()
+        # 终审(批次抽帧 + 镜内身份)与单镜诊断(抽帧 + qc_clip + 镜内身份)
+        hard_gates.vlm_review_final(str(clip), frames_count=4,
+                                    context={"shots": [shot]})
+        hard_gates.vlm_review_shot(str(clip), shot)
+        after = _snap()
+        leaked = sorted(after - before)
+        assert not leaked, f"审查后泄漏临时目录: {leaked[:5]}"
 
 
 class TestTimelineAccounting:

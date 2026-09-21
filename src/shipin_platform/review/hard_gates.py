@@ -24,6 +24,7 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -346,8 +347,12 @@ def _check_ssrf(url: str) -> str:
     return url
 
 
-def _extract_frames(video: Path, count: int) -> list[dict]:
-    """Uniformly sample `count` frames of the video (start + spread + end)."""
+def _extract_frames(video: Path, count: int) -> tuple[list[dict], str]:
+    """Uniformly sample `count` frames of the video (start + spread + end).
+
+    轮19:返回 (frames, tmp_dir)——调用方须在批次编码完成后
+    `_cleanup_tmp(tmp_dir)`,否则每个审查调用泄漏一个含 N 张 960px
+    PNG 的目录(磁盘打满事故的根因之一)。"""
     probe = subprocess.run(
         ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(video)],
         capture_output=True, text=True)
@@ -364,7 +369,7 @@ def _extract_frames(video: Path, count: int) -> list[dict]:
             capture_output=True, text=True)
         if p.exists() and p.stat().st_size > 1000:
             frames.append({"t": round(t, 2), "path": str(p)})
-    return frames
+    return frames, tmp
 
 
 def _frames_payload(frames: list[dict]) -> list[dict]:
@@ -420,7 +425,10 @@ SAME_PERSON_PROMPT = (
 
 
 def _capture(video: Path, t: float) -> str:
-    """抽一帧图存临时文件,返回路径(失败返回空串)。"""
+    """抽一帧图存临时文件,返回路径(失败返回空串)。
+
+    轮19:目录由调用方(_compare_person)负责删除——此前每帧一个
+    mkdtemp 只建不清,长跑服务把 TEMP 打满(2540 个目录/2.7G 实证)。"""
     tmp = tempfile.mkdtemp(prefix="vlm_identity_")
     p = Path(tmp) / f"f_{t:06.2f}.png"
     r = subprocess.run(
@@ -465,7 +473,11 @@ def _same_person(imgs: list, key: str) -> dict:
 # 轮16:补 男女/职业词——"男生在加班""程序员坐下"这类主体此前不在表内,
 # 整镜的身份判定被静默跳过。只用复合词不用单字"男/女":「女包」
 # 「男装」等商品镜不该被当人物镜。
+# 轮18:补代词"她/她们"——LLM 写「她坐在窗边」这类主体(无"主角"
+# 字样)此前两个通道全跳过。「她」无商品词包含,可安全用单字;
+# 「他」不行——「其他」会误命中。
 _PERSON_HINTS = ("主角", "主人公", "人物", "模特",
+                 "她", "她们",
                  "女子", "女人", "女性", "女孩", "女生", "男女",
                  "男子", "男人", "男性", "男生",
                  "咖啡师", "店员", "顾客", "消费者", "用户",
@@ -533,19 +545,26 @@ def _person_pair(a: dict, b: dict) -> bool:
 
 def _compare_person(video: Path, ta: float, tb: float, key: str) -> dict:
     """抽 ta/tb 两帧问 VLM 是否同一人。返回 {"captured", "available",
-    "result"};抽帧失败时 captured=False(调用方不计入 checked)。"""
+    "result"};抽帧失败时 captured=False(调用方不计入 checked)。
+
+    轮19:两帧的临时目录在本函数内删除(编码进 base64 后即无用)。"""
     pa, pb = _capture(video, ta), _capture(video, tb)
     if not pa or not pb:
+        _cleanup_tmp(Path(pa).parent if pa else None,
+                     Path(pb).parent if pb else None)
         return {"captured": False, "available": False, "result": {}}
-    imgs = []
-    for fp in (pa, pb):
-        with open(fp, "rb") as fh:
-            b64 = base64.b64encode(fh.read()).decode()
-        imgs.append({"type": "image_url",
-                     "image_url": {"url": f"data:image/png;base64,{b64}"}})
-    r = _same_person(imgs, key)
-    return {"captured": True, "available": bool(r.get("available")),
-            "result": r}
+    try:
+        imgs = []
+        for fp in (pa, pb):
+            with open(fp, "rb") as fh:
+                b64 = base64.b64encode(fh.read()).decode()
+            imgs.append({"type": "image_url",
+                         "image_url": {"url": "data:image/png;base64," + b64}})
+        r = _same_person(imgs, key)
+        return {"captured": True, "available": bool(r.get("available")),
+                "result": r}
+    finally:
+        _cleanup_tmp(Path(pa).parent, Path(pb).parent)
 
 
 def _identity_finding(a_label: str, b_label: str, r: dict, intra: bool,
@@ -737,6 +756,20 @@ def _shot_boundaries(shots: list[dict]) -> list[float]:
 # "intra" 被误拦。兜底:换镜语义词 + 排除告警词,缺一不可——
 # 真实缺陷(29.18s"…疑似画面内容错位")同时含"切换"与"错位",告警词
 # 优先 → 仍按 critical 拦截。
+
+
+def _cleanup_tmp(*dirs) -> None:
+    """删除抽帧/身份判定产生的临时目录。never raises。
+
+    轮19(磁盘打满事故):此前每帧一个 mkdtemp 只建不清——真实审查
+    一晚泄漏 2540 个目录/2.7G,TEMP 盘 100% 满后 E2E 直接失败。
+    服务长跑场景下这是必修项。"""
+    for d in dirs:
+        if not d:
+            continue
+        shutil.rmtree(str(d), ignore_errors=True)
+
+
 _BOUNDARY_MARGIN = 2.0  # 采样帧距剪辑瞬间 0.45~1.6s,跨镜对帧最远 ~1.6s
 _BOUNDARY_SWITCH_WORDS = ("切换", "换镜", "转场", "镜头交替", "切至",
                           "镜头切换", "跨镜头", "正常交接", "过渡")
@@ -948,10 +981,12 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
     except Exception:
         times = None
     dropped_frames: list[dict] = []
+    _tmp_dirs: list[str] = []  # 轮19:批次编码完成后统一删除
     try:
         if times:
             frames = []
             tmp = tempfile.mkdtemp(prefix="vlm_gate_")
+            _tmp_dirs.append(str(tmp))
             for i, (t, shot_idx) in enumerate(times):
                 p = Path(tmp) / f"f{i:02d}_t{t:06.2f}.png"
                 r = subprocess.run(
@@ -967,10 +1002,14 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
                     dropped_frames.append({"t": round(t, 2), "shot": tag,
                                            "shot_idx": shot_idx})
         else:
-            frames = _extract_frames(video, max(4, min(frames_count, 16)))
+            frames, _ef_tmp = _extract_frames(
+                video, max(4, min(frames_count, 16)))
+            _tmp_dirs.append(str(_ef_tmp))
     except Exception as e:
+        _cleanup_tmp(*_tmp_dirs)
         return {"verdict": "error", "reason": f"抽帧失败: {e}", "findings": []}
     if not frames:
+        _cleanup_tmp(*_tmp_dirs)
         return {"verdict": "blocked", "reason": "未能从视频抽取任何帧", "findings": []}
 
     # ── M3: per-shot 覆盖可断言 ─────────────────────────────────────
@@ -1062,6 +1101,10 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
         for si in (parsed.get("shot_issues") or []):
             if isinstance(si, dict) and str(si.get("shot") or "").strip():
                 shot_issues.append(si)
+
+    # 轮19:批次已全部编码发送,抽帧临时目录在此删除(此前从不删,
+    # 每个审查调用泄漏一个含 N 张 960px PNG 的目录)
+    _cleanup_tmp(*_tmp_dirs)
 
     # ── 人物一致性(跨镜 + 镜内双通道,VBench-2.0 human_identity 思路) ──
     # 轮11a:守卫从 len(shots)>1 放宽到 shots 非空——单镜视频同样可能
@@ -1199,6 +1242,7 @@ def vlm_review_shot(clip_path: str, shot: dict, frames_count: int = 4,
         else:
             dropped.append(t)
     if not frames:
+        _cleanup_tmp(tmp)
         return {"verdict": "blocked", "shot_id": sid, "findings": findings,
                 "reason": f"镜头{sid} 未能抽取任何帧", "deterministic": det}
     ctx = {"shots": [dict(shot, duration_sec=clip_dur)],
@@ -1261,6 +1305,8 @@ def vlm_review_shot(clip_path: str, shot: dict, frames_count: int = 4,
             if isinstance(si, dict) and str(si.get("issue") or "").strip():
                 shot_issues.append({"shot": str(si.get("shot") or sid),
                                     "issue": str(si.get("issue"))[:200]})
+    # 轮19:批次已全部编码发送,抽帧临时目录在此删除
+    _cleanup_tmp(tmp)
     for b in breaks:
         findings.append({"severity": "critical", "code": "VLM_BREAK",
                          "message": b})
