@@ -489,6 +489,24 @@ def _is_person_shot(subject: str) -> bool:
     return any(h in str(subject or "") for h in _PERSON_HINTS)
 
 
+# 轮17:剧本钉外观判定——anchor/任一镜主体写了服装发型具体式样时,
+# 跨镜换装即"违反剧本"(不是风格选择),COSTUME_SWAP 升 critical。
+# 「镜」「装」这类单字不收(「镜头」「装饰」会误命中)。
+_APPEARANCE_WORDS = ("衫", "外套", "大衣", "围巾", "裙", "西装", "制服",
+                     "毛衣", "T恤", "恤", "裤", "帽", "鞋", "眼镜", "发型",
+                     "长发", "短发", "直发", "卷发", "披肩", "马尾", "胡须")
+
+
+def _look_pinned(shots: list[dict], actor_anchor: str = "") -> bool:
+    if any(w in str(actor_anchor or "") for w in _APPEARANCE_WORDS):
+        return True
+    for s in shots:
+        if isinstance(s, dict) and any(
+                w in str(s.get("subject") or "") for w in _APPEARANCE_WORDS):
+            return True
+    return False
+
+
 def _person_pair(a: dict, b: dict) -> bool:
     """相邻两镜是否应做跨镜身份判定(轮16 重写配对判据)。
 
@@ -530,23 +548,37 @@ def _compare_person(video: Path, ta: float, tb: float, key: str) -> dict:
             "result": r}
 
 
-def _identity_finding(a_label: str, b_label: str, r: dict, intra: bool) -> dict:
-    """换人/换装 finding;intra=True 时为镜头内部(首帧 vs 末帧)判定。"""
+def _identity_finding(a_label: str, b_label: str, r: dict, intra: bool,
+                      pinned_look: bool = False) -> dict:
+    """换人/换装 finding;intra=True 时为镜头内部(首帧 vs 末帧)判定。
+
+    轮17:pinned_look(剧本钉了服装/发型式样)时换装也升 critical——
+    脚本写死了造型,跨镜换装就是违反剧本,不是风格选择。"""
     spec = str(r.get("spec") or "")
     is_face = ("脸" in spec or "发" in spec)
+    is_critical = is_face or (pinned_look and _spec_is_costume(spec))
     where = ("镜头%s 内部(首帧 vs 末帧)" % a_label if intra
              else "镜头%s→镜头%s" % (a_label, b_label))
     return {
-        "severity": "critical" if is_face else "warning",
+        "severity": "critical" if is_critical else "warning",
         "code": "IDENTITY_SWITCH" if is_face else "COSTUME_SWAP",
         "scope": "intra" if intra else "cross",
         "message": (f"{where} VLM 判定不是同一人"
                     f"(不一致点:{spec or str(r.get('reason') or '')[:60]})——"
                     f"{'镜内' if intra else '跨镜'}身份"
-                    f"{'已更换,禁止交付' if is_face else '被换装,需复核'}")}
+                    f"{'已更换,禁止交付' if is_critical else '被换装,需复核'}"
+                    + ("（剧本已钉死人物造型,换装即违反剧本）"
+                       if pinned_look and _spec_is_costume(spec)
+                       else ""))}
 
 
-def _identity_gate(video: Path, shots: list[dict], key: str) -> dict:
+def _spec_is_costume(spec: str) -> bool:
+    """不一致点是否只是服装层(不含脸/发)——后者一律 critical。"""
+    return bool(spec) and not ("脸" in spec or "发" in spec)
+
+
+def _identity_gate(video: Path, shots: list[dict], key: str,
+                   pinned_look: bool = False) -> dict:
     """人物一致性双通道:
     1) 跨镜:相邻两镜按 _person_pair 判定是否需要比(都是人物镜且不
        构成不同角色即比——「顾客」vs「店员」的合理切换仍跳过,
@@ -585,7 +617,7 @@ def _identity_gate(video: Path, shots: list[dict], key: str) -> dict:
         if not r["same"]:
             findings.append(_identity_finding(
                 str(a.get("shot_id", i + 1)),
-                str(b.get("shot_id", j + 1)), r, False))
+                str(b.get("shot_id", j + 1)), r, False, pinned_look))
     # ── 镜内首/末帧对比(轮11a) ─────────────────────────────────────
     intra_pairs, intra_checked = [], 0
     for i, s in enumerate(shots):
@@ -606,7 +638,7 @@ def _identity_gate(video: Path, shots: list[dict], key: str) -> dict:
             continue
         if not r["same"]:
             findings.append(_identity_finding(
-                str(s.get("shot_id", i + 1)), "", r, True))
+                str(s.get("shot_id", i + 1)), "", r, True, pinned_look))
     return {"pairs": pairs, "checked": checked, "findings": findings,
             "intra_pairs": intra_pairs, "intra_checked": intra_checked}
 
@@ -1037,7 +1069,12 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
     identity = {"pairs": [], "checked": 0, "findings": [],
                 "intra_pairs": [], "intra_checked": 0}
     if shots and key:
-        identity = _identity_gate(video, shots, key)
+        # 轮17:剧本钉了人物外观(anchor/镜主体含服装发型式样)时,跨镜
+        # 换装即违反剧本 → COSTUME_SWAP 升 critical
+        identity = _identity_gate(video, shots, key,
+                                  pinned_look=_look_pinned(
+                                      shots, str(ctx.get("actor_anchor")
+                                                 or "")))
 
     all_findings = det_findings + [
         {"severity": "critical", "code": "VLM_BREAK", "message": b} for b in breaks

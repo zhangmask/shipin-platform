@@ -1170,6 +1170,11 @@ def run_assemble_phase(project_id: str, store) -> dict:
               or "享受每一刻")[:40]
     ctx = {"product_info": str(brief.get("product_info", "")),
            "brand_name": brand_name, "slogan": slogan,
+           # 轮17:主角锚定(与 text 阶段同一解析式)——剧本钉了服装发型
+           # 式样时,终审把跨镜换装从 warning 升 critical(违反剧本)
+           "actor_anchor": (str(brief.get("actor_anchor")
+                                or brief.get("hero_anchor")
+                                or brief.get("character") or "").strip()),
            "duration_sec": round(sum(windows), 2),
            # G4(2026-09-21 审计):终验 VLM 逐帧对照分镜预期(场景/主体/动作),
            # 缺这些字段时「画面演错剧本」在审查里无从谈起

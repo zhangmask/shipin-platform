@@ -497,8 +497,11 @@ def _make_flash_clip(out, bands: list[tuple[float, float]],
     return Path(out)
 
 
-def _vlm_stub(monkeypatch, *, shot_issues=None, same_person=None, breaks=None):
-    """替换 hard_gates 的 VLM 通道:按提示词分派 SAME_PERSON 与批次问题。"""
+def _vlm_stub(monkeypatch, *, shot_issues=None, same_person=None, breaks=None,
+              same_person_spec="脸换了"):
+    """替换 hard_gates 的 VLM 通道:按提示词分派 SAME_PERSON 与批次问题。
+    same_person_spec: 判定"不是同一人"时的不一致点(轮17 测 COSTUME_SWAP
+    升级需要不含脸/发的纯服装 spec)。"""
     import json as _json
     from shipin_platform.review import hard_gates
 
@@ -506,8 +509,8 @@ def _vlm_stub(monkeypatch, *, shot_issues=None, same_person=None, breaks=None):
         if "同一人" in prompt:  # 跨镜身份成对判定(SAME_PERSON_PROMPT)
             if same_person is None:
                 return '{"same": true, "spec": "", "reason": ""}'
-            return _json.dumps({"same": False, "spec": "脸换了",
-                                "reason": "两镜不是同一张脸"},
+            return _json.dumps({"same": False, "spec": same_person_spec,
+                                "reason": "两镜不是同一人"},
                                ensure_ascii=False)
         body = {"frames": [], "breaks": [] if breaks is None else breaks,
                 "brand_seen": True,
@@ -670,6 +673,57 @@ class TestIdentityGate:
         r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
         assert r["identity"]["checked"] == 0
         assert r["identity"]["intra_checked"] == 0
+
+    # ── 轮17:剧本钉外观时 COSTUME_SWAP 升 critical ───────────────────
+    # 剧本写了服装/发型式样(anchor 或镜主体含服装词)时,跨镜换装就是
+    # 违反剧本,不是风格选择;没钉外观的脚本保持 warning(导演自由)。
+
+    def test_costume_swap_critical_when_look_pinned(self, monkeypatch,
+                                                    tmp_path):
+        """主体写了服装式样 → 纯服装不一致也 critical,message 带说明。"""
+        _vlm_stub(monkeypatch, same_person=False,
+                  same_person_spec="服装")
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "pk.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0,
+             "subject": "女主角穿米白针织开衫"},
+            {"shot_id": "S02", "duration_sec": 2.0,
+             "subject": "女主角穿深色外套"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        hits = [f for f in r["findings"] if f["code"] == "COSTUME_SWAP"]
+        assert hits, r["findings"]
+        assert hits[0]["severity"] == "critical", hits[0]
+        assert "剧本已钉死" in hits[0]["message"]
+
+    def test_costume_swap_warning_without_pin(self, monkeypatch, tmp_path):
+        """脚本没钉外观(泛称主角) → 换装仍是 warning(风格自由)。"""
+        _vlm_stub(monkeypatch, same_person=False,
+                  same_person_spec="服装")
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "np.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "主角"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "主角"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        hits = [f for f in r["findings"] if f["code"] == "COSTUME_SWAP"]
+        assert hits, r["findings"]
+        assert hits[0]["severity"] == "warning", hits[0]
+
+    def test_costume_swap_critical_via_actor_anchor(self, monkeypatch,
+                                                    tmp_path):
+        """外观写在 brief 的 actor_anchor(而非镜主体)时同样生效。"""
+        _vlm_stub(monkeypatch, same_person=False,
+                  same_person_spec="服装")
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "anc.mp4", 4.0)
+        ctx = {"actor_anchor": "主角为25岁女性,黑色长直发披肩、米白色针织开衫",
+               "shots": [
+                   {"shot_id": "S01", "duration_sec": 2.0, "subject": "主角"},
+                   {"shot_id": "S02", "duration_sec": 2.0, "subject": "主角"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        hits = [f for f in r["findings"] if f["code"] == "COSTUME_SWAP"]
+        assert hits and hits[0]["severity"] == "critical", r["findings"]
 
     # ── 轮11a:镜内人物一致性(首帧 vs 末帧) ─────────────────────────
     # coffee-v7 实测教训:S02 在 t=4.03s 镜内换装、S06 在 19.89→21.5s
