@@ -1281,6 +1281,28 @@ def run_assemble_phase(project_id: str, store) -> dict:
         fv["reason"] = ((fv.get("reason") or "")
                         + f"；附属门(单镜诊断/入拼复审/旁白声轨) "
                           f"{len(_sr_crit)} 处 critical")
+    # 轮23:通道级结论汇总——终审只说"按 findings 修复"不够,运营需要
+    # 定位到「哪一镜的哪个通道」出的问题(clip 诊断/关键帧审图/入拼
+    # 复审/旁白声轨),明细在各 *_review.json / *_check.json。
+    def _ncrit(r: dict) -> int:
+        return sum(1 for f in (r.get("findings") or [])
+                   if f.get("severity") == "critical")
+
+    _channels: list[dict] = []
+    for _sid, _r in sorted((_sr_all or {}).items()):
+        _is_kf = str(_sid).startswith("__")
+        _channels.append({
+            "channel": "keyframe" if _is_kf else "shot_review",
+            "shot_id": str(_sid).strip("_").removeprefix("keyframe_"),
+            "verdict": _r.get("verdict"), "critical": _ncrit(_r)})
+    for _idx, _r in sorted((_pr_all or {}).items()):
+        _channels.append({"channel": "part_review",
+                          "shot_id": _r.get("shot_id"),
+                          "part_idx": _idx, "verdict": _r.get("verdict"),
+                          "critical": _ncrit(_r)})
+    _channels.append({"channel": "narration", "verdict": _nc.get("verdict"),
+                      "critical": _ncrit(_nc)})
+    out["review_channels"] = _channels
     _save(project_id, "final_review.json", fv)
     out["final_review"] = {"verdict": fv.get("verdict"),
                            "deterministic": fv.get("deterministic"),

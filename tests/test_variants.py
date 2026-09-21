@@ -279,6 +279,11 @@ class TestVariantE2E:
                 assert g["generate"]["ok"] is True, g["generate"].get("reason")
                 a = run_variant_phases(vid, store, phases="assemble")["assemble"]
                 assert a["ok"] is True, a.get("reason")
+                # 轮23:通道级结论汇总必须出现在响应里(终审 fix 时
+                # 运营按它定位「哪一镜的哪个通道」出的问题)
+                assert "review_channels" in a, sorted(a.keys())
+                for ch in a["review_channels"]:
+                    assert ch.get("channel") and "critical" in ch, ch
                 assert (PROJECTS_DIR / vid / "final.mp4").is_file()
                 st = variant_status(vid, store)
                 assert st["final_exists"] is True
