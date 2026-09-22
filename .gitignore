@@ -40,3 +40,5 @@ assets/
 .mimosa/
 ._cues_*/data/references/
 data/references/
+._cues_*
+._cues_*/
