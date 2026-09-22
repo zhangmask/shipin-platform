@@ -328,6 +328,20 @@ class TestApiGates:
                     if f.get("gate") == "final_review")
         assert gate["status"] == "NOT_REVIEWED"
 
+    def test_finalize_idempotent_when_already_released(self, client):
+        """轮32:已发布项目重复 finalize(前端重复点击/发布后轮询)必须
+        幂等 200——旧行为走 required 循环,RELEASED≠PASS → 409
+        UPSTREAM_FAILED(语义是「上游未过」,实际「早已发布」)。"""
+        pid = "fin-twice"
+        client.post("/api/project/create", json={"project_id": pid})
+        self._pass_all_stages(pid)
+        self._write_final_review(pid, "pass")
+        r1 = client.post(f"/api/project/{pid}/finalize")
+        assert r1.status_code == 200
+        r2 = client.post(f"/api/project/{pid}/finalize")
+        assert r2.status_code == 200, r2.json()
+        assert r2.json()["status"] == "RELEASED"
+
     def test_finalize_ok_when_final_review_pass_keeps_hash(self, client):
         pid = "fin-pass"
         client.post("/api/project/create", json={"project_id": pid})

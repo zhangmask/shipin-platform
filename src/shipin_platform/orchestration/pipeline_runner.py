@@ -479,13 +479,17 @@ def _iterate(stage: str, data: dict, project_id: str, store,
 
     decision = final["decision"]
     h = stable_artifact_hash(data)
+    # 轮32:先落盘再记帐——旧顺序 record_artifact 在 _save 之前,两者之间
+    # 崩溃/磁盘满会留下「DB=PASS+新哈希、盘上旧文件或缺失」:下次 prompt
+    # 阶段缓存命中跳过重审 → 读盘上旧文件(没用过审的旧 prompt 花钱生成,
+    # 正是轮29 要堵的)或 shot_prompts KeyError 500。
+    _save(project_id, f"{stage}.json", data)
+    _save(project_id, f"{stage}_review.json",
+          {"decision": decision, "rounds": rounds, "llm": llm_info})
     if decision in ("pass", "pass_with_warnings"):
         store.record_artifact(project_id, stage, h)
     else:
         store.record_artifact(project_id, stage, h, status="BLOCKED")
-    _save(project_id, f"{stage}.json", data)
-    _save(project_id, f"{stage}_review.json",
-          {"decision": decision, "rounds": rounds, "llm": llm_info})
     return {"stage": stage, "decision": decision, "data": data,
             "stats": final["stats"], "revision_plan": final.get("revision_plan", []),
             "llm": llm_info}
@@ -556,14 +560,35 @@ def run_text_phase(project_id: str, brief: dict, store,
             s.setdefault("shot_id", f"S{i+1:02d}")
         r = _iterate("script", draft, project_id, store, use_llm=True)
         steps.append({"stage": "script", "attempt": attempt + 1,
-                      "decision": r["decision"], "criticals": r["stats"]["critical"]})
+                      "decision": r["decision"], "criticals": r["stats"]["critical"],
+                      "llm": r.get("llm") or {}})
+        # 轮32:语义审片不可用(key 中途失效/端点 5xx/输出不可解析)且规则
+        # 全过时立刻带可操作原因退出——旧行为是把 r["llm"] 丢掉、空烧
+        # 剩余 attempt(每次 1 次 repair 生成 + 1 次审片),6 次后用户拿到
+        # 的 reason 是误导性的「LLM+规则都没过、人工介入剧本」,运营按
+        # 错误方向改剧本,改完还是同样失败。
+        if ((r.get("llm") or {}).get("available") is False
+                and r["stats"]["critical"] == 0):
+            return {"ok": False, "phase": "text", "steps": steps,
+                    "reason": ("语义审片不可用("
+                               + str((r.get("llm") or {}).get("reason")
+                                     or "")[:120]
+                               + ")——剧本已过规则引擎,但故事结构/可拍性/"
+                                 "连续性未经语义审查;检查 AGNES_KEY 与审片"
+                                 "端点可用性后重试 /api/pipeline/text")}
         last_plan = r["revision_plan"]
         if r["decision"] in ("pass", "pass_with_warnings"):
             script = r["data"]
             break
     if script is None:
+        _llm_reason = next((str(s.get("llm", {}).get("reason") or "")
+                            for s in reversed(steps)
+                            if (s.get("llm") or {}).get("available") is False),
+                           "")
         return {"ok": False, "phase": "text", "steps": steps,
-                "reason": "剧本 6 次生成/修复未通过审核(LLM+规则),需要人工介入"}
+                "reason": ("剧本 6 次生成/修复未通过审核(LLM+规则),需要人工介入"
+                           + (f"；语义审片不可用: {_llm_reason[:120]}"
+                              if _llm_reason else ""))}
 
     # 分镜:同样定向修复。主角锚定优先取 brief.actor_anchor/hero_anchor/
     # character(用户在产品里写了「男主角45岁」「穿蓝西装」就要用上),
@@ -594,7 +619,18 @@ def run_text_phase(project_id: str, brief: dict, store,
             s.setdefault("dialogue", dlg if isinstance(dlg, dict) else "")
         r = _iterate("storyboard", draft, project_id, store, use_llm=True)
         steps.append({"stage": "storyboard", "attempt": attempt + 1,
-                      "decision": r["decision"], "criticals": r["stats"]["critical"]})
+                      "decision": r["decision"], "criticals": r["stats"]["critical"],
+                      "llm": r.get("llm") or {}})
+        # 轮32:同剧本 attempt——语义审片不可用且规则全过立刻可操作退出
+        if ((r.get("llm") or {}).get("available") is False
+                and r["stats"]["critical"] == 0):
+            return {"ok": False, "phase": "text", "steps": steps,
+                    "reason": ("语义审片不可用("
+                               + str((r.get("llm") or {}).get("reason")
+                                     or "")[:120]
+                               + ")——分镜已过规则引擎,但故事结构/可拍性/"
+                                 "连续性未经语义审查;检查 AGNES_KEY 与审片"
+                                 "端点可用性后重试 /api/pipeline/text")}
         last_plan = r["revision_plan"]
         if r["decision"] in ("pass", "pass_with_warnings"):
             storyboard = r["data"]
@@ -603,8 +639,14 @@ def run_text_phase(project_id: str, brief: dict, store,
             storyboard = _bind_brand(storyboard, b["data"])
             break
     if storyboard is None:
+        _llm_reason = next((str(s.get("llm", {}).get("reason") or "")
+                            for s in reversed(steps)
+                            if (s.get("llm") or {}).get("available") is False),
+                           "")
         return {"ok": False, "phase": "text", "steps": steps,
-                "reason": "分镜 6 次生成/修复未通过审核,需要人工介入"}
+                "reason": ("分镜 6 次生成/修复未通过审核,需要人工介入"
+                           + (f"；语义审片不可用: {_llm_reason[:120]}"
+                              if _llm_reason else ""))}
 
     return {"ok": True, "phase": "text", "steps": steps,
             "script": script, "storyboard": storyboard,
@@ -1282,7 +1324,12 @@ def run_assemble_phase(project_id: str, store) -> dict:
     _viol = check_subtitle_cues(burn.get("cues") or [],
                                 str((work / "subtitled.mp4").resolve()))
     _viol_crit = [v for v in _viol if v.get("severity") == "critical"]
-    out["burn"] = {"violations": _viol or None}
+    # 轮32:critical/warning 计数随响应走——y 带 warning 在默认 margin_v=96
+    # 下对每个正常项目都成立(验收规则与排版参数的矛盾,见轮27),旧行为只
+    # 落盘 subtitle_check.json、运营侧零可见,根因排版参数永远挂着没人修。
+    out["burn"] = {"violations": _viol or None,
+                   "critical": len(_viol_crit),
+                   "warnings": len(_viol) - len(_viol_crit)}
     if _viol_crit:
         _save(project_id, "subtitle_check.json",
               {"verdict": "fix", "violations": _viol})

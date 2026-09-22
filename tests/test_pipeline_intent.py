@@ -223,6 +223,61 @@ class TestPromptStageCache:
         assert pr._prompt_stage_stale(row, data) is False
 
 
+class TestTextPhaseLlmDown:
+    """轮32:语义审片不可用(规则全过)时立刻带可操作原因退出。
+
+    旧行为:r["llm"] 被 steps 丢弃、6 次 attempt 每次烧 1 次 repair 生成
+    +1 次审片后,用户拿到的 reason 是误导性的「LLM+规则都没过、人工介入
+    剧本」;steps 里 6 行 decision=revise,criticals=0 自相矛盾(0 critical
+    为何 revise),无任何字段指向 AGNES_KEY。"""
+
+    def test_bails_with_actionable_reason_single_attempt(self, monkeypatch):
+        from shipin_platform.orchestration.stage_store import ProjectStageStore
+        # 过 run_text_phase 的 key 前置检查(中间失效由下方 stub 模拟)
+        monkeypatch.setenv("AGNES_KEY", "x" * 24)
+        pid = "text-llm-down"
+        store = ProjectStageStore(":memory:")
+        store.create_project(pid)
+        brief = {"content_type": "product", "product_info": "测试咖啡",
+                 "target_platform": "douyin", "duration_sec": 24,
+                 "target_audience": "都市白领", "tone": "轻松治愈",
+                 "creative_direction": "温暖治愈的产品短片",
+                 "reference_materials": "", "special_requirements": ""}
+        pr._save(pid, "brief.json", brief)
+        _narr = ["深夜街头冷色如冰", "加班后的倦无人说", "推门暖光迎面而来",
+                 "手工烘焙的香气", "第一口顺滑融化疲惫", "走向座位缓缓落座",
+                 "原来温柔就在这一杯", "享受这一刻好滋味"]
+        draft = {"duration_sec": 24, "shots": []}
+        for i in range(1, 9):
+            _dlg = ""
+            if i in (3, 7):  # 至少 2 镜台词(引擎对白门禁)
+                _dlg = {"role_code": "hero_male", "text": "欢迎光临慢慢喝"}
+            draft["shots"].append({
+                "shot_id": f"S{i:02d}", "duration_sec": 3,
+                "shot_size": "中景", "camera": "固定机位",
+                "spatial": "画面中央", "subject": "主角",
+                "scene": "咖啡店", "motion": "端起咖啡杯",
+                "narration": _narr[i - 1], "dialogue": _dlg})
+        monkeypatch.setattr(pr, "_llm_json", lambda *a, **k: dict(draft))
+        monkeypatch.setattr(
+            pr, "llm_stage_review",
+            lambda stage, data, brief=None: {
+                "available": False, "reason": "测试:审片端点 500",
+                "findings": [], "scores": {}, "raw": ""})
+        r = pr.run_text_phase(pid, brief, store)
+        assert r["ok"] is False
+        # 可操作:点名是语义审片不可用 + 带上端点原因,而不是"剧本要人工介入"
+        assert "语义审片不可用" in r["reason"], r["reason"]
+        assert "审片端点 500" in r["reason"]
+        assert "AGNES_KEY" in r["reason"]
+        # 不空烧:1 次 attempt 就退出(旧行为烧满 6 次)
+        assert len([s for s in r["steps"]
+                    if s.get("stage") == "script"]) == 1
+        # steps 带 llm 上下文(旧行为整个丢弃)
+        st = next(s for s in r["steps"] if s.get("stage") == "script")
+        assert (st.get("llm") or {}).get("available") is False
+
+
 class TestIterateDurationLoop:
     """轮25 回归:_iterate 的时长闭环收尾块曾引用三个从未赋名的变量
     (fitted_total/dev/llm_meta)——stage="script" 且 brief 带

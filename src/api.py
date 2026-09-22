@@ -1528,6 +1528,14 @@ def project_finalize(project_id: str):
     except StageGateError:
         raise HTTPException(status_code=404, detail=f"project not found: {project_id}")
 
+    # 轮32:幂等——已发布项目重复 finalize(前端重复点击/发布后轮询)旧行为
+    # 走 required 循环,post_production 已是 RELEASED ≠ PASS → 409
+    # UPSTREAM_FAILED,错误码语义是「上游未过」,实际是「早已发布」。
+    _pp = store.get_stage(project_id, "post_production")
+    if _pp is not None and str(_pp["status"]) == "RELEASED":
+        return {"project_id": project_id, "status": "RELEASED",
+                "stages": store.get_project_status(project_id)}
+
     # Required stages: brief through post_production (image_prompt/video_prompt
     # are optional when no generation step is used; skip them).
     required = ("brief", "script", "storyboard", "video_gen", "post_production")
