@@ -444,6 +444,23 @@ class TestAbstractQualityGates:
         assert not any("台词与旁白重复" in f.issue
                        for f in report.findings)
 
+    def test_subjective_chinese_adjectives_flagged(self):
+        """轮39(五审 #6a):旧表 12 个完整形态硬编码("震撼的"命中、"震撼"
+        漏),中文广告高频主观词("口感惊艳""回味无穷")零 finding。词根
+        前缀匹配后必须报。"""
+        script = _mk_script(["清晨的第一口，口感惊艳，回味无穷"])
+        report = ReviewEngine().run_review("script", script)
+        hits = [f for f in report.findings if "主观词" in f.issue]
+        assert hits, [f.issue for f in report.findings]
+        assert any("惊艳" in f.issue for f in hits), hits
+
+    def test_subjective_word_root_without_suffix_flagged(self):
+        """轮39:去掉"的"的后缀形态("震撼")同样命中——旧表只收完整形态。"""
+        script = _mk_script(["这一刻，全场震撼"])
+        report = ReviewEngine().run_review("script", script)
+        assert any("主观词'震撼'" in f.issue for f in report.findings), \
+            [f.issue for f in report.findings]
+
     def test_script_clean_no_narration_duplicate(self):
         report = ReviewEngine().run_review("script", _mk_script([NARR1, NARR2]))
         assert not any(f.failure_mode == "NARRATION_DUPLICATED" for f in report.findings)

@@ -258,6 +258,16 @@ class FailureClassifier:
         return {"mode": mode, "strategy": strategy, "severity": sev}
 
 
+
+# 轮39:主观词词根(检查与机械修复两侧共用;前缀匹配,"震撼"/"震撼的"都中)
+_SUBJECTIVE_ROOTS = (
+    "震撼", "感人", "凄美", "史诗", "完美", "惊艳", "绝美", "回味无穷",
+    "口感惊艳", "无与伦比", "无以伦比", "颠覆", "炸裂", "极致", "顶级",
+    "尊享", "奢享", "臻品", "引领", "赋能", "叹为观止", "欲罢不能",
+    "epic", "inspiring", "powerful", "beautiful", "moody",
+    "cinematic", "breathtaking", "stunning", "amazing", "magical",
+)
+
 class RevisionEngine:
     """Applies revision strategies based on failure modes."""
 
@@ -383,15 +393,15 @@ class RevisionEngine:
     }
 
     # E1: subjective word → visual description ("" = just remove)
+    # 轮39: richer entries first(视觉化改写),词根并集殿后(删除)——与检查
+    # 侧 _SUBJECTIVE_ROOTS 同源,不脱节。
     SUBJECTIVE_REPLACEMENTS = {
         "confident smile": "lips curved upward, eyes slightly narrowed",
         "sad": "head slightly lowered, shoulders relaxed downward",
         "happy": "lips curved upward, eyes wide and bright",
         "dramatic": "high contrast lighting, deep shadows on one side",
         "warm atmosphere": "golden hour light casting amber tones",
-        "cinematic": "", "beautiful": "", "epic": "", "stunning": "", "amazing": "",
-        "inspiring": "", "powerful": "", "moody": "", "breathtaking": "",
-        "震撼的": "", "感人的": "", "史诗级的": "", "完美的": "",
+        **{root: "" for root in _SUBJECTIVE_ROOTS},
     }
 
     def fix(self, stage: str, data: dict, report: ReviewReport) -> dict:
@@ -577,6 +587,7 @@ _NARR_PUNCT_RE = re.compile(
 
 def _norm_narration_key(text: str) -> str:
     return _NARR_PUNCT_RE.sub("", str(text or "")).lower()
+
 
 
 class ReviewEngine:
@@ -774,21 +785,23 @@ class ReviewEngine:
             ))
 
         # Subjective words check
-        subjective_words = ["震撼的", "感人的", "史诗级的", "完美的", "epic",
-                           "inspiring", "powerful", "beautiful", "moody",
-                           "cinematic", "breathtaking", "stunning"]
-        narration_text = " ".join(s.get("narration", "") for s in shots)
-        for word in subjective_words:
-            if word in narration_text:
-                cls = self.classifier.classify("script", "subjective_word", word)
+        # 轮39:旧表 12 个完整形态硬编码("震撼的"命中、"震撼"漏)、且不收
+        # 中文广告高频主观词("口感惊艳""回味无穷"零 finding)。改词根前缀
+        # 匹配:词根出现即中,修复表(RevisionEngine.SUBJECTIVE_REPLACEMENTS)
+        # 以同一词根并集扩展,两侧不脱节。
+        narration_text = " ".join(s.get("narration", "") for s in shots
+                                  if isinstance(s.get("narration"), str))
+        for root in _SUBJECTIVE_ROOTS:
+            if root.lower() in narration_text.lower():
+                cls = self.classifier.classify("script", "subjective_word", root)
                 findings.append(Finding(
                     dimension="language",
                     severity=Severity.SUGGESTION,
-                    issue=f"使用主观词'{word}'",
+                    issue=f"使用主观词'{root}'",
                     evidence=f"出现在旁白中",
                     failure_mode=cls["mode"],
                     revision_strategy=cls["strategy"],
-                    proposed_fix=f"替换为视觉描述",
+                    proposed_fix="替换为视觉描述",
                 ))
 
         # Shot too short (< 1.0s is below the perceivable TVC floor)
