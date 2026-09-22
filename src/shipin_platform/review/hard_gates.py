@@ -696,12 +696,25 @@ def _identity_finding(a_label: str, b_label: str, r: dict, intra: bool,
     """换人/换装 finding;intra=True 时为镜头内部(首帧 vs 末帧)判定。
 
     轮17:pinned_look(剧本钉了服装/发型式样)时换装也升 critical——
-    脚本写死了造型,跨镜换装就是违反剧本,不是风格选择。"""
+    脚本写死了造型,跨镜换装就是违反剧本,不是风格选择。
+    轮35:spec 空(VLM 只说"不是同一人"、没给不一致点)时向 critical
+    兜底——旧逻辑 is_face=False → COSTUME_SWAP warning,而单镜诊断的
+    warning 会被 assemble 的 critical 过滤器直接丢弃,"换人"在模型
+    措辞不利时静默降级(五审 #4)。
+    轮41:spec 与 reason 双空(模型既不给不一致点也不解释)时不再直接
+    critical,降为 IDENTITY_UNVERIFIED suggestion——最没信息量的答案
+    不该受最重的罚(六审 #4 残留);reason 有实质内容(如"脸部完全
+    不同")仍走 critical 兜底。"""
     spec = str(r.get("spec") or "")
-    # 轮35:spec 空(VLM 只说"不是同一人"、没给不一致点)时向 critical
-    # 兜底——旧逻辑 is_face=False → COSTUME_SWAP warning,而单镜诊断的
-    # warning 会被 assemble 的 critical 过滤器直接丢弃,"换人"在模型
-    # 措辞不利时静默降级(五审 #4)。reason 仍写进 message 供人工判。
+    reason = str(r.get("reason") or "")
+    if not spec and not reason.strip():
+        return {
+            "severity": "suggestion", "code": "IDENTITY_UNVERIFIED",
+            "scope": "intra" if intra else "cross",
+            "message": (f"镜头{a_label} 内部(首帧 vs 末帧)" if intra
+                        else f"镜头{a_label}→镜头{b_label}"
+                        ) + " VLM 判定不是同一人但未给出任何不一致点或解释"
+                          "——身份存疑但证据不足,建议人工复核或重审"}
     is_face = ("脸" in spec or "发" in spec) or not spec
     is_critical = is_face or (pinned_look and _spec_is_costume(spec))
     where = ("镜头%s 内部(首帧 vs 末帧)" % a_label if intra
@@ -711,7 +724,7 @@ def _identity_finding(a_label: str, b_label: str, r: dict, intra: bool,
         "code": "IDENTITY_SWITCH" if is_face else "COSTUME_SWAP",
         "scope": "intra" if intra else "cross",
         "message": (f"{where} VLM 判定不是同一人"
-                    f"(不一致点:{spec or str(r.get('reason') or '')[:60]})——"
+                    f"(不一致点:{spec or reason[:60]})——"
                     f"{'镜内' if intra else '跨镜'}身份"
                     f"{'已更换,禁止交付' if is_critical else '被换装,需复核'}"
                     + ("（剧本已钉死人物造型,换装即违反剧本）"

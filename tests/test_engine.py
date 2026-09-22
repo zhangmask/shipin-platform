@@ -529,7 +529,7 @@ class TestAbstractQualityGates:
     def test_storyboard_camera_finding_attributes_real_shot(self):
         """轮36a:中间镜无 camera 字段时,雷同 finding 必须挂在真正持有
         该机位的镜上——旧代码用压缩缓存下标索引原 shots,camera=
-        [static,'',static] 会把 finding 挂到没有 camera 字段的 S02,
+        [static,'',static] 时会把 finding 挂到没有 camera 字段的 S02,
         修订计划让 LLM 改不存在的字段(诱发 STALL)。"""
         sb = _mk_storyboard(["static", "", "static"],
                             [NARR1, NARR2, "蒸汽在指缝间缠绕"])
@@ -539,6 +539,8 @@ class TestAbstractQualityGates:
         assert cams, [f.failure_mode for f in report.findings]
         assert "S01" in cams[0].evidence and "S03" in cams[0].evidence, \
             cams[0].evidence
+        # 轮41:隔空镜(S02 无 camera)时点名实际比对对象,不写"上一镜"
+        assert "与镜头S01" in cams[0].issue, cams[0].issue
 
     def test_storyboard_camera_gap_does_not_false_pair(self):
         """轮36a:空 camera 的镜不得参与相邻比对——[dolly in,'',static]

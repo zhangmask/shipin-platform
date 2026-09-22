@@ -1196,6 +1196,49 @@ class TestIdentityGate:
                 if f["code"] in ("IDENTITY_SWITCH", "COSTUME_SWAP")]
         assert hits and hits[0]["severity"] == "critical", hits
 
+    def test_no_spec_no_reason_is_unverified_suggestion(self, monkeypatch,
+                                                        tmp_path):
+        """轮41(六审 #4 残留):spec 与 reason 双空(模型既不给不一致点
+        也不解释)时不再直接 critical——最没信息量的答案不该受最重的罚,
+        降 IDENTITY_UNVERIFIED suggestion 转人工。"""
+        import json as _json_u
+        from shipin_platform.review import hard_gates
+        monkeypatch.setattr(hard_gates, "_vlm_credentials", lambda: "fake-key")
+        monkeypatch.setattr(
+            hard_gates, "_ask_vlm",
+            lambda *a, **k: _json_u.dumps(
+                {"same": False, "spec": "", "reason": ""},
+                ensure_ascii=False))
+        clip = _make_motion_clip(tmp_path / "unv.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "女主角"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "女主角"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        hits = [f for f in r["findings"]
+                if f["code"] == "IDENTITY_UNVERIFIED"]
+        assert hits and hits[0]["severity"] == "suggestion", hits
+        assert "IDENTITY_SWITCH" not in {f["code"] for f in r["findings"]}
+
+    def test_empty_spec_with_reason_stays_critical(self, monkeypatch,
+                                                   tmp_path):
+        """轮41 另一面:spec 空但 reason 有实质内容("脸部完全不同")仍走
+        critical 兜底——fail-safe 方向不被双空降级削弱。"""
+        import json as _json_r
+        from shipin_platform.review import hard_gates
+        monkeypatch.setattr(hard_gates, "_vlm_credentials", lambda: "fake-key")
+        monkeypatch.setattr(
+            hard_gates, "_ask_vlm",
+            lambda *a, **k: _json_r.dumps(
+                {"same": False, "spec": "", "reason": "脸部完全不同"},
+                ensure_ascii=False))
+        clip = _make_motion_clip(tmp_path / "rsn.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "女主角"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "女主角"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        hits = [f for f in r["findings"] if f["code"] == "IDENTITY_SWITCH"]
+        assert hits and hits[0]["severity"] == "critical", hits
+
     def test_ta_word_not_person(self, monkeypatch, tmp_path):
         """『其他装饰特写』不能因『他』被当人物镜——表里刻意没有『他』。"""
         _vlm_stub(monkeypatch)

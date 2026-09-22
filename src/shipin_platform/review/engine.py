@@ -1230,7 +1230,10 @@ proposed_fix="补齐 beat/rhythm/sfx 三字段(TVC 质感必备,AGENT_GUIDE §10
                 findings.append(Finding(
                     dimension="variation",
                     severity=Severity.CRITICAL,
-                    issue=f"镜头{cur.get('shot_id', '?')}与上一镜同为机位'{cc}'——镜头语言无差异",
+                    # 轮41:点名实际比对对象——空 camera 的镜不参与配对,
+                    # [static,'',static] 时被比较的是 S01/S03,"与上一镜"
+                    # 的措辞在隔空镜时不严谨(六审残留)
+                    issue=f"镜头{cur.get('shot_id', '?')}与镜头{prev.get('shot_id', '?')}同为机位'{cc}'——镜头语言无差异",
                     evidence=f"consecutive camera='{cc}' (S{prev.get('shot_id', '?')} -> S{cur.get('shot_id', '?')})",
                     failure_mode=cls["mode"],
                     revision_strategy=cls["strategy"],
