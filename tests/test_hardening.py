@@ -630,6 +630,25 @@ class TestApiGates:
         assert r2.status_code == 200, r2.json()
         assert r2.json()["status"] == "RELEASED"
 
+    def test_variant_run_enforces_budget(self, client):
+        """轮42(七审 #1):/api/variant/{id}/run 旧代码不查预算,超预算
+        项目经此车道继续烧 image/video/tts(sync/async 主车道有
+        _enforce_budget,variant/retry 两条车道完全失效)。"""
+        import hashlib
+        pid = "bf-var"
+        client.post("/api/project/create", json={"project_id": pid})
+        import json as _json_vb
+        _vdir = api._project_dir(pid)
+        _vdir.mkdir(parents=True, exist_ok=True)
+        (_vdir / "budget.json").write_text(
+            _json_vb.dumps({"max_budget_usd": 0.0001}), encoding="utf-8")
+        from shipin_platform.services.costing import record_cost
+        record_cost(pid, "video", model="agnes-video", units=1.0, note="x")
+        r = client.post(f"/api/variant/{pid}/run",
+                        json={"phases": "generate"})
+        assert r.status_code == 422, r.json()
+        assert "预算" in str(r.json().get("detail", ""))
+
     def test_finalize_ok_when_final_review_pass_keeps_hash(self, client):
         pid = "fin-pass"
         client.post("/api/project/create", json={"project_id": pid})

@@ -415,6 +415,10 @@ def _iterate(stage: str, data: dict, project_id: str, store,
     final = rounds[-1]
     if use_llm and stage in ("script", "storyboard"):
         llm = llm_stage_review(stage, data, brief=brief_ctx)
+        # 轮42:LLM 审片调用入账(七审 #2:此前 text 阶段付费 LLM 调用零
+        # 入账,预算只覆盖媒体生成)
+        record_cost(project_id, "llm", model="agnes-text", units=1.0,
+                    note=f"{stage} 审片")
         if llm["available"]:
             llm_info = {"scores": llm.get("scores", {}), "n": len(llm["findings"])}
             for f in llm["findings"]:
@@ -560,8 +564,14 @@ def run_text_phase(project_id: str, brief: dict, store,
     for attempt in range(6):
         if draft is None:
             draft = _llm_json(_script_prompt(b["data"], category))
+            if draft:
+                record_cost(project_id, "llm", model="agnes-text",
+                            units=1.0, note="剧本生成")
         else:
             draft = _repair("script", draft, last_plan) or draft
+            if draft:
+                record_cost(project_id, "llm", model="agnes-text",
+                            units=1.0, note="剧本修复")
         if not draft or "shots" not in draft:
             draft = None
             continue
@@ -615,8 +625,14 @@ def run_text_phase(project_id: str, brief: dict, store,
                               json.dumps(script, ensure_ascii=False))
                               .replace("{actor_anchor}", actor_anchor),
                               max_tokens=5000)
+            if draft:
+                record_cost(project_id, "llm", model="agnes-text",
+                            units=1.0, note="分镜生成")
         else:
             draft = _repair("storyboard", draft, last_plan) or draft
+            if draft:
+                record_cost(project_id, "llm", model="agnes-text",
+                            units=1.0, note="分镜修复")
         if not draft or "shots" not in draft:
             draft = None
             continue
@@ -874,10 +890,20 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
         if by_id[sid]["mode"] == "outro_card":
             report.append({"shot_id": sid, "note": "kenburns 落版卡,assemble 阶段生成"})
             continue
-        if mrec.get("qc") == "ok":
+        dur = float(s.get("duration_sec") or 3)
+        # 轮42:clip 缓存必须过输入指纹(见 _clip_input_sha)——指纹不符
+        # (prompt/首末帧/时长变过)即使 qc=="ok" 也强制重生;manifest 里
+        # 的 clip 文件也必须真实存在(旧代码信 manifest 不验盘)。
+        _ci = _clip_input_sha(vid_map.get(sid) or s.get("motion") or "",
+                              str(mrec.get("first_frame") or ""),
+                              str(mrec.get("last_frame") or ""), dur)
+        _cached_clip = str(mrec.get("clip") or "")
+        if (mrec.get("qc") == "ok"
+                and mrec.get("clip_input_sha") == _ci
+                and _cached_clip.endswith(".mp4")
+                and Path(_cached_clip).is_file()):
             report.append({"shot_id": sid, "qc": "ok", "cached": True})
             continue
-        dur = float(s.get("duration_sec") or 3)
         clip = work / f"{sid}_clip.mp4"
         # 轮21:关键帧 vs 分镜文本门——视频模型以 first_frame 为条件
         # 生成,关键帧跑偏整镜必歪,而 qc_clip 的 dHash 只比「clip 首帧
@@ -905,6 +931,14 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                 mrec["keyframe_review"] = f"error: {str(e)[:120]}"
         attempts = []
         for attempt in range(3):
+            # 轮42:阶段内预算熔断(七审 #2)——每次生成前复查,超限即中止,
+            # 不让单次 generate 超支一个数量级(入口闸只在进门时查一次)
+            _over, _why = _budget_exceeded(project_id)
+            if _over:
+                return {"ok": False, "phase": "generate",
+                        "reason": (f"预算熔断({_why})——{sid} 第 {attempt + 1} "
+                                   f"次生成前中止;POST /api/pipeline/"
+                                   f"{project_id}/budget 调整上限后重跑")}
             # 重试阶梯(v6 实证):1) 原提示词 2) 固定机位+原运动
             # 3) 固定机位+主体极简运动。机位运动+主体运动叠加是切镜主诱因。
             if attempt == 0:
@@ -957,6 +991,9 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                                               canvas_w, canvas_h)):
                     mrec["master"] = str(work / f"{sid}_canvas_master.mp4")
                 mrec["clip"] = str(clip)
+                # 轮42:记下本镜 clip 的输入指纹——下次重跑凭它判断缓存
+                # 是否还有效(prompt/首末帧/时长变过 → 强制重生)
+                mrec["clip_input_sha"] = _ci
                 # 审计 G5:clip 内容哈希落账——assemble 时代验同一文件名是否
                 # 被换过内容(拼接阶段会按此清单逐片核对,防"审A拼B")
                 import hashlib as _hl
@@ -1153,6 +1190,43 @@ def _prompt_stage_stale(row, data: dict) -> bool:
         return stable_artifact_hash(data) != recorded
     except Exception:
         return True
+
+
+def _budget_exceeded(project_id: str) -> tuple[bool, str]:
+    """轮42:阶段内预算熔断(七审 #2:api._enforce_budget 只是进门费,
+    generate 的 attempt 循环内无复查——默认价下单次 generate 可超支一个
+    数量级(8 镜×3 次 attempt≈$1.44 vs $0.05 上限),下次调用才被 422)。
+    与 _enforce_budget 同源(budget.json + cost_summary);自身异常不阻断
+    生成(入口闸已拦过一轮,熔断是第二道)。"""
+    try:
+        bp = _project_dir(project_id) / "budget.json"
+        if not bp.is_file():
+            return False, ""
+        b = json.loads(bp.read_text(encoding="utf-8"))
+        mx = b.get("max_budget_usd")
+        if mx is None:
+            return False, ""
+        from shipin_platform.services.costing import cost_summary
+        used = float(cost_summary(project_id).get("total_usd") or 0)
+        if used > float(mx):
+            return True, f"已用 ${used:.4f} > 上限 ${float(mx):.4f}"
+    except Exception:
+        return False, ""
+    return False, ""
+
+
+def _clip_input_sha(vid_prompt: str, first_frame: str, last_frame: str,
+                    dur: float) -> str:
+    """轮42:clip 的输入指纹(vid prompt + 首末帧 + 时长)。
+
+    generate 的 clip 缓存捷径旧只看 qc=="ok"——storyboard 改写/变体改
+    风格后 vid prompt 变了但 shot_id 不变,旧 clip 原样复用:新 prompt
+    从未执行,「审查与花钱定稿的输入 ≠ 实际入拼的内容」(七审 #3;轮29
+    的 prompt 侧、轮26 的 TTS 侧同类问题都已修,generate 侧一直漏)。"""
+    import hashlib as _hl_ci
+    payload = f"{str(vid_prompt or '')}\x00{str(first_frame or '')}\x00" \
+              f"{str(last_frame or '')}\x00{float(dur or 0):.2f}"
+    return _hl_ci.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _mtime(p: str) -> float:

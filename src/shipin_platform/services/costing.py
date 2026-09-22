@@ -25,6 +25,11 @@ PRICING_DEFAULTS = {
     "image": {"usd_per_unit": 0.001},
     "video": {"usd_per_sec": 0.02},
     "tts": {"usd_per_unit": 0.0},
+    # 轮42:LLM(文本生成/审片)按次估算入账——此前 text 阶段每阶段最多
+    # 6 轮 ×(生成/修复/审片)的付费调用完全不在账内,预算数字只覆盖媒体
+    # 生成、与真实账单长期对不上(七审 #2)。estimate 可被 providers.json
+    # 的 pricing.llm 覆盖。
+    "llm": {"usd_per_unit": 0.002},
 }
 
 _pricing_cache: Optional[dict] = None

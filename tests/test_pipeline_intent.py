@@ -11,6 +11,8 @@ import json
 import pytest
 
 from shipin_platform.orchestration import pipeline_runner as pr
+from shipin_platform.orchestration.stage_store import ProjectStageStore
+from shipin_platform.services.costing import record_cost
 
 
 class TestCanvasForBrief:
@@ -137,6 +139,107 @@ class TestLlmReviewUnavailable:
         assert "端点 500" in rev["llm"].get("reason", "")
         # 「审不了」不得算过:决策绝不能是 pass/pass_with_warnings
         assert r["decision"] not in ("pass", "pass_with_warnings"), r
+
+
+class TestBudgetFuse:
+    """轮42(七审 #1/#2):预算闸曾是"进门费"——variant/retry 两条车道
+    不查、attempt 循环内不复查、text 阶段 LLM 花费零入账。本轮:入口
+    闸补到两条车道 + 阶段内熔断 + LLM 按次入账。"""
+
+    def _mk_project(self, pid: str, max_budget=None):
+        from shipin_platform.orchestration.stage_store import ProjectStageStore
+        store = ProjectStageStore(":memory:")
+        store.create_project(pid)
+        pr._save(pid, "brief.json", {"product_info": "x", "duration_sec": 12})
+        if max_budget is not None:
+            (pr._project_dir(pid) / "budget.json").write_text(
+                json.dumps({"max_budget_usd": max_budget}), encoding="utf-8")
+        return store
+
+    def test_no_budget_file_never_fuses(self):
+        pid = "bf-none"
+        self._mk_project(pid)
+        over, why = pr._budget_exceeded(pid)
+        assert over is False and why == ""
+
+    def test_under_budget_no_fuse(self):
+        pid = "bf-under"
+        self._mk_project(pid, max_budget=1.0)
+        over, _ = pr._budget_exceeded(pid)
+        assert over is False
+
+    def test_over_budget_fuses_with_reason(self):
+        pid = "bf-over"
+        self._mk_project(pid, max_budget=0.0001)
+        record_cost(pid, "video", model="agnes-video", units=1.0, note="x")
+        over, why = pr._budget_exceeded(pid)
+        assert over is True
+        assert "上限" in why
+
+    def test_llm_calls_are_costed(self, monkeypatch):
+        """七审 #2:text 阶段(生成/修复/审片)的付费 LLM 调用此前零入账,
+        预算数字只覆盖媒体生成、与真实账单长期对不上。"""
+        from shipin_platform.services.costing import cost_summary
+        pid = "bf-llm"
+        self._mk_project(pid)
+        store = ProjectStageStore(":memory:")
+        store.create_project(pid)
+        monkeypatch.setattr(
+            pr, "llm_stage_review",
+            lambda stage, data, brief=None: {
+                "available": True, "scores": {}, "findings": []})
+        pr._iterate("script", self._draft(), pid, store, use_llm=True)
+        summary = cost_summary(pid)
+        assert "llm" in summary.get("by_kind", {}), summary
+        assert summary.get("total_usd", 0) > 0, summary
+
+    @staticmethod
+    def _draft() -> dict:
+        narr = ["深夜街头冷色如冰", "加班后的倦无人说", "推门暖光迎面而来",
+                "手工烘焙的香气", "第一口顺滑融化疲惫", "走向座位缓缓落座",
+                "原来温柔就在这一杯", "享受这一刻好滋味"]
+        return {"duration_sec": 24, "shots": [
+            {"shot_id": f"S{i:02d}", "duration_sec": 3, "shot_size": "中景",
+             "camera": "固定机位", "spatial": "画面中央", "subject": "主角",
+             "scene": "咖啡店", "motion": "端起咖啡杯",
+             "narration": narr[i - 1], "dialogue": ""}
+            for i in range(1, 9)]}
+
+
+class TestClipCacheFingerprint:
+    """轮42(七审 #3):generate 的 clip 缓存捷径旧只看 qc=="ok"——
+    storyboard 改写/变体改风格后 vid prompt 变了但 shot_id 不变,旧
+    clip 原样复用:新 prompt 从未执行,「审查与花钱定稿的输入 ≠ 实际
+    入拼的内容」(轮29 修了 prompt 侧、轮26 修了 TTS 侧,generate 侧
+    一直漏)。输入指纹(prompt+首末帧+时长)不符必须强制重生。"""
+
+    def test_same_inputs_same_fingerprint(self):
+        from shipin_platform.orchestration import pipeline_runner as pr
+        a = pr._clip_input_sha("one take, fixed camera", "/p/S01.jpg",
+                               "/p/S02.jpg", 3.0)
+        b = pr._clip_input_sha("one take, fixed camera", "/p/S01.jpg",
+                               "/p/S02.jpg", 3.0)
+        assert a == b
+
+    def test_changed_prompt_invalidates(self):
+        from shipin_platform.orchestration import pipeline_runner as pr
+        a = pr._clip_input_sha("one take, fixed camera", "/p/S01.jpg",
+                               "/p/S02.jpg", 3.0)
+        b = pr._clip_input_sha("one take, dolly in", "/p/S01.jpg",
+                               "/p/S02.jpg", 3.0)
+        assert a != b, "prompt 变了必须作废旧 clip"
+
+    def test_changed_first_frame_invalidates(self):
+        from shipin_platform.orchestration import pipeline_runner as pr
+        a = pr._clip_input_sha("p", "/p/S01.jpg", "/p/S02.jpg", 3.0)
+        b = pr._clip_input_sha("p", "/p/S01_new.jpg", "/p/S02.jpg", 3.0)
+        assert a != b, "关键帧换了必须作废旧 clip(视频以首帧为条件)"
+
+    def test_changed_duration_invalidates(self):
+        from shipin_platform.orchestration import pipeline_runner as pr
+        a = pr._clip_input_sha("p", "/p/S01.jpg", "/p/S02.jpg", 3.0)
+        b = pr._clip_input_sha("p", "/p/S01.jpg", "/p/S02.jpg", 4.0)
+        assert a != b
 
 
 class TestTtsFailureDetection:

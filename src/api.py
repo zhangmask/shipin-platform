@@ -2104,6 +2104,10 @@ def variant_run(variant_id: str, req: VariantRunRequest):
     """变体重跑:phases=text|generate|assemble|all,阶段间硬门禁在阶段内。"""
     from shipin_platform.variants.variant_runner import (
         VariantError, run_variant_phases)
+    # 轮42:变体重跑入口补预算硬闸——旧代码直接调 run_variant_phases,
+    # 超预算项目经此车道继续烧 image/video/tts(七审 #1:sync/async 主
+    # 车道有 _enforce_budget,variant/retry 两条车道完全失效)
+    _enforce_budget(variant_id, _stage_store())
     try:
         return run_variant_phases(variant_id, _stage_store(),
                                   phases=req.phases, category=req.category)
@@ -2285,6 +2289,11 @@ def task_retry(task_id: str, request: Request):
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")
     _enforce_task_binding(request, task)
+    # 轮42:重投入口补预算硬闸(七审 #1:task_store.retry_task 重放的 fn
+    # 直接跑 run_generate_phase,闸门没挂在 fn 上,重投即绕过;只对
+    # 花钱的 generate/assemble 类任务生效)
+    if str(task.get("kind") or "") in ("generate", "assemble", "all"):
+        _enforce_budget(str(task.get("project_id") or ""), _stage_store())
     retried = ts.retry_task(task_id)
     if retried is None:
         raise HTTPException(
