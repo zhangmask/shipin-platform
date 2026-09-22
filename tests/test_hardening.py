@@ -1082,6 +1082,22 @@ class TestIdentityGate:
         assert r["identity"]["checked"] == 1, r["identity"]
         assert r["identity"]["intra_checked"] == 2
 
+    def test_empty_spec_falls_back_to_critical(self, monkeypatch, tmp_path):
+        """轮35c(五审 #4):VLM 判"不是同一人"但 spec 空(没给不一致点)时,
+        旧逻辑 is_face=False → COSTUME_SWAP warning,而单镜诊断的 warning
+        会被 assemble 的 critical 过滤器丢弃——"换人"在模型措辞不利时
+        静默降级。现在 spec 空向 critical 兜底。"""
+        _vlm_stub(monkeypatch, same_person=False, same_person_spec="")
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "es.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "女主角"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "女主角"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        hits = [f for f in r["findings"]
+                if f["code"] in ("IDENTITY_SWITCH", "COSTUME_SWAP")]
+        assert hits and hits[0]["severity"] == "critical", hits
+
     def test_ta_word_not_person(self, monkeypatch, tmp_path):
         """『其他装饰特写』不能因『他』被当人物镜——表里刻意没有『他』。"""
         _vlm_stub(monkeypatch)
@@ -1691,6 +1707,58 @@ class TestBoundaryBreakGate:
         codes = {f["code"] for f in r["findings"]}
         assert "VLM_BREAK" in codes, r["findings"]
         assert r["boundary_transitions"] == []
+
+    # ── 轮35:margin 按镜长缩放 + 协议违约 fail-closed + spec 空兜底 ──
+
+    def test_mid_shot_break_not_swallowed_by_short_shot_margin(
+            self, monkeypatch, tmp_path):
+        """轮35a(五审 #1 实锤):4s 短镜(bounds=[0,4])中段崩坏标
+        kind=boundary 不再被固定 2.0s 豁免窗吞掉——旧行为任意 t 都
+        |t-b|≤2 → 静默放行;新行为 eff_margin=1.6,中段 1.8s 不再豁免。"""
+        _vlm_stub(monkeypatch, breaks=[
+            {"t": 1.8, "desc": "画面出现条纹状崩坏", "kind": "boundary"}])
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "b7.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 4.0, "subject": "A"},
+            {"shot_id": "S02", "duration_sec": 4.0, "subject": "A"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        codes = {f["code"] for f in r["findings"]}
+        assert "VLM_BREAK" in codes, r["findings"]
+        assert r["boundary_transitions"] == []
+
+    def test_edge_sample_still_exempted_for_short_shot(
+            self, monkeypatch, tmp_path):
+        """轮35a 的另一面:2s 短镜的合法边界采样(t=1.4,含换镜词)仍
+        必须豁免——1.6s 采样覆盖保底不能把正常换镜误报成 critical。"""
+        _vlm_stub(monkeypatch, breaks=[
+            {"t": 1.4, "desc": "从街角场景直接切换到咖啡店门口，跨镜头正常交接"}])
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "b8.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "A"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "A"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        codes = {f["code"] for f in r["findings"]}
+        assert "VLM_BREAK" not in codes, r["findings"]
+        assert len(r["boundary_transitions"]) == 1
+
+    def test_vlm_unparseable_payload_is_protocol_violation(
+            self, monkeypatch, tmp_path):
+        """轮35b(五审 #2):VLM 返回不可解析为 JSON 时旧代码 parsed={}
+        静默放行(该批零 findings)——分镜文本可经注入单方面关闭内容门。
+        现在按「没审到」记 critical。"""
+        from shipin_platform.review import hard_gates
+        monkeypatch.setattr(hard_gates, "_vlm_credentials", lambda: "fake-key")
+        monkeypatch.setattr(hard_gates, "_ask_vlm",
+                            lambda *a, **k: "我无法处理该请求")
+        clip = _make_motion_clip(tmp_path / "proto.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 4.0, "subject": "主角"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        codes = {f["code"] for f in r["findings"]}
+        assert "VLM_PROTOCOL_VIOLATION" in codes, r["findings"]
+        assert r["verdict"] == "fix"
 
 
 class TestKeySanity:

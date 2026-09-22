@@ -693,7 +693,11 @@ def _identity_finding(a_label: str, b_label: str, r: dict, intra: bool,
     轮17:pinned_look(剧本钉了服装/发型式样)时换装也升 critical——
     脚本写死了造型,跨镜换装就是违反剧本,不是风格选择。"""
     spec = str(r.get("spec") or "")
-    is_face = ("脸" in spec or "发" in spec)
+    # 轮35:spec 空(VLM 只说"不是同一人"、没给不一致点)时向 critical
+    # 兜底——旧逻辑 is_face=False → COSTUME_SWAP warning,而单镜诊断的
+    # warning 会被 assemble 的 critical 过滤器直接丢弃,"换人"在模型
+    # 措辞不利时静默降级(五审 #4)。reason 仍写进 message 供人工判。
+    is_face = ("脸" in spec or "发" in spec) or not spec
     is_critical = is_face or (pinned_look and _spec_is_costume(spec))
     where = ("镜头%s 内部(首帧 vs 末帧)" % a_label if intra
              else "镜头%s→镜头%s" % (a_label, b_label))
@@ -890,11 +894,19 @@ def _cleanup_tmp(*dirs) -> None:
 
 
 _BOUNDARY_MARGIN = 2.0  # 采样帧距剪辑瞬间 0.45~1.6s,跨镜对帧最远 ~1.6s
+# 轮35:margin 上限 = max(1.6s 采样覆盖保底, 25%×相邻镜长)。原固定 2.0s
+# 对 ≤4s 短镜覆盖整镜(bounds=[0,4] 时任意 t 都 |t-b|≤2),中段崩坏标
+# kind=boundary 即被静默豁免(五审 #1 实锤:4s 镜 t=1.0~3.9 全 True)。
+# 1.6s 保底来自 VLM 报的是采样秒不是剪辑瞬间(最远 ~1.6s),短镜的合法
+# 边界采样(如 2s 镜 t=1.4)必须仍能豁免;25% 比例把 4s 镜的豁免窗压到
+# 1.6s(中段 1.6~2.4 不再被吞),8s 以上镜保持 2.0s 不变。
+_BOUNDARY_MIN_COVER = 1.6
+_BOUNDARY_MARGIN_SHOT_RATIO = 0.25
 _BOUNDARY_SWITCH_WORDS = ("切换", "换镜", "转场", "镜头交替", "切至",
                           "镜头切换", "跨镜头", "正常交接", "过渡")
 _BOUNDARY_ALARM_WORDS = ("错位", "异常", "疑似", "崩坏", "花屏", "变形",
-                        "漂移", "鬼影", "残影", "撕裂", "闪烁", "闪白",
-                        "闪帧", "雪花", "污染", "缺损", "丢失")
+                         "漂移", "鬼影", "残影", "撕裂", "闪烁", "闪白",
+                         "闪帧", "雪花", "污染", "缺损", "丢失")
 
 
 def _is_boundary_transition(t_b: Optional[float], kind: str, desc: str,
@@ -903,8 +915,10 @@ def _is_boundary_transition(t_b: Optional[float], kind: str, desc: str,
     """VLM 断帧是否其实命中真实镜头边界 → 属正常换镜,不计异常。
 
     三关全过才返回 True:
-      1. t 非空且落在某镜头边界 ±margin 内(VLM 报采样帧秒,
-         不报剪辑瞬间;远离边界的"换镜"不可信);
+      1. t 非空且落在某镜头边界 ±eff_margin 内(VLM 报采样帧秒,
+         不报剪辑瞬间;远离边界的"换镜"不可信)。轮35:eff_margin =
+         min(margin, max(1.6s 采样覆盖保底, 25%×该边界到最近邻边界
+         的距离))——短镜中段不再被固定 2.0s 豁免窗吞掉;
       2. 显式 kind='boundary' → 直接豁免;
       3. kind 缺失/标 intra 时:desc 必须含换镜语义词且不含告警词。
 
@@ -913,13 +927,19 @@ def _is_boundary_transition(t_b: Optional[float], kind: str, desc: str,
     """
     if t_b is None or not bounds:
         return False
-    if not any(abs(t_b - b) <= margin for b in bounds):
-        return False
-    if str(kind).strip() == "boundary":
-        return True
-    if not any(w in desc for w in _BOUNDARY_SWITCH_WORDS):
-        return False
-    return not any(w in desc for w in _BOUNDARY_ALARM_WORDS)
+    for b in bounds:
+        _near = min((abs(x - b) for x in bounds if x != b), default=0.0)
+        _eff = (min(margin, max(_BOUNDARY_MIN_COVER,
+                                _BOUNDARY_MARGIN_SHOT_RATIO * _near))
+                if _near > 0 else margin)
+        if abs(t_b - b) > _eff:
+            continue
+        if str(kind).strip() == "boundary":
+            return True
+        if not any(w in desc for w in _BOUNDARY_SWITCH_WORDS):
+            continue
+        return not any(w in desc for w in _BOUNDARY_ALARM_WORDS)
+    return False
 
 
 def _context_frames(video_dur: float, shots: list[dict], frames_count: int) -> list[tuple[float, int]]:
@@ -1212,6 +1232,17 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
             parsed = json.loads(m.group(0)) if m else {}
         except (json.JSONDecodeError, AttributeError):
             parsed = {}
+        # 轮35:协议违约 fail-closed——返回不可解析为 JSON(注入把模型带偏/
+        # 模型不守「返回严格 JSON」)时,旧代码 parsed={} 静默放行:该批零
+        # findings 零报错,分镜文本可经此单方面关闭内容门(五审 #2)。
+        # 与 COVERAGE_GAP 同规格:没审到 = critical,不许读作"审过了"。
+        if not parsed:
+            det_findings.append({
+                "severity": "critical", "code": "VLM_PROTOCOL_VIOLATION",
+                "message": (f"终审 VLM 第 {i // 3 + 1} 批"
+                            f"(t={batch[0]['t']}~{batch[-1]['t']}s)返回不可"
+                            f"解析为 JSON——该批帧未审,按未审拦截")})
+            continue
         for b in (parsed.get("breaks") or []):
             if isinstance(b, str):
                 if b not in breaks:
@@ -1417,6 +1448,21 @@ def vlm_review_shot(clip_path: str, shot: dict, frames_count: int = 4,
         except Exception as e:
             batch_results.append({"batch": i // 3, "error":
                                   f"{type(e).__name__}: {e}"[:160]})
+            # 轮35:请求异常(重试后仍失败)同样是「该批未审」——记 critical
+            # 而非静默 continue,没审到不许读作审过了
+            findings.append({
+                "severity": "critical", "code": "VLM_PROTOCOL_VIOLATION",
+                "message": (f"镜头{sid} 单镜诊断第 {i // 3 + 1} 批 VLM 请求"
+                            f"失败({type(e).__name__})——该批帧未审,按未审"
+                            f"拦截")})
+            continue
+        # 轮35:协议违约 fail-closed——返回不可解析为 JSON 时旧代码
+        # parsed={} 静默放行(分镜文本可经注入单方面关闭内容门)
+        if not parsed:
+            findings.append({
+                "severity": "critical", "code": "VLM_PROTOCOL_VIOLATION",
+                "message": (f"镜头{sid} 单镜诊断第 {i // 3 + 1} 批返回不可解析"
+                            f"为 JSON——该批帧未审,按未审拦截")})
             continue
         batch_results.append({"batch": i // 3, "t": [f["t"] for f in batch]})
         for b in (parsed.get("breaks") or []):
