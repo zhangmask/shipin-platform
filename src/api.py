@@ -655,6 +655,10 @@ class FinalVideoReviewRequest(BaseModel):
     # 项目上下文：product_info/brand_name/duration_sec/shots[{shot_id,duration_sec,subject}]
     # 传入后终验按分镜表抽帧 + 确定性镜内切检查；不传则退化为中性通用检查
     context: dict = {}
+    # 轮30:可选 project_id——手工/agent 链路(stitch→burn/mux→终验→finalize)
+    # 的终审凭证出口。传入且 verdict=pass 时把结论落盘 final_review.json,
+    # finalize 的终审闸(轮25)才认;fix/blocked 不落盘,闸的严格性不变。
+    project_id: str = ""
 
 
 class EncodeRequest(BaseModel):
@@ -898,8 +902,28 @@ def review_final_video(req: FinalVideoReviewRequest):
     按 project context 的分镜表抽帧）。Returns blocked (no AGNES_KEY),
     pass, or fix-with-findings."""
     from shipin_platform.review.hard_gates import vlm_review_final
-    return vlm_review_final(req.video_path, frames_count=req.frames,
+    _res = vlm_review_final(req.video_path, frames_count=req.frames,
                             context=req.context or None)
+    # 轮30:手工/agent 链路的终审凭证出口。该链路(平台 stitch 端点的
+    # next_action 文档化:burn/mux/normalize → 本端点 → finalize)此前
+    # 没有任何地方落盘 final_review.json,而 finalize 终审闸(轮25)只认
+    # assemble 写的这个文件 → 整条手工链路被 409 NOT_REVIEWED 死锁。
+    # verdict=pass 才落盘(pass 才是发布凭证);fix/blocked 不落盘。
+    if req.project_id and str(_res.get("verdict") or "") == "pass":
+        try:
+            _d = _project_dir(req.project_id) / "final_review.json"
+            _d.parent.mkdir(parents=True, exist_ok=True)
+            _d.write_text(_json.dumps(_res, ensure_ascii=False, indent=1),
+                          encoding="utf-8")
+            try:
+                _stage_store().record_event(
+                    req.project_id, "final_review_passed",
+                    "终验通过(手工链路凭证)", detail=str(_d))
+            except Exception:
+                pass
+        except OSError:
+            pass  # 落盘失败不改变终验结论本身
+    return _res
 
 
 # ── AI Agent Self-Discovery + Intake ─────────────────────────────

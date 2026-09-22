@@ -139,6 +139,37 @@ class TestLlmReviewUnavailable:
         assert r["decision"] not in ("pass", "pass_with_warnings"), r
 
 
+class TestTtsFailureDetection:
+    """轮31:合成失败必须显式失败(新审计 #2:轮26 指纹机制在失败路径上
+    被绕过——synthesize 静默失败 → _tts_of 按 mtime 取旧音频 → 新指纹
+    盖上去 → 该镜永远"新鲜",无限复用旧口播,align 按错音频算窗口)。"""
+
+    def test_failed_segments_detected(self):
+        from shipin_platform.orchestration import pipeline_runner as pr
+
+        class _Seg:
+            def __init__(self, sid, err="", out=""):
+                self.shot_id = sid
+                self.error = err
+                self.output_path = out
+
+        segs = [_Seg("S01", out="a.mp3"), _Seg("S02", err="edge-tts 502"),
+                _Seg("S03", out="")]
+        failed = pr._tts_failures(segs)
+        assert [s.shot_id for s in failed] == ["S02", "S03"]
+
+    def test_all_ok_no_failures(self):
+        from shipin_platform.orchestration import pipeline_runner as pr
+
+        class _Seg:
+            def __init__(self, sid):
+                self.shot_id = sid
+                self.error = ""
+                self.output_path = f"{sid}.mp3"
+
+        assert pr._tts_failures([_Seg("S01"), _Seg("S02")]) == []
+
+
 class TestPromptStageCache:
     """轮29:prompt 阶段 PASS 缓存必须过内容哈希。
 

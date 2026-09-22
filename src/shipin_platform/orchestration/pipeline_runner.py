@@ -978,9 +978,20 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
             else:
                 segs.append(tts.build_segment(s["shot_id"], s["narration"],
                                               role_code="biz_female"))
-        tts.synthesize_segments_sync(segs)
+        _synth = tts.synthesize_segments_sync(segs)
         record_cost(project_id, "tts", model="tts-v1",
                     units=float(len(segs)), note="旁白+台词")
+        # 轮31:合成失败必须显式失败——synthesize 的失败是静默的(段上挂
+        # error/output_path 空),旧代码丢弃返回值:_tts_of 按 mtime 取到
+        # 上一轮的旧音频,随后新文本指纹盖上去 → 该镜从此对指纹永远"新鲜",
+        # 无限复用旧口播(旧词配新字幕,正是轮26 要消灭的声画不一致),
+        # 且 align 按错音频算窗口、全链路无门能发现。
+        _failed = _tts_failures(_synth)
+        if _failed:
+            return {"ok": False, "phase": "generate",
+                    "reason": ("TTS 合成失败(旧音频已作废,拒绝盖新指纹): "
+                               + "; ".join(f"{s.shot_id}:{str(s.error)[:60]}"
+                                           for s in _failed[:3]))}
     for s in shots:
         p = _tts_of(s["shot_id"])
         if not p:
@@ -1041,6 +1052,18 @@ def _tts_text_sha(s: dict) -> str:
              else str(dlg or ""))
     payload = f"{str(s.get('narration') or '')}\x00{dtext}"
     return _hl3.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _tts_failures(segments) -> list:
+    """轮31:合成失败段——error 非空或 output_path 为空。
+
+    synthesize_segments_sync 的失败是静默的(asyncio.gather 吞异常挂到
+    段上),旧调用方丢弃返回值:_tts_of 随后按 mtime 取到上一轮的旧音频,
+    新文本指纹盖上去 → 该镜从此对指纹永远「新鲜」,无限复用旧口播
+    (旧词配新字幕,正是轮26 要消灭的声画不一致),align 还按错音频算
+    窗口,全链路无门能发现。失败段必须让 generate 显式失败。"""
+    return [s for s in (segments or [])
+            if getattr(s, "error", "") or not getattr(s, "output_path", "")]
 
 
 def _prompt_stage_stale(row, data: dict) -> bool:

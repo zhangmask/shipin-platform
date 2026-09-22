@@ -342,6 +342,56 @@ class TestApiGates:
         assert row["artifact_hash"].startswith("a") or len(
             row["artifact_hash"]) == 64
 
+    # ── 轮30:手工/agent 链路的终审凭证出口 ──────────────────────────
+    # 回归:平台 stitch 端点的 next_action 文档化手工链路
+    # (burn/mux/normalize → /api/review/final-video → finalize),但该
+    # 端点此前没有 project_id、不落盘 final_review.json,而 finalize
+    # 终审闸(轮25)只认 assemble 写的这个文件 → 整条手工链路被 409
+    # NOT_REVIEWED 死锁(修 finalize 门时引入的回归)。
+
+    def _stub_final_review(self, monkeypatch, verdict: str):
+        from shipin_platform.review import hard_gates
+        monkeypatch.setattr(
+            hard_gates, "vlm_review_final",
+            lambda *a, **k: {"verdict": verdict,
+                             "reason": f"终验{verdict}",
+                             "findings": [{"severity": "critical",
+                                           "code": "VLM_BREAK",
+                                           "message": "x"}]})
+
+    def test_final_video_endpoint_pass_unlocks_finalize(self, client,
+                                                        monkeypatch):
+        """pass 落盘 final_review.json → 手工链路 finalize 放行。"""
+        pid = "manual-pass"
+        client.post("/api/project/create", json={"project_id": pid})
+        self._pass_all_stages(pid)
+        self._stub_final_review(monkeypatch, "pass")
+        r = client.post("/api/review/final-video",
+                        json={"video_path": str(api._project_dir(pid)),
+                              "project_id": pid})
+        assert r.status_code == 200 and r.json()["verdict"] == "pass"
+        fr = api._project_dir(pid) / "final_review.json"
+        assert fr.is_file(), "pass 必须落盘终审凭证"
+        rz = client.post(f"/api/project/{pid}/finalize")
+        assert rz.status_code == 200, rz.json()
+
+    def test_final_video_endpoint_fix_still_blocks(self, client,
+                                                   monkeypatch):
+        """fix 不落盘 → finalize 仍拦(闸的严格性不变)。"""
+        pid = "manual-fix"
+        client.post("/api/project/create", json={"project_id": pid})
+        self._pass_all_stages(pid)
+        self._stub_final_review(monkeypatch, "fix")
+        r = client.post("/api/review/final-video",
+                        json={"video_path": str(api._project_dir(pid)),
+                              "project_id": pid})
+        assert r.status_code == 200 and r.json()["verdict"] == "fix"
+        fr = api._project_dir(pid) / "final_review.json"
+        if fr.exists():
+            fr.unlink()  # 清掉可能的历史残留再断言
+        rz = client.post(f"/api/project/{pid}/finalize")
+        assert rz.status_code == 409
+
     def test_iterate_rejects_stale_upstream(self, client):
         client.post("/api/project/create", json={"project_id": "p2"})
         # brief 存在但 BLOCKED → script 迭代必须被拒
