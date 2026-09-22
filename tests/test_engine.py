@@ -461,6 +461,30 @@ class TestAbstractQualityGates:
         assert any("主观词'震撼'" in f.issue for f in report.findings), \
             [f.issue for f in report.findings]
 
+    # ── 轮40:词根长序修复 + manual 桶去重(六审 #5) ──────────────────
+    # (词根检查走剧本阶段旁白;image_prompt 侧另有英文表+E1 映射)
+
+    def test_overlapping_roots_no_dangling_residue(self):
+        """轮40:重叠词根(惊艳/口感惊艳)必须长词根先删——旧顺序先删短的
+        「惊艳」,「口感惊艳」再也匹配不上,留下「这杯酸奶的口感，」这种
+        悬空残词。"""
+        script = _mk_script(["这杯酸奶的口感惊艳，回味无穷"])
+        report = ReviewEngine().run_review("script", script)
+        result = RevisionEngine().fix("script", script, report)
+        narr = result["data"]["shots"][0]["narration"]
+        assert "口感" not in narr, narr
+        assert "惊艳" not in narr and "回味无穷" not in narr, narr
+
+    def test_same_mode_not_duplicated_into_manual(self):
+        """轮40:同 mode 多条 finding(一段多个主观词根)只修一次——旧逻辑
+        第一条修成功(applied),后续 no-op 又落 manual,而 manual_modes 是
+        对外合约(每项要求 LLM 重生):已修好又被要求重写,白烧一轮迭代。"""
+        script = _mk_script(["epic and stunning and breathtaking 的一杯"])
+        report = ReviewEngine().run_review("script", script)
+        result = RevisionEngine().fix("script", script, report)
+        assert "SUBJECTIVE_WORD" in result["applied"]
+        assert "SUBJECTIVE_WORD" not in result["manual"], result
+
     def test_script_clean_no_narration_duplicate(self):
         report = ReviewEngine().run_review("script", _mk_script([NARR1, NARR2]))
         assert not any(f.failure_mode == "NARRATION_DUPLICATED" for f in report.findings)

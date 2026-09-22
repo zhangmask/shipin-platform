@@ -148,12 +148,93 @@ class TestFinalReviewContext:
         assert sum(v for k, v in cov.items()
                    if k.startswith("尾部")) >= 2, cov
 
+    def test_tail_coverage_does_not_force_thin(self, monkeypatch, tmp_path):
+        """轮40(六审 CRITICAL 回归):轮38 曾给每个尾段帧唯一 tag
+        「尾部+X.XXs」→ 每条 cnt 恒 1 → COVERAGE_THIN 必触 → 凡有尾段
+        (>0.5s)的成片终审恒 fix 无法交付。现在固定 tag + 按计划帧判定:
+        尾段足额采样时不得出 COVERAGE_THIN。"""
+        _vlm_stub(monkeypatch)
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "tail2.mp4", 6.8)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "主角"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "主角"},
+            {"shot_id": "S03", "duration_sec": 2.0, "subject": "主角"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=8,
+                                        context=ctx)
+        codes = {f["code"] for f in r["findings"]}
+        assert "COVERAGE_THIN" not in codes, r["findings"]
+        assert "COVERAGE_GAP" not in codes, r["findings"]
+        assert r["shot_coverage"].get("尾部", 0) >= 1
+
+    def test_tail_frame_break_not_exempted(self, monkeypatch, tmp_path):
+        """轮40(六审 #2):尾段帧(超出 Σ)的 break 即使标 kind=boundary
+        也不豁免——Σ 右侧没有镜,无所谓"采样偏移";旧实现末镜起点边界
+        拿左邻镜长定尺,短末镜+尾段一起被 2.0s 窗吞掉。"""
+        _vlm_stub(monkeypatch, breaks=[
+            {"t": 18.5, "desc": "尾段画面出现条纹崩坏", "kind": "boundary"}])
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "tb.mp4", 6.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 4.0, "subject": "A"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "A"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        codes = {f["code"] for f in r["findings"]}
+        assert "VLM_BREAK" in codes, r["findings"]
+        assert r["boundary_transitions"] == []
+
+    def test_vlm_request_exception_is_protocol_violation(self, monkeypatch,
+                                                         tmp_path):
+        """轮40(六审 #3):_ask_vlm 重试后仍抛异常(端点宕机)时,旧代码
+        无 try → RuntimeError 逃出终审变 500;与"返回垃圾"给两种默认值
+        (垃圾=拦截/宕机=崩溃)。现在同记 VLM_PROTOCOL_VIOLATION critical。"""
+        from shipin_platform.review import hard_gates
+        monkeypatch.setattr(hard_gates, "_vlm_credentials", lambda: "fake-key")
+
+        def _boom(*a, **k):
+            raise RuntimeError("endpoint down after retries")
+
+        monkeypatch.setattr(hard_gates, "_ask_vlm", _boom)
+        clip = _make_motion_clip(tmp_path / "down.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 4.0, "subject": "主角"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        codes = {f["code"] for f in r["findings"]}
+        assert "VLM_PROTOCOL_VIOLATION" in codes, r["findings"]
+        assert r["verdict"] == "fix"
+
+    def test_spec_field_drift_tolerated(self, monkeypatch, tmp_path):
+        """轮40(六审 #4):模型把 spec 字段改名成 difference/points 时,
+        旧代码 spec="" → 轮35c 的"空→critical"误杀正常片。现在取首个
+        非空别名字段。"""
+        import json as _json_d
+        from shipin_platform.review import hard_gates
+        monkeypatch.setattr(hard_gates, "_vlm_credentials", lambda: "fake-key")
+        monkeypatch.setattr(
+            hard_gates, "_ask_vlm",
+            lambda *a, **k: _json_d.dumps(
+                {"same": False, "difference": "服装颜色不同"},
+                ensure_ascii=False))
+        clip = _make_motion_clip(tmp_path / "drift.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "女主角"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "女主角"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
+        hits = [f for f in r["findings"]
+                if f["code"] in ("IDENTITY_SWITCH", "COSTUME_SWAP")]
+        assert hits and hits[0]["severity"] == "warning", hits
+        assert "服装" in hits[0]["message"]
+
     def test_shot_boundaries_and_frames(self):
         """_context_frames: 每镜全覆盖采样——不丢镜头、帧落在镜内、含中段。"""
         from shipin_platform.review.hard_gates import (_shot_boundaries,
                                                        _context_frames)
         shots = [{"duration_sec": 5}, {"duration_sec": 5}, {"duration_sec": 3}]
         assert _shot_boundaries(shots) == [0.0, 5.0, 10.0]
+        # 轮40:with_total=True 追加 Σ(片尾锚点)——供末镜右侧豁免窗定尺;
+        # 默认 False 保持旧语义(确定性滤波的"临近边界=合法转场"不认 Σ,
+        # 否则临近片尾的闪帧/黑屏会被当合法过渡放行)
+        assert _shot_boundaries(shots, with_total=True) == [0.0, 5.0, 10.0, 13.0]
         frames = _context_frames(13.0, shots, 12)
         # 返回 [(t, shot_idx)...], t 不越界,帧数不超预算
         assert all(0 <= t <= 13.0 for t, _ in frames)

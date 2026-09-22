@@ -394,14 +394,17 @@ class RevisionEngine:
 
     # E1: subjective word → visual description ("" = just remove)
     # 轮39: richer entries first(视觉化改写),词根并集殿后(删除)——与检查
-    # 侧 _SUBJECTIVE_ROOTS 同源,不脱节。
+    # 侧 _SUBJECTIVE_ROOTS 同源,不脱节。轮40:词根按长度降序——重叠词根
+    # (惊艳/口感惊艳)必须先删长词根,否则先删短的「惊艳」会让「口感惊艳」
+    # 再也匹配不上,留下「这杯酸奶的口感，」这种悬空残词(六审 #5)。
     SUBJECTIVE_REPLACEMENTS = {
         "confident smile": "lips curved upward, eyes slightly narrowed",
         "sad": "head slightly lowered, shoulders relaxed downward",
         "happy": "lips curved upward, eyes wide and bright",
         "dramatic": "high contrast lighting, deep shadows on one side",
         "warm atmosphere": "golden hour light casting amber tones",
-        **{root: "" for root in _SUBJECTIVE_ROOTS},
+        **{root: "" for root in sorted(_SUBJECTIVE_ROOTS,
+                                       key=len, reverse=True)},
     }
 
     def fix(self, stage: str, data: dict, report: ReviewReport) -> dict:
@@ -419,6 +422,13 @@ class RevisionEngine:
 
         for finding in report.findings:
             mode = finding.failure_mode
+            # 轮40:同 mode 已机械修好 → 后续 finding 直接跳过。旧逻辑对
+            # 同 mode 的每条 finding 都重跑修复器:第一条修成功(applied),
+            # 后续已是 no-op(ok=False)又落 manual——manual_modes 是对外
+            # 合约(每一项要求 LLM 重生),"已修好又被要求重写"白烧一轮
+            # 迭代且有改写回归风险(六审 #5:同段三个主观词根即触发)。
+            if mode in applied:
+                continue
             ok = False
             try:
                 if mode == "STYLE_ANCHOR_MISSING":

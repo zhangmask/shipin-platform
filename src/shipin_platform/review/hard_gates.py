@@ -559,8 +559,13 @@ def _same_person(imgs: list, key: str) -> dict:
         if "same" not in parsed:
             return {"available": False, "same": None,
                     "reason": "VLM 未返回 same 字段(载荷不匹配),跳过本次判定"}
+        # 轮40:字段漂移容忍——模型偶尔用 difference/points 代替 spec
+        # (六审 #4:纯命名漂移会让轮35c 的"spec 空→critical"误杀正常片);
+        # 取首个非空字段,整句缺失仍走 available=False 的 skip 通道。
+        _spec = (parsed.get("spec") or parsed.get("difference")
+                 or parsed.get("points") or "")
         return {"available": True, "same": bool(parsed.get("same")),
-                "spec": str(parsed.get("spec", ""))[:80],
+                "spec": str(_spec)[:80],
                 "reason": str(parsed.get("reason", ""))[:200]}
     except Exception as e:
         return {"available": False, "same": None,
@@ -864,12 +869,21 @@ def _batch_prompt(times: str, n: int, context: Optional[dict] = None,
     return "\n".join(lines)
 
 
-def _shot_boundaries(shots: list[dict]) -> list[float]:
-    """Cumulative start times of the storyboard shots (seconds)."""
+def _shot_boundaries(shots: list[dict], with_total: bool = False) -> list[float]:
+    """Cumulative start times of the storyboard shots (seconds).
+
+    with_total=True 时末尾追加 Σ(末镜结束时刻)——轮40:它是"片尾边界
+    锚点",让末镜起点边界的右侧豁免窗按末镜时长定尺(短末镜不再被左邻
+    长镜的窗口吞掉,六审 #2),尾段帧也能相对 Σ 判定不在豁免窗内。
+    默认 False:确定性滤波(内部切/瞬变/黑帧的"临近边界=合法转场"语义)
+    要保持旧行为——Σ 不是画面里的真实剪辑点(尤其是还有尾段时),把
+    临近片尾的闪帧/黑屏当合法过渡会放行真缺陷。"""
     bounds, t = [], 0.0
     for s in shots:
         bounds.append(round(t, 2))
         t += float(s.get("duration_sec") or 0)
+    if with_total and bounds:
+        bounds.append(round(t, 2))
     return bounds
 
 
@@ -894,14 +908,14 @@ def _cleanup_tmp(*dirs) -> None:
 
 
 _BOUNDARY_MARGIN = 2.0  # 采样帧距剪辑瞬间 0.45~1.6s,跨镜对帧最远 ~1.6s
-# 轮35:margin 上限 = max(1.6s 采样覆盖保底, 25%×相邻镜长)。原固定 2.0s
-# 对 ≤4s 短镜覆盖整镜(bounds=[0,4] 时任意 t 都 |t-b|≤2),中段崩坏标
-# kind=boundary 即被静默豁免(五审 #1 实锤:4s 镜 t=1.0~3.9 全 True)。
-# 1.6s 保底来自 VLM 报的是采样秒不是剪辑瞬间(最远 ~1.6s),短镜的合法
-# 边界采样(如 2s 镜 t=1.4)必须仍能豁免;25% 比例把 4s 镜的豁免窗压到
-# 1.6s(中段 1.6~2.4 不再被吞),8s 以上镜保持 2.0s 不变。
+# 轮35/40:单侧豁免窗 = min(margin, 1.6s 采样覆盖保底, 该侧相邻镜长)。
+# 原固定 2.0s 对 ≤4s 短镜覆盖整镜(bounds=[0,4] 时任意 t 都 |t-b|≤2),
+# 中段崩坏标 kind=boundary 即被静默豁免(五审 #1 实锤:4s 镜 t=1.0~3.9
+# 全 True)。1.6s 保底来自 VLM 报的是采样秒不是剪辑瞬间(最远 ~1.6s),
+# 短镜的合法边界采样(如 2s 镜 t=1.4)必须仍能豁免;按"该侧镜长"封顶后
+# 4s 镜单侧窗 1.6s(中段 1.6~2.4 不再被吞),末镜右侧由 Σ 锚点按末镜
+# 时长定尺(六审 #2:短末镜不再被左邻长镜的窗口吞掉)。
 _BOUNDARY_MIN_COVER = 1.6
-_BOUNDARY_MARGIN_SHOT_RATIO = 0.25
 _BOUNDARY_SWITCH_WORDS = ("切换", "换镜", "转场", "镜头交替", "切至",
                           "镜头切换", "跨镜头", "正常交接", "过渡")
 _BOUNDARY_ALARM_WORDS = ("错位", "异常", "疑似", "崩坏", "花屏", "变形",
@@ -915,10 +929,11 @@ def _is_boundary_transition(t_b: Optional[float], kind: str, desc: str,
     """VLM 断帧是否其实命中真实镜头边界 → 属正常换镜,不计异常。
 
     三关全过才返回 True:
-      1. t 非空且落在某镜头边界 ±eff_margin 内(VLM 报采样帧秒,
-         不报剪辑瞬间;远离边界的"换镜"不可信)。轮35:eff_margin =
-         min(margin, max(1.6s 采样覆盖保底, 25%×该边界到最近邻边界
-         的距离))——短镜中段不再被固定 2.0s 豁免窗吞掉;
+      1. t 非空且落在某镜头边界的**单侧豁免窗**内。轮40:每个边界按左右
+         两侧分别定尺——eff_side = min(margin, 1.6s 采样覆盖保底,
+         该侧相邻镜长)。旧代码对每个边界只算一个"到最近邻边界的距离",
+         末镜起点边界拿左邻镜长定尺:短末镜+长前镜时整个短末镜被
+         2.0s 窗吞掉(六审 #2 实锤)。Σ 入 bounds 后末镜右侧也有锚点;
       2. 显式 kind='boundary' → 直接豁免;
       3. kind 缺失/标 intra 时:desc 必须含换镜语义词且不含告警词。
 
@@ -927,12 +942,15 @@ def _is_boundary_transition(t_b: Optional[float], kind: str, desc: str,
     """
     if t_b is None or not bounds:
         return False
-    for b in bounds:
-        _near = min((abs(x - b) for x in bounds if x != b), default=0.0)
-        _eff = (min(margin, max(_BOUNDARY_MIN_COVER,
-                                _BOUNDARY_MARGIN_SHOT_RATIO * _near))
-                if _near > 0 else margin)
-        if abs(t_b - b) > _eff:
+    for idx, b in enumerate(bounds):
+        # 两端的外侧距离为 0:片头之前/片尾(Σ)之后没有镜,谈不上"采样
+        # 偏移"——Σ 的右侧窗口必须是 0,否则尾段帧会被 1.6s 右窗吞掉
+        # (六审 #2:尾帧 kind=boundary 被静默豁免的残留路径)。
+        d_left = (b - bounds[idx - 1]) if idx > 0 else 0.0
+        d_right = (bounds[idx + 1] - b) if idx + 1 < len(bounds) else 0.0
+        eff_l = min(margin, _BOUNDARY_MIN_COVER, d_left)
+        eff_r = min(margin, _BOUNDARY_MIN_COVER, d_right)
+        if not (b - eff_l <= t_b <= b + eff_r):
             continue
         if str(kind).strip() == "boundary":
             return True
@@ -1200,8 +1218,9 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
                     ["ffmpeg", "-v", "error", "-ss", f"{t}", "-i", str(video),
                      "-frames:v", "1", "-vf", "scale=960:-2", "-y", str(p)],
                     capture_output=True, text=True)
-                # 轮38:shot_idx=None = 尾段帧(无分镜归属)
-                tag = (f"尾部+{t:.2f}s" if shot_idx is None
+                # 轮40:shot_idx=None = 尾段帧(无分镜归属);固定 tag「尾部」
+                # (轮38 的每帧唯一 tag 会让覆盖计数恒 1 → THIN 必触)
+                tag = ("尾部" if shot_idx is None
                        else f"镜头{shots[shot_idx].get('shot_id', shot_idx + 1)}")
                 if p.exists() and p.stat().st_size > 1000:
                     frames.append({"t": round(t, 2), "path": str(p),
@@ -1225,27 +1244,32 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
     # 每个镜头都有计划帧;实际进入 VLM 的帧数按镜头统计,0 帧镜头必须暴露。
     shot_coverage: dict[str, int] = {}
     coverage_gaps: list[dict] = []
+    _planned: dict[str, int] = {}  # 轮40:每 tag 的计划帧数(THIN 按计划判)
     if times:
         for _, shot_idx in times:
-            if shot_idx is None:
-                continue  # 轮38:尾段帧无分镜归属,按 frames 里的「尾部
-                         # +X.XXs」tag 直接计数,不进 seed
-            tag = f"镜头{shots[shot_idx].get('shot_id', shot_idx + 1)}"
-            shot_coverage[tag] = shot_coverage.get(tag, 0)
+            # 轮40:尾段帧用固定 tag「尾部」——轮38 曾用「尾部+X.XXs」每帧
+            # 唯一 → 每条 cnt 恒 1 → COVERAGE_THIN 必触 → 凡有尾段的成片
+            # 终审恒 fix 无法交付(六审实证)。固定 tag + 按计划帧数判定。
+            tag = ("尾部" if shot_idx is None
+                   else f"镜头{shots[shot_idx].get('shot_id', shot_idx + 1)}")
+            _planned[tag] = _planned.get(tag, 0) + 1
+            shot_coverage.setdefault(tag, 0)
         for f in frames:
             if "shot" in f:
                 shot_coverage[f["shot"]] = shot_coverage.get(f["shot"], 0) + 1
-        for tag, cnt in sorted(shot_coverage.items()):
+        for tag, planned_n in sorted(_planned.items()):
+            cnt = shot_coverage.get(tag, 0)
             if cnt == 0:
                 coverage_gaps.append({"shot": tag, "frames": cnt})
                 det_findings.append({
                     "severity": "critical", "code": "COVERAGE_GAP",
-                    "message": f"镜头 {tag} 没有任何帧进入 VLM 审查——该镜头未审,禁止放行"})
-            elif cnt < 2:
+                    "message": f"{tag} 没有任何帧进入 VLM 审查——该区域未审,禁止放行"})
+            elif cnt < planned_n:
                 coverage_gaps.append({"shot": tag, "frames": cnt})
                 det_findings.append({
                     "severity": "warning", "code": "COVERAGE_THIN",
-                    "message": f"镜头 {tag} 仅 {cnt} 帧进入 VLM 审查(计划不足/抽帧失败)"})
+                    "message": (f"{tag} 仅 {cnt}/{planned_n} 帧进入 VLM 审查"
+                                f"(抽帧失败)——未审部分按未见处理")})
         if dropped_frames:
             det_findings.append({
                 "severity": "warning", "code": "FRAMES_DROPPED",
@@ -1259,7 +1283,9 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
     # 的断帧,只有落在真实镜头边界 ±_BOUNDARY_MARGIN 内才豁免(coffee-v7 实跑:
     # 正当转场被误报成 critical 的 5 条即此类);t 远离所有边界或 desc 含告警词
     # (错位/疑似/异常…) → 仍按 critical 处理。
-    bounds = _shot_boundaries(shots) if shots else []
+    # 轮40:with_total=True——豁免窗需要 Σ 锚点(末镜右侧按末镜时长定尺、
+    # 尾段帧不被右窗吞);确定性滤波仍用无 Σ 的起点集(Σ 非画面真实剪辑点)
+    bounds = _shot_boundaries(shots, with_total=True) if shots else []
     brand_seen = False
     anomalies: list[dict] = []
     shot_issues: list[dict] = []
@@ -1271,9 +1297,26 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
         batch = (frames[0:4] if i == 0
                  else frames[max(0, i - 1): i + 4][:4])
         times_str = ", ".join(f"{f['t']}" for f in batch)
-        resp = _ask_vlm(_frames_payload(batch),
-                        _batch_prompt(times_str, len(batch), ctx, batch), key)
-        batch_results.append({"t_range": f"{batch[0]['t']}~{batch[-1]['t']}", "vlm": resp})
+        # 轮40:请求异常(3 次重试后仍失败:端点宕机/超时)必须走与单镜
+        # 路径一致的 critical 处理器——旧代码此处无 try,_ask_vlm 的
+        # RuntimeError 直接逃出终审变 500/任务失败,"连不上"与"返回垃圾"
+        # 给出两种默认值(垃圾=拦截,宕机=崩溃),而身份通道对同一故障还
+        # 静默 skip(六审 #3)。
+        try:
+            resp = _ask_vlm(_frames_payload(batch),
+                            _batch_prompt(times_str, len(batch), ctx, batch),
+                            key)
+            batch_results.append({"t_range": f"{batch[0]['t']}~{batch[-1]['t']}",
+                                  "vlm": resp})
+        except Exception as e:
+            batch_results.append({"batch": i // 3,
+                                  "error": f"{type(e).__name__}: {e}"[:160]})
+            det_findings.append({
+                "severity": "critical", "code": "VLM_PROTOCOL_VIOLATION",
+                "message": (f"终审 VLM 第 {i // 3 + 1} 批"
+                            f"(t={batch[0]['t']}~{batch[-1]['t']}s)请求失败"
+                            f"({type(e).__name__})——该批帧未审,按未审拦截")})
+            continue
         try:
             m = re.search(r"\{.*\}", resp, re.S)
             parsed = json.loads(m.group(0)) if m else {}
