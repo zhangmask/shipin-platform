@@ -438,6 +438,41 @@ class TestAbstractQualityGates:
         report = ReviewEngine().run_review("storyboard", sb)
         assert any(f.failure_mode == "NARRATION_DUPLICATED" for f in report.findings)
 
+    # ── 轮36:机位比对索引错位 + 标点逃逸的重复旁白(五审 #6c/#6d) ──
+
+    def test_storyboard_camera_finding_attributes_real_shot(self):
+        """轮36a:中间镜无 camera 字段时,雷同 finding 必须挂在真正持有
+        该机位的镜上——旧代码用压缩缓存下标索引原 shots,camera=
+        [static,'',static] 会把 finding 挂到没有 camera 字段的 S02,
+        修订计划让 LLM 改不存在的字段(诱发 STALL)。"""
+        sb = _mk_storyboard(["static", "", "static"],
+                            [NARR1, NARR2, "蒸汽在指缝间缠绕"])
+        report = ReviewEngine().run_review("storyboard", sb)
+        cams = [f for f in report.findings
+                if f.failure_mode == "CAMERA_SAME_ADJACENT"]
+        assert cams, [f.failure_mode for f in report.findings]
+        assert "S01" in cams[0].evidence and "S03" in cams[0].evidence, \
+            cams[0].evidence
+
+    def test_storyboard_camera_gap_does_not_false_pair(self):
+        """轮36a:空 camera 的镜不得参与相邻比对——[dolly in,'',static]
+        本无机位雷同,旧代码会拿缓存下标错位比较(可能误报)。"""
+        sb = _mk_storyboard(["dolly in", "", "static"],
+                            [NARR1, NARR2, "蒸汽在指缝间缠绕"])
+        report = ReviewEngine().run_review("storyboard", sb)
+        assert not any(f.failure_mode == "CAMERA_SAME_ADJACENT"
+                       for f in report.findings)
+
+    def test_storyboard_narration_dup_survives_punctuation(self):
+        """轮36b:标点差异不构成逃逸——「每一杯都是匠心」vs「每一杯，
+        都是匠心」归一化(空白+标点剥离)后同键,必须报重复。"""
+        sb = _mk_storyboard(["dolly in", "truck right"],
+                            ["每一杯都是匠心", "每一杯，都是匠心"])
+        report = ReviewEngine().run_review("storyboard", sb)
+        assert any(f.failure_mode == "NARRATION_DUPLICATED"
+                   for f in report.findings), \
+            [f.failure_mode for f in report.findings]
+
     def test_storyboard_placeholder_leak_flagged(self):
         sb = _mk_storyboard(["dolly in", "static"], [NARR1, NARR2])
         sb["shots"][0]["subject"] = "XX 牌咖啡豆倾泻而下"

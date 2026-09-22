@@ -566,6 +566,19 @@ class RevisionEngine:
         return text.strip(" ,;")
 
 
+# 轮36:重复旁白的归一化键——空白+中英文标点全剥离。旧逻辑只去空白,
+# 「每一杯都是匠心」vs「每一杯，都是匠心」只差标点被判为不同 key 放行,
+# 配音照念两遍(五审 #6c)。
+_NARR_PUNCT_RE = re.compile(
+    "[" + re.escape("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+    + r"\s\u3000-\u303f\uff00-\uffef\u2014\u2018\u2019\u201c\u201d"
+    + r"\u2026\u00b7]+")
+
+
+def _norm_narration_key(text: str) -> str:
+    return _NARR_PUNCT_RE.sub("", str(text or "")).lower()
+
+
 class ReviewEngine:
     """Main review engine that orchestrates multi-round iteration."""
 
@@ -918,7 +931,7 @@ class ReviewEngine:
             n = s.get("narration")
             if not isinstance(n, str) or not n.strip():
                 continue
-            key = re.sub(r"\s+", "", n)
+            key = _norm_narration_key(n)
             seen_narration.setdefault(key, []).append(
                 str(s.get("shot_id") or "?"))
         for key, ids in seen_narration.items():
@@ -1164,28 +1177,26 @@ proposed_fix="补齐 beat/rhythm/sfx 三字段(TVC 质感必备,AGENT_GUIDE §10
         # shot_size 逐镜不同所以 ST2 查不出——成片观感"每镜都差不多"。
         # 机位(camera)是镜头语言差异的直接载体:相邻镜 camera 逐字相同
         # (允许的例外:品牌落版末镜静态 logo,其 scene 含 logo/品牌/背景)。
-        _cam_cache: list[str] = []
-        for i, s in enumerate(shots):
-            cam = str(s.get("camera") or "").strip().lower()
-            if not cam:
-                continue
-            _cam_cache.append(cam)
-        for i in range(1, len(_cam_cache)):
-            prev = shots[i - 1]
-            cur = shots[i]
+        # 轮36:旧代码用压缩缓存(跳过空 camera)的下标去索引原 shots——
+        # camera=[static,"",static] 时把"雷同"finding 挂到**没有 camera
+        # 字段**的中间镜上(修订计划让 LLM 改不存在的字段,诱发 STALL),
+        # 真实相邻对也可能被错位比较。改为显式 (shot,camera) 成对遍历。
+        _cams = [(s, str(s.get("camera") or "").strip().lower())
+                 for s in shots]
+        _cams = [(s, c) for s, c in _cams if c]
+        for (prev, pc), (cur, cc) in zip(_cams, _cams[1:]):
             # 落版专用镜头(纯色背景+logo/slogan)允许 static,不判机位重复
             cscene = str(cur.get("scene") or "")
-            pscene = str(prev.get("scene") or "")
-            if _cam_cache[i] == _cam_cache[i - 1] and not \
+            if pc == cc and not \
                     any(mark in cscene for mark in ("logo", "slogan", "落版", "背景")):
                 cls = self.classifier.classify(
                     "storyboard", "camera_duplicated",
-                    f"{prev.get('shot_id', i)}->{cur.get('shot_id', i + 1)}")
+                    f"{prev.get('shot_id', '?')}->{cur.get('shot_id', '?')}")
                 findings.append(Finding(
                     dimension="variation",
                     severity=Severity.CRITICAL,
-                    issue=f"镜头{cur.get('shot_id', i + 1)}与上一镜同为机位'{_cam_cache[i]}'——镜头语言无差异",
-                    evidence=f"consecutive camera='{_cam_cache[i]}' (S{prev.get('shot_id', i)} -> S{cur.get('shot_id', i + 1)})",
+                    issue=f"镜头{cur.get('shot_id', '?')}与上一镜同为机位'{cc}'——镜头语言无差异",
+                    evidence=f"consecutive camera='{cc}' (S{prev.get('shot_id', '?')} -> S{cur.get('shot_id', '?')})",
                     failure_mode=cls["mode"],
                     revision_strategy=cls["strategy"],
                     proposed_fix="相邻镜头换用不同机位(dolly/truck/crane/pedestal 交替),景别也尽量跨档;品牌落版镜除外",
@@ -1196,7 +1207,7 @@ proposed_fix="补齐 beat/rhythm/sfx 三字段(TVC 质感必备,AGENT_GUIDE §10
         for s in shots:
             n = s.get("narration")
             if isinstance(n, str) and n.strip():
-                seen_narr.setdefault(re.sub(r"\s+", "", n), []).append(
+                seen_narr.setdefault(_norm_narration_key(n), []).append(
                     str(s.get("shot_id") or "?"))
         for key, ids in seen_narr.items():
             if len(ids) >= 2:
