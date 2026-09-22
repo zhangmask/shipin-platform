@@ -902,6 +902,18 @@ def review_final_video(req: FinalVideoReviewRequest):
     按 project context 的分镜表抽帧）。Returns blocked (no AGNES_KEY),
     pass, or fix-with-findings."""
     from shipin_platform.review.hard_gates import vlm_review_final
+    # 轮33:带 project_id 时被审视频必须位于该项目目录内——否则调用方可
+    # 对 preview cut/别的项目的视频跑终验,把 pass 凭证签给本项目
+    # (三审审计 #1:凭证与"被审视频/项目"零绑定,finalize 只读 verdict)。
+    if req.project_id:
+        _p = Path(req.video_path).resolve()
+        _proj = _project_dir(req.project_id).resolve()
+        try:
+            _p.relative_to(_proj)
+        except ValueError:
+            return {"verdict": "blocked",
+                    "reason": (f"video_path 不在项目 {req.project_id} 目录内"
+                               f"——拒绝对外部/他项目视频签发本项目终审凭证")}
     _res = vlm_review_final(req.video_path, frames_count=req.frames,
                             context=req.context or None)
     # 轮30:手工/agent 链路的终审凭证出口。该链路(平台 stitch 端点的
@@ -1531,10 +1543,29 @@ def project_finalize(project_id: str):
     # 轮32:幂等——已发布项目重复 finalize(前端重复点击/发布后轮询)旧行为
     # 走 required 循环,post_production 已是 RELEASED ≠ PASS → 409
     # UPSTREAM_FAILED,错误码语义是「上游未过」,实际是「早已发布」。
+    # 轮33:幂等不等于免检——发布后成片被换/凭证损坏时,重复 finalize 仍
+    # 必须 409(否则给"确认发布"的假信号),故此处先过哈希一致性。
     _pp = store.get_stage(project_id, "post_production")
     if _pp is not None and str(_pp["status"]) == "RELEASED":
-        return {"project_id": project_id, "status": "RELEASED",
-                "stages": store.get_project_status(project_id)}
+        _fm = _project_dir(project_id) / "final.mp4"
+        _frp = _project_dir(project_id) / "final_review.json"
+        _frsha = ""
+        try:
+            if _frp.is_file():
+                _frsha = str((_json.loads(
+                    _frp.read_text(encoding="utf-8")) or {}).get(
+                        "video_sha256") or "")
+        except (OSError, ValueError):
+            _frsha = ""
+        _ok = True
+        if _fm.is_file() and _frsha:
+            import hashlib as _hl_idem
+            _ok = (_hl_idem.sha256(_fm.read_bytes()).hexdigest()
+                   == _frsha)
+        if _ok:
+            return {"project_id": project_id, "status": "RELEASED",
+                    "stages": store.get_project_status(project_id)}
+        # 不一致:落到下面的完整门(终审闸+哈希比对)给出 409 明细
 
     # Required stages: brief through post_production (image_prompt/video_prompt
     # are optional when no generation step is used; skip them).
@@ -1569,6 +1600,38 @@ def project_finalize(project_id: str):
                       "critical": len(_crit),
                       "reason": str(_fr.get("reason") or "")[:200],
                       "detail": "终审未通过,按 findings 修复后重跑 assemble"})
+    # 轮33:发布物三方哈希比对——终审闸此前只读 verdict 字段,「盘上的
+    # final.mp4 就是当年过审的那条」从未被核对。assemble 跑通一次后
+    # /api/video/mux 换个文件(3 个调用,无需任何故障注入)或直接换盘上
+    # 文件再 finalize,轮25/27/30 的全部内容门在发布入口被整体绕过。
+    # 比对链:盘上 final.mp4 sha256 ↔ final_review.video_sha256(审的那条)
+    # ↔ post_production.artifact_hash(混音归一化后记的那条)。任一侧哈希
+    # 缺失(旧数据)时跳过该侧比对,不与现存项目互相伤害。
+    _final_mp4 = _project_dir(project_id) / "final.mp4"
+    _art_fails: list[dict] = []
+    if not _final_mp4.is_file():
+        _art_fails.append({"gate": "final_artifact", "status": "MISSING",
+                           "detail": "项目目录无 final.mp4"})
+    else:
+        import hashlib as _hl_fz
+        _disk_sha = _hl_fz.sha256(_final_mp4.read_bytes()).hexdigest()
+        _fr_sha = str(_fr.get("video_sha256") or "")
+        _pp_row = store.get_stage(project_id, "post_production") or {}
+        _pp_sha = str(_pp_row.get("artifact_hash") or "").strip()
+        if _fr_sha and _fr_sha != _disk_sha:
+            _art_fails.append({
+                "gate": "final_artifact", "status": "REVIEW_VIDEO_MISMATCH",
+                "detail": ("盘上 final.mp4 与终审凭证记录的被审视频不一致"
+                           "——成片在过审后被换过,禁止发布")})
+        if (_pp_sha and _pp_sha != "RELEASED" and _pp_sha != _disk_sha):
+            _art_fails.append({
+                "gate": "final_artifact", "status": "ARTIFACT_MISMATCH",
+                "detail": ("盘上 final.mp4 与 post_production 记录的成片指纹"
+                           "不一致——發布物被改动,禁止发布")})
+    if _art_fails:
+        raise HTTPException(status_code=409,
+                            detail={"code": "ARTIFACT_MISMATCH",
+                                    "fails": _art_fails})
     if fails:
         raise HTTPException(status_code=409,
                             detail={"code": "UPSTREAM_FAILED", "fails": fails})

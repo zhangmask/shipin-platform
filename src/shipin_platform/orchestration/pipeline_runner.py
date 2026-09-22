@@ -483,9 +483,18 @@ def _iterate(stage: str, data: dict, project_id: str, store,
     # 崩溃/磁盘满会留下「DB=PASS+新哈希、盘上旧文件或缺失」:下次 prompt
     # 阶段缓存命中跳过重审 → 读盘上旧文件(没用过审的旧 prompt 花钱生成,
     # 正是轮29 要堵的)或 shot_prompts KeyError 500。
-    _save(project_id, f"{stage}.json", data)
-    _save(project_id, f"{stage}_review.json",
-          {"decision": decision, "rounds": rounds, "llm": llm_info})
+    # 轮33:落盘 OSError 不再裸抛 500——返回 decision=stop 的可消费结构
+    # (调用方照常判非 pass),reason 指名磁盘/IO 问题;同步端点因此得到
+    # ok:False+reason 而非 500,异步任务不会整轮重试烧钱。
+    try:
+        _save(project_id, f"{stage}.json", data)
+        _save(project_id, f"{stage}_review.json",
+              {"decision": decision, "rounds": rounds, "llm": llm_info})
+    except OSError as e:
+        return {"stage": stage, "decision": "stop", "data": data,
+                "stats": {"critical": 1}, "revision_plan": [],
+                "llm": llm_info,
+                "reason": f"落盘失败({type(e).__name__}): {e}"[:200]}
     if decision in ("pass", "pass_with_warnings"):
         store.record_artifact(project_id, stage, h)
     else:
@@ -1021,8 +1030,13 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                 segs.append(tts.build_segment(s["shot_id"], s["narration"],
                                               role_code="biz_female"))
         _synth = tts.synthesize_segments_sync(segs)
+        # 轮33:成本只计成功段——旧代码失败也记 units=len(segs),账目虚高、
+        # _enforce_budget 可能提前误闸。
+        _ok_n = sum(1 for x in (_synth or [])
+                    if not getattr(x, "error", "")
+                    and getattr(x, "output_path", ""))
         record_cost(project_id, "tts", model="tts-v1",
-                    units=float(len(segs)), note="旁白+台词")
+                    units=float(_ok_n), note="旁白+台词")
         # 轮31:合成失败必须显式失败——synthesize 的失败是静默的(段上挂
         # error/output_path 空),旧代码丢弃返回值:_tts_of 按 mtime 取到
         # 上一轮的旧音频,随后新文本指纹盖上去 → 该镜从此对指纹永远"新鲜",
@@ -1046,6 +1060,12 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
             dv = glob_tts(work, f"{s['shot_id']}_dlg")
             if dv:
                 manifest["shots"][s["shot_id"]]["dlg"] = dv
+        elif s["shot_id"] in need:
+            # 轮33:台词被删的镜(三审审计 #4)——manifest 是累积加载的,旧
+            # dlg 路径不显式清掉就会留在 assemble 的声音设计里(旧台词轨
+            # 照播)、align 按旧音频算窗口,而新指纹让该镜永远"新鲜",
+            # 无门能发现。删/置空台词时必须显式摘掉。
+            manifest["shots"][s["shot_id"]].pop("dlg", None)
     align = align_narration([{"shot_id": s["shot_id"],
                               "duration_sec": float(s.get("duration_sec") or 3),
                               "narration_path": manifest["shots"][s["shot_id"]]["tts"],

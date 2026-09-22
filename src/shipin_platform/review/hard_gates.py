@@ -1011,6 +1011,15 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
     video = Path(video_path).resolve()
     if not video.exists():
         return {"verdict": "blocked", "reason": f"video not found: {video}", "findings": []}
+    # 轮33:被审视频的内容哈希——终审凭证必须绑定"审的是这条视频"。
+    # 缺了它,finalize 无法在发布时刻核对「盘上的 final.mp4 就是当年过的
+    # 那条」:assemble 后把成片换掉再 finalize,所有内容门被整体绕过
+    # (三审审计的共同根因)。
+    try:
+        import hashlib as _hl_v
+        _video_sha = _hl_v.sha256(video.read_bytes()).hexdigest()
+    except OSError:
+        _video_sha = ""
 
     # ── layer 1: deterministic structure pass ──────────────────────
     from .clip_qc import detect_cut_times, _duration_and_dims
@@ -1301,6 +1310,7 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
         "dropped_frames": dropped_frames,
         "shot_issues": shot_issues,
         "identity": identity,
+        "video_sha256": _video_sha,
         "batches": batch_results,
     }
 

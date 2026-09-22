@@ -296,12 +296,22 @@ class TestApiGates:
         store.record_artifact(pid, "post_production", h)
         store.record_confirmation(pid, "script")
 
-    def _write_final_review(self, pid: str, verdict: str):
+    def _write_final_review(self, pid: str, verdict: str,
+                            with_artifact: bool = True):
+        """轮33:默认连 final.mp4 一起落(与 post_production 指纹同内容的
+        b"final-bytes")——finalize 的发布物三方哈希比对需要盘上成片存在
+        且与凭证/post_production 指纹一致;with_artifact=False 造「有凭证
+        无成片」的负例。"""
+        import hashlib
         import json as _json
-        p = api._project_dir(pid) / "final_review.json"
-        p.parent.mkdir(parents=True, exist_ok=True)
+        work = api._project_dir(pid)
+        work.mkdir(parents=True, exist_ok=True)
+        if with_artifact:
+            (work / "final.mp4").write_bytes(b"final-bytes")
+        p = work / "final_review.json"
         p.write_text(_json.dumps(
             {"verdict": verdict, "reason": f"终审{verdict}",
+             "video_sha256": hashlib.sha256(b"final-bytes").hexdigest(),
              "findings": [{"severity": "critical", "code": "VLM_BREAK",
                            "message": "x"}]},
             ensure_ascii=False), encoding="utf-8")
@@ -322,11 +332,105 @@ class TestApiGates:
         pid = "fin-none"
         client.post("/api/project/create", json={"project_id": pid})
         self._pass_all_stages(pid)
+        work = self._fresh_project_dir(pid)
+        # 成片哈希与 post_production 一致(过 artifact 门), isolating 本测试
+        # 关心的点:没有 final_review.json → final_review 门拦
+        (work / "final.mp4").write_bytes(b"final-bytes")
         r = client.post(f"/api/project/{pid}/finalize")
         assert r.status_code == 409
         gate = next(f for f in r.json()["detail"]["fails"]
                     if f.get("gate") == "final_review")
         assert gate["status"] == "NOT_REVIEWED"
+
+    def _fresh_project_dir(self, pid: str) -> Path:
+        """轮33:清掉项目目录再建——API 测试写的是真实 data/projects,
+        上一次运行的残留(尤其 final.mp4)会污染本轮断言。"""
+        import shutil as _sh
+        d = api._project_dir(pid)
+        _sh.rmtree(d, ignore_errors=True)
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def test_finalize_blocked_when_artifact_swapped_after_review(
+            self, client):
+        """轮33:发布物三方哈希比对——assemble 跑通后把 final.mp4 换掉
+        再 finalize,必须 409(旧行为只读 verdict,内容门在发布入口被
+        整体绕过:三审审计的共同根因)。"""
+        import hashlib
+        pid = "fin-swap"
+        client.post("/api/project/create", json={"project_id": pid})
+        self._pass_all_stages(pid)
+        work = self._fresh_project_dir(pid)
+        import json as _json_sw
+        real = b"REAL-FINAL-VIDEO-BYTES"
+        (work / "final.mp4").write_bytes(real)
+        # 终审凭证:审的是 real,verdict pass
+        (work / "final_review.json").write_text(_json_sw.dumps(
+            {"verdict": "pass", "reason": "终验通过",
+             "video_sha256": hashlib.sha256(real).hexdigest(),
+             "findings": []}, ensure_ascii=False), encoding="utf-8")
+        # 换文件(模拟 mux/直接替换)
+        (work / "final.mp4").write_bytes(b"SWAPPED-DEFECTIVE-BYTES")
+        r = client.post(f"/api/project/{pid}/finalize")
+        assert r.status_code == 409
+        fails = r.json()["detail"]["fails"]
+        gate = next(f for f in fails if f.get("gate") == "final_artifact")
+        assert gate["status"] in ("REVIEW_VIDEO_MISMATCH",
+                                  "ARTIFACT_MISMATCH")
+
+    def test_finalize_ok_when_artifact_hash_matches(self, client):
+        """轮33 happy path:盘上 final.mp4 = 终审凭证记录的那条 = post_
+        production 指纹 → 放行。"""
+        import hashlib
+        pid = "fin-hash-ok"
+        client.post("/api/project/create", json={"project_id": pid})
+        store = api._STAGE_STORE
+        real = b"REAL-FINAL-VIDEO-BYTES-2"
+        _h = hashlib.sha256(real).hexdigest()
+        for stage in ("brief", "script", "storyboard", "video_gen"):
+            store.record_artifact(pid, stage, "h")
+        store.record_artifact(pid, "post_production", _h)
+        store.record_confirmation(pid, "script")
+        work = self._fresh_project_dir(pid)
+        (work / "final.mp4").write_bytes(real)
+        import json as _json_h
+        (work / "final_review.json").write_text(_json_h.dumps(
+            {"verdict": "pass", "reason": "终验通过",
+             "video_sha256": _h, "findings": []},
+            ensure_ascii=False), encoding="utf-8")
+        r = client.post(f"/api/project/{pid}/finalize")
+        assert r.status_code == 200, r.json()
+
+    def test_finalize_blocked_when_final_mp4_missing(self, client):
+        """轮33:final_review pass 但盘上无 final.mp4 → 409(不能对空气发布)。"""
+        pid = "fin-nomp4"
+        client.post("/api/project/create", json={"project_id": pid})
+        self._pass_all_stages(pid)
+        self._fresh_project_dir(pid)
+        self._write_final_review(pid, "pass", with_artifact=False)
+        r = client.post(f"/api/project/{pid}/finalize")
+        assert r.status_code == 409
+        fails = r.json()["detail"]["fails"]
+        assert any(f.get("gate") == "final_artifact"
+                   and f.get("status") == "MISSING" for f in fails)
+
+    def test_final_video_endpoint_rejects_external_video_path(
+            self, client, monkeypatch, tmp_path):
+        """轮33:带 project_id 时被审视频必须位于项目目录内——否则可对
+        preview cut/他项目视频跑终验,把 pass 凭证签给本项目。"""
+        pid = "fv-external"
+        client.post("/api/project/create", json={"project_id": pid})
+        self._pass_all_stages(pid)
+        outside = tmp_path / "outside.mp4"
+        outside.write_bytes(b"not-in-project")
+        r = client.post("/api/review/final-video",
+                        json={"video_path": str(outside),
+                              "project_id": pid})
+        assert r.status_code == 200
+        assert r.json()["verdict"] == "blocked"
+        assert "不在项目" in r.json()["reason"]
+        assert not (api._project_dir(pid)
+                    / "final_review.json").exists()
 
     def test_finalize_idempotent_when_already_released(self, client):
         """轮32:已发布项目重复 finalize(前端重复点击/发布后轮询)必须
@@ -364,14 +468,18 @@ class TestApiGates:
     # NOT_REVIEWED 死锁(修 finalize 门时引入的回归)。
 
     def _stub_final_review(self, monkeypatch, verdict: str):
+        """轮33:stub 也带 video_sha256(与 _write_final_review 落的
+        b"final-bytes" 一致)——finalize 的发布物三方哈希比对需要凭证里
+        有被审视频哈希才放行。"""
+        import hashlib
         from shipin_platform.review import hard_gates
         monkeypatch.setattr(
             hard_gates, "vlm_review_final",
-            lambda *a, **k: {"verdict": verdict,
-                             "reason": f"终验{verdict}",
-                             "findings": [{"severity": "critical",
-                                           "code": "VLM_BREAK",
-                                           "message": "x"}]})
+            lambda *a, **k: {
+                "verdict": verdict, "reason": f"终验{verdict}",
+                "video_sha256": hashlib.sha256(b"final-bytes").hexdigest(),
+                "findings": [{"severity": "critical",
+                              "code": "VLM_BREAK", "message": "x"}]})
 
     def test_final_video_endpoint_pass_unlocks_finalize(self, client,
                                                         monkeypatch):
@@ -379,6 +487,8 @@ class TestApiGates:
         pid = "manual-pass"
         client.post("/api/project/create", json={"project_id": pid})
         self._pass_all_stages(pid)
+        # 盘上成片(内容与 post_production 指纹/stub 的视频哈希一致)
+        (api._project_dir(pid) / "final.mp4").write_bytes(b"final-bytes")
         self._stub_final_review(monkeypatch, "pass")
         r = client.post("/api/review/final-video",
                         json={"video_path": str(api._project_dir(pid)),
