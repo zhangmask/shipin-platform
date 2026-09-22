@@ -432,6 +432,92 @@ class TestApiGates:
         assert not (api._project_dir(pid)
                     / "final_review.json").exists()
 
+    # ── 轮34:旧凭证 fail-closed + 端点项目绑定 ──────────────────────
+    # 四审 #1:轮33 的「腿缺失跳过」遇上 mux/normalize 会把 post_
+    # production 指纹改写成新文件哈希——旧凭证+可覆写指纹让「换片再
+    # 发布」对全部存量项目依然开放(commit 声称堵死的路径复辟)。
+
+    def test_finalize_blocks_legacy_credential_without_video_sha(
+            self, client):
+        """pass 凭证但没有 video_sha256(旧数据/读取失败)→ 409
+        CREDENTIAL_STALE——不许「旧凭证+可覆写指纹」放过被换过的成片。"""
+        pid = "fin-legacy"
+        client.post("/api/project/create", json={"project_id": pid})
+        self._pass_all_stages(pid)
+        work = self._fresh_project_dir(pid)
+        (work / "final.mp4").write_bytes(b"final-bytes")
+        import json as _json_lg
+        (work / "final_review.json").write_text(_json_lg.dumps(
+            {"verdict": "pass", "reason": "终验通过", "findings": []},
+            ensure_ascii=False), encoding="utf-8")  # 无 video_sha256
+        r = client.post(f"/api/project/{pid}/finalize")
+        assert r.status_code == 409
+        fails = r.json()["detail"]["fails"]
+        gate = next(f for f in fails if f.get("gate") == "final_artifact")
+        assert gate["status"] == "CREDENTIAL_STALE"
+        assert "final-video" in gate["detail"]  # 指明恢复路径
+
+    def test_finalize_blocks_when_reviewed_video_swapped_then_remuxed(
+            self, client):
+        """四审 #1 的完整攻击序列:assemble 过审 → mux 换文件(顺手覆写
+        post_production 指纹)→ finalize。旧代码 pp 腿与换过的文件自洽
+        → 放行;新代码凭证腿(视频哈希)仍指向旧视频 → 409。"""
+        import hashlib
+        pid = "fin-swap-remux"
+        client.post("/api/project/create", json={"project_id": pid})
+        self._pass_all_stages(pid)
+        work = self._fresh_project_dir(pid)
+        good, bad = b"GOOD-REVIEWED-FINAL", b"BAD-SWAPPED-FINAL"
+        import json as _json_sr
+        (work / "final.mp4").write_bytes(good)
+        (work / "final_review.json").write_text(_json_sr.dumps(
+            {"verdict": "pass", "reason": "终验通过",
+             "video_sha256": hashlib.sha256(good).hexdigest(),
+             "findings": []}, ensure_ascii=False), encoding="utf-8")
+        # mux 换文件 + 顺手把 post_production 指纹改成新文件的(端点行为)
+        (work / "final.mp4").write_bytes(bad)
+        api._STAGE_STORE.record_artifact(
+            pid, "post_production", hashlib.sha256(bad).hexdigest())
+        r = client.post(f"/api/project/{pid}/finalize")
+        assert r.status_code == 409
+        fails = r.json()["detail"]["fails"]
+        gate = next(f for f in fails if f.get("gate") == "final_artifact")
+        assert gate["status"] == "REVIEW_VIDEO_MISMATCH"
+
+    def test_final_video_endpoint_enforces_project_binding(
+            self, client, monkeypatch):
+        """四审 #3:带 project_id 落凭证前必须过请求级项目绑定(离线模式
+        绑定是 no-op,这里钉的是「端点确实调用了绑定」这条接线)。"""
+        pid = "fv-bind"
+        client.post("/api/project/create", json={"project_id": pid})
+        seen: list = []
+        monkeypatch.setattr(api, "_enforce_project_binding",
+                            lambda request, project_id: seen.append(
+                                project_id))
+        r = client.post("/api/review/final-video",
+                        json={"video_path": str(api._project_dir(pid)),
+                              "project_id": pid})
+        assert r.status_code == 200
+        assert seen == [pid], "final-video 落凭证路径必须过项目绑定"
+
+    def test_enforce_project_binding_mechanism_blocks_cross_tenant(self):
+        """绑定机制本身:绑到 A 的 key 访问 B → 403。"""
+        from fastapi import HTTPException
+        from api import _enforce_project_binding
+
+        class _Principal:
+            project_id = "A"
+
+        class _State:
+            principal = _Principal()
+
+        class _Req:
+            state = _State()
+
+        with pytest.raises(HTTPException) as ei:
+            _enforce_project_binding(_Req(), "B")
+        assert ei.value.status_code == 403
+
     def test_finalize_idempotent_when_already_released(self, client):
         """轮32:已发布项目重复 finalize(前端重复点击/发布后轮询)必须
         幂等 200——旧行为走 required 循环,RELEASED≠PASS → 409

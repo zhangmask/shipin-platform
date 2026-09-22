@@ -897,11 +897,16 @@ def review_timeline(req: TimelineReviewRequest):
 
 
 @app.post("/api/review/final-video")
-def review_final_video(req: FinalVideoReviewRequest):
+def review_final_video(req: FinalVideoReviewRequest, request: Request):
     """双层终验：确定性结构检查（镜内切/节奏）+ VLM 走查（context 参数化，
     按 project context 的分镜表抽帧）。Returns blocked (no AGNES_KEY),
     pass, or fix-with-findings."""
     from shipin_platform.review.hard_gates import vlm_review_final
+    # 轮34:带 project_id(要落终审凭证)必须过请求级项目绑定——否则持有
+    # 任绑到 A 的 write key 就能给任意项目 B 覆写 final_review.json
+    # (毁证/污染发布态,四审审计 #3;verdict=pass 的落盘在绑定之后)。
+    if req.project_id:
+        _enforce_project_binding(request, req.project_id)
     # 轮33:带 project_id 时被审视频必须位于该项目目录内——否则调用方可
     # 对 preview cut/别的项目的视频跑终验,把 pass 凭证签给本项目
     # (三审审计 #1:凭证与"被审视频/项目"零绑定,finalize 只读 verdict)。
@@ -1529,6 +1534,50 @@ def burn_subtitle(req: BurnSubtitleRequest):
 
 # ── Final Release ────────────────────────────────────────────────
 
+def _finalize_artifact_fails(project_id: str, fr: dict) -> list[dict]:
+    """轮33/34:发布物三方哈希比对,返回 fails 列表(空=通过)。
+
+    链条:盘上 final.mp4 sha256(`_file_sha256` 分块读,不全文件进内存)
+    ↔ final_review.video_sha256(终审审的那条) ↔
+    post_production.artifact_hash(assemble 混音归一后记的那条)。
+    轮34:终审凭证缺 video_sha256 → CREDENTIAL_STALE(fail-closed)——
+    /api/video/mux、/api/audio/normalize 带 project_id 会把 post_
+    production 指纹顺手改写成新文件哈希,「旧凭证 + 可覆写指纹」让
+    "换片再发布"对存量项目依然开放(四审审计 #1 实证)。恢复路径:
+    对当前 final.mp4 重跑 /api/review/final-video 或重跑 assemble。
+    """
+    fails: list[dict] = []
+    _final_mp4 = _project_dir(project_id) / "final.mp4"
+    if not _final_mp4.is_file():
+        return [{"gate": "final_artifact", "status": "MISSING",
+                 "detail": "项目目录无 final.mp4"}]
+    _disk_sha = _file_sha256(_final_mp4)
+    _fr_sha = str((fr or {}).get("video_sha256") or "").strip()
+    if not _fr_sha:
+        fails.append({"gate": "final_artifact", "status": "CREDENTIAL_STALE",
+                      "detail": ("终审凭证缺被审视频哈希(旧数据或读取失败)——"
+                                 "对当前 final.mp4 重跑 "
+                                 "/api/review/final-video 或重跑 assemble "
+                                 "刷新凭证后再发布")})
+    elif _fr_sha != _disk_sha:
+        fails.append({"gate": "final_artifact",
+                      "status": "REVIEW_VIDEO_MISMATCH",
+                      "detail": ("盘上 final.mp4 与终审凭证记录的被审视频不一致"
+                                 "——成片在过审后被换过;对当前 final.mp4 "
+                                 "重跑 /api/review/final-video 刷新凭证")})
+    try:
+        _pp_row = _stage_store().get_stage(project_id,
+                                           "post_production") or {}
+        _pp_sha = str(_pp_row.get("artifact_hash") or "").strip()
+    except Exception:
+        _pp_sha = ""
+    if _pp_sha and _pp_sha != "RELEASED" and _pp_sha != _disk_sha:
+        fails.append({"gate": "final_artifact", "status": "ARTIFACT_MISMATCH",
+                      "detail": ("盘上 final.mp4 与 post_production 记录的成片"
+                                 "指纹不一致——发布物被改动,禁止发布")})
+    return fails
+
+
 @app.post("/api/project/{project_id}/finalize")
 def project_finalize(project_id: str):
     """Mark project RELEASED: all required stages must be PASS and artifact
@@ -1543,26 +1592,18 @@ def project_finalize(project_id: str):
     # 轮32:幂等——已发布项目重复 finalize(前端重复点击/发布后轮询)旧行为
     # 走 required 循环,post_production 已是 RELEASED ≠ PASS → 409
     # UPSTREAM_FAILED,错误码语义是「上游未过」,实际是「早已发布」。
-    # 轮33:幂等不等于免检——发布后成片被换/凭证损坏时,重复 finalize 仍
-    # 必须 409(否则给"确认发布"的假信号),故此处先过哈希一致性。
+    # 轮33/34:幂等不等于免检——复用主路径同一套三方比对(含旧凭证
+    # fail-closed),不一致落到完整门给 409,不再单写一套降格比较。
     _pp = store.get_stage(project_id, "post_production")
     if _pp is not None and str(_pp["status"]) == "RELEASED":
-        _fm = _project_dir(project_id) / "final.mp4"
         _frp = _project_dir(project_id) / "final_review.json"
-        _frsha = ""
+        _fr0: dict = {}
         try:
             if _frp.is_file():
-                _frsha = str((_json.loads(
-                    _frp.read_text(encoding="utf-8")) or {}).get(
-                        "video_sha256") or "")
+                _fr0 = _json.loads(_frp.read_text(encoding="utf-8")) or {}
         except (OSError, ValueError):
-            _frsha = ""
-        _ok = True
-        if _fm.is_file() and _frsha:
-            import hashlib as _hl_idem
-            _ok = (_hl_idem.sha256(_fm.read_bytes()).hexdigest()
-                   == _frsha)
-        if _ok:
+            _fr0 = {}
+        if not _finalize_artifact_fails(project_id, _fr0):
             return {"project_id": project_id, "status": "RELEASED",
                     "stages": store.get_project_status(project_id)}
         # 不一致:落到下面的完整门(终审闸+哈希比对)给出 409 明细
@@ -1604,37 +1645,17 @@ def project_finalize(project_id: str):
     # final.mp4 就是当年过审的那条」从未被核对。assemble 跑通一次后
     # /api/video/mux 换个文件(3 个调用,无需任何故障注入)或直接换盘上
     # 文件再 finalize,轮25/27/30 的全部内容门在发布入口被整体绕过。
-    # 比对链:盘上 final.mp4 sha256 ↔ final_review.video_sha256(审的那条)
-    # ↔ post_production.artifact_hash(混音归一化后记的那条)。任一侧哈希
-    # 缺失(旧数据)时跳过该侧比对,不与现存项目互相伤害。
-    _final_mp4 = _project_dir(project_id) / "final.mp4"
-    _art_fails: list[dict] = []
-    if not _final_mp4.is_file():
-        _art_fails.append({"gate": "final_artifact", "status": "MISSING",
-                           "detail": "项目目录无 final.mp4"})
-    else:
-        import hashlib as _hl_fz
-        _disk_sha = _hl_fz.sha256(_final_mp4.read_bytes()).hexdigest()
-        _fr_sha = str(_fr.get("video_sha256") or "")
-        _pp_row = store.get_stage(project_id, "post_production") or {}
-        _pp_sha = str(_pp_row.get("artifact_hash") or "").strip()
-        if _fr_sha and _fr_sha != _disk_sha:
-            _art_fails.append({
-                "gate": "final_artifact", "status": "REVIEW_VIDEO_MISMATCH",
-                "detail": ("盘上 final.mp4 与终审凭证记录的被审视频不一致"
-                           "——成片在过审后被换过,禁止发布")})
-        if (_pp_sha and _pp_sha != "RELEASED" and _pp_sha != _disk_sha):
-            _art_fails.append({
-                "gate": "final_artifact", "status": "ARTIFACT_MISMATCH",
-                "detail": ("盘上 final.mp4 与 post_production 记录的成片指纹"
-                           "不一致——發布物被改动,禁止发布")})
+    # 轮34:verdict/阶段闸先报(最明确的 NOT_REVIEWED/fix),artifact
+    # 闸作为第二层只对 verdict=pass 的项目生效;凭证缺 video_sha256
+    # 按 fail-closed 拦(CREDENTIAL_STALE)。
+    if fails:
+        raise HTTPException(status_code=409,
+                            detail={"code": "UPSTREAM_FAILED", "fails": fails})
+    _art_fails = _finalize_artifact_fails(project_id, _fr)
     if _art_fails:
         raise HTTPException(status_code=409,
                             detail={"code": "ARTIFACT_MISMATCH",
                                     "fails": _art_fails})
-    if fails:
-        raise HTTPException(status_code=409,
-                            detail={"code": "UPSTREAM_FAILED", "fails": fails})
     # 发布:保留下方记的成片完整性指纹,pipeline_runner 早已避开把 hash
     # 覆写成字面量"RELEASED"(那会让后续 finalize 的哈希校验永远 409),
     # 这里同样不能覆写;发布事件走 event,不动 artifact。指纹为空(旧数据/
