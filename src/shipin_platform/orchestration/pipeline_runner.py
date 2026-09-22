@@ -86,8 +86,17 @@ def _project_dir(project_id: str) -> Path:
 
 
 def _save(project_id: str, name: str, data) -> Path:
+    # 轮43(七审 #6):原子写(temp + os.replace)——截断式 write_text 在
+    # 磁盘满/进程被杀时会留下半截 JSON,旧 _load 直接 json.loads 裸抛 →
+    # /report、/artifact 500;且轮32a 把 record_artifact 挪到 _save 之后,
+    # 半截文件会让"DB 说审过、盘上是坏的」。
+    import os as _os
+    import uuid as _uuid
     p = _project_dir(project_id) / name
-    p.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp = p.with_suffix("." + _uuid.uuid4().hex[:8] + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                   encoding="utf-8")
+    _os.replace(tmp, p)
     # P2：可回溯产物每次落盘都全量快照（内容哈希去重；回滚走 /restore）
     try:
         from shipin_platform.services.artifact_store import (
@@ -849,7 +858,16 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
         mode = by_id[sid]["mode"]
         if mode == "chain":
             nxt = shots[i + 1]["shot_id"]
-            manifest["shots"][sid]["last_frame"] = str(work / f"{nxt}.jpg")
+            # 轮44:链式末帧必须跟随下一镜的**真实**首帧——变体场景下
+            # 下一镜首帧常是素材池命中(基准路径,本地不生成),旧代码写死
+            # 本地 {nxt}.jpg → 文件不存在 → generate_video_agnes 直接
+            # "keyframe image not found"(轮42 指纹强制重生后暴露的既存
+            # latent bug:此前 stale qc 跳过生成,从未走到这)
+            nxt_ref = (manifest["shots"].get(nxt) or {}).get("first_frame")
+            if nxt_ref and Path(nxt_ref).is_file():
+                manifest["shots"][sid]["last_frame"] = str(nxt_ref)
+            else:
+                manifest["shots"][sid]["last_frame"] = str(work / f"{nxt}.jpg")
         elif mode in ("own_end", "outro_card"):
             ref_lp = manifest["shots"][sid].get("last_frame")
             lp = work / f"{sid}_last.jpg"
@@ -891,18 +909,23 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
             report.append({"shot_id": sid, "note": "kenburns 落版卡,assemble 阶段生成"})
             continue
         dur = float(s.get("duration_sec") or 3)
-        # 轮42:clip 缓存必须过输入指纹(见 _clip_input_sha)——指纹不符
-        # (prompt/首末帧/时长变过)即使 qc=="ok" 也强制重生;manifest 里
-        # 的 clip 文件也必须真实存在(旧代码信 manifest 不验盘)。
+        # 轮42/44:clip 缓存必须过新鲜度判据——本地 clip 比全输入指纹
+        # (prompt/首末帧/时长);池化 clip(变体复用基准素材,设计行为)
+        # 比镜头定义指纹(shot_id+时长+主体/场景/动作),变体改
+        # style_anchor 不误杀池复用,/rewrite 改镜头定义仍强制重生。
         _ci = _clip_input_sha(vid_map.get(sid) or s.get("motion") or "",
                               str(mrec.get("first_frame") or ""),
                               str(mrec.get("last_frame") or ""), dur)
+        _sci = _clip_shot_sha(sid, dur, s)
+        _pooled = _clip_is_pooled(mrec, project_id)
         _cached_clip = str(mrec.get("clip") or "")
-        if (mrec.get("qc") == "ok"
-                and mrec.get("clip_input_sha") == _ci
+        _fresh = ((_pooled and mrec.get("clip_shot_sha") == _sci)
+                  or (not _pooled and mrec.get("clip_input_sha") == _ci))
+        if (mrec.get("qc") == "ok" and _fresh
                 and _cached_clip.endswith(".mp4")
                 and Path(_cached_clip).is_file()):
-            report.append({"shot_id": sid, "qc": "ok", "cached": True})
+            report.append({"shot_id": sid, "qc": "ok", "cached": True,
+                           "pooled": _pooled})
             continue
         clip = work / f"{sid}_clip.mp4"
         # 轮21:关键帧 vs 分镜文本门——视频模型以 first_frame 为条件
@@ -930,6 +953,7 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
             except Exception as e:
                 mrec["keyframe_review"] = f"error: {str(e)[:120]}"
         attempts = []
+        generated = False  # 轮44:本镜是否真生成了过审 clip(见循环后检查)
         for attempt in range(3):
             # 轮42:阶段内预算熔断(七审 #2)——每次生成前复查,超限即中止,
             # 不让单次 generate 超支一个数量级(入口闸只在进门时查一次)
@@ -978,6 +1002,7 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
             attempts.append({"attempt": attempt + 1, "qc": qc["verdict"],
                              "cuts": qc["checks"]["internal_cuts"]["value"]})
             if qc["verdict"] == "ok":
+                generated = True
                 mrec["qc"] = "ok"
                 # 画布归一化:AGNES 固定出 720p 横屏,9:16 项目必须统一到目标
                 # 画幅(中心裁剪+黑边),否则 stitch 的 xfade 链因尺寸不一致失败;
@@ -991,9 +1016,11 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                                               canvas_w, canvas_h)):
                     mrec["master"] = str(work / f"{sid}_canvas_master.mp4")
                 mrec["clip"] = str(clip)
-                # 轮42:记下本镜 clip 的输入指纹——下次重跑凭它判断缓存
-                # 是否还有效(prompt/首末帧/时长变过 → 强制重生)
+                # 轮42/44:记下本镜 clip 的新鲜度判据——本地用全输入
+                # 指纹;同时记镜头定义指纹(变体深拷贝 manifest 时随之
+                # 携带,池化复用按它判定,不被重新派生的 prompt 误伤)
                 mrec["clip_input_sha"] = _ci
+                mrec["clip_shot_sha"] = _sci
                 # 审计 G5:clip 内容哈希落账——assemble 时代验同一文件名是否
                 # 被换过内容(拼接阶段会按此清单逐片核对,防"审A拼B")
                 import hashlib as _hl
@@ -1019,12 +1046,24 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                 _save(project_id, "manifest.json", manifest)
                 break
             mrec["qc"] = "fix"
+        # 轮44:三次 attempt 全败(生成异常 r=None 被 continue 跳过、或 QC
+        # 全败)必须显式失败——旧代码此时带着基准 manifest 深拷贝来的
+        # stale qc=="ok" 通过下方检查,generate 假报 ok:True,assemble 拿
+        # 不存在的基准 clip 拼接才在 stitch 炸("no packets"),E2E 三连挂
+        # 的根因(潜伏 fail-open:变体/复用 manifest 的场景必踩)。
+        if not generated:
+            mrec["qc"] = "fix"
         store.record_clip_qc(project_id, sid, str(clip),
                              "ok" if mrec.get("qc") == "ok" else "fix", {"attempts": attempts})
         report.append({"shot_id": sid, "qc": mrec.get("qc"), "attempts": attempts})
         if mrec.get("qc") != "ok":
             _save(project_id, "manifest.json", manifest)
-            return {"ok": False, "phase": "generate", "reason": f"{sid} 3 次生成未通过 QC",
+            _errs = [str(a.get("error"))[:80] for a in attempts
+                     if a.get("error")][:2]
+            return {"ok": False, "phase": "generate",
+                    "reason": (f"{sid} 3 次生成未成功"
+                               + (f"（{'; '.join(_errs)}）" if _errs else "")
+                               + "——旧素材/过期 qc 状态不得复用"),
                     "report": report}
 
     # 4) TTS(缺则生成;变体沿用的素材引用直接复用)+ 对齐
@@ -1206,10 +1245,15 @@ def _budget_exceeded(project_id: str) -> tuple[bool, str]:
         mx = b.get("max_budget_usd")
         if mx is None:
             return False, ""
-        from shipin_platform.services.costing import cost_summary
+        from shipin_platform.services.costing import (cost_summary,
+                                                      LedgerCorruptError)
         used = float(cost_summary(project_id).get("total_usd") or 0)
         if used > float(mx):
             return True, f"已用 ${used:.4f} > 上限 ${float(mx):.4f}"
+    except LedgerCorruptError as e:
+        # 轮43:账本损坏时熔断方向是"停"——查不了账就不能继续花钱
+        # (入口闸同理会先把这类请求拦在门外)
+        return True, f"成本账本损坏,无法核对预算({str(e)[:80]})"
     except Exception:
         return False, ""
     return False, ""
@@ -1222,11 +1266,39 @@ def _clip_input_sha(vid_prompt: str, first_frame: str, last_frame: str,
     generate 的 clip 缓存捷径旧只看 qc=="ok"——storyboard 改写/变体改
     风格后 vid prompt 变了但 shot_id 不变,旧 clip 原样复用:新 prompt
     从未执行,「审查与花钱定稿的输入 ≠ 实际入拼的内容」(七审 #3;轮29
-    的 prompt 侧、轮26 的 TTS 侧同类问题都已修,generate 侧一直漏)。"""
+    修了 prompt 侧、轮26 修了 TTS 侧,generate 侧一直漏)。"""
     import hashlib as _hl_ci
     payload = f"{str(vid_prompt or '')}\x00{str(first_frame or '')}\x00" \
               f"{str(last_frame or '')}\x00{float(dur or 0):.2f}"
     return _hl_ci.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _clip_shot_sha(sid: str, dur: float, shot: dict) -> str:
+    """轮44:镜头定义指纹(shot_id+时长+主体/场景/动作文本)。
+
+    变体复用基准素材池是**设计行为**(manifest 深拷贝携带 base 的
+    clip/qc/指纹)——池化 clip 不能拿变体重新派生的 prompt 判新鲜度
+    (style_anchor 覆盖后 prompt 必变,轮42 原始指纹误杀了池复用,
+    E2E 三连挂的根因),改按镜头定义判:定义没变 → 池复用合法;
+    /rewrite 改了动作/时长 → 重构重生成(七审 #3 的关切不放松)。"""
+    import hashlib as _hl_cs
+    payload = "\x00".join([
+        str(sid or ""), f"{float(dur or 0):.2f}",
+        str(shot.get("subject") or ""), str(shot.get("scene") or ""),
+        str(shot.get("motion") or "")])
+    return _hl_cs.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _clip_is_pooled(mrec: dict, project_id: str) -> bool:
+    """clip 是否来自共享素材池(文件位于别的项目目录)。"""
+    clip = str(mrec.get("clip") or "")
+    if not clip:
+        return False
+    try:
+        return (Path(clip).resolve().parent
+                != _project_dir(project_id).resolve())
+    except Exception:
+        return False
 
 
 def _mtime(p: str) -> float:
@@ -1400,8 +1472,12 @@ def run_assemble_phase(project_id: str, store) -> dict:
         return {"ok": False, "phase": "assemble", "reason": f"color-grade: {g}"}
     out["color_grade"] = {"output": graded}
 
-    # 4) 字幕(服务端按 align 时间轴生成)
-    srt = _build_srt(storyboard, tl, manifest)
+    # 4) 字幕(服务端按 align 时间轴生成;轮44d 按字号/画幅算折行预算,
+    # §10.6 宽度红线治本——720p@46px 下 10 字行 63.7% 会被验收门打死)
+    _fs = int(comp_sub.get("font_size", 46) or 46)
+    _cw = int(manifest.get("canvas_w") or 0) or 1280
+    srt = _build_srt(storyboard, tl, manifest,
+                     max_line_chars=max(4, int(_cw * 0.62 / _fs)))
     srt_path = work / "subs.srt"
     srt_path.write_text(srt, encoding="utf-8")
     burn = burn_srt(str(Path(graded).resolve()), str(srt_path.resolve()),
@@ -1459,16 +1535,30 @@ def run_assemble_phase(project_id: str, store) -> dict:
     out["audio"] = {k: ma.get(k) for k in ("bgm_ducked", "sfx_count")}
 
     # 6) mux + normalize(记录 post_production)
+    # 轮43(七审 #6):旧代码 mux/normalize 直接写 final.mp4——重跑 assemble
+    # 卡在任一步(磁盘满/ffmpeg 崩)时,磁盘上的 final.mp4 变成未归一化
+    # 甚至截断的中间产物,而 store 里 post_production 仍 PASS、事件流仍
+    # 写着"成片已发布":发布态与盘上文件脱节且不可回滚。改 candidate
+    # 中间产物 + 全部成功后才原子上岗;失败时保留上一版 final.mp4 并记
+    # assemble_failed 事件(发布态若有,另行撤销见下方终验分支)。
+    _final_cand = work / "final.candidate.mp4"
+    _final_prev = work / "final.published.mp4"
     mm = mux_audio_video(str(work / "subtitled.mp4"), str(work / "soundbed.wav"),
-                         str(work / "final.mp4"))
+                         str(_final_cand))
     if not mm.get("ok"):
         return {"ok": False, "phase": "assemble", "reason": f"mux: {mm}"}
-    nm = normalize_loudness(str(work / "final.mp4"), str(work / "final_norm.mp4"),
+    _norm_cand = work / "final_norm.candidate.mp4"
+    nm = normalize_loudness(str(_final_cand), str(_norm_cand),
                             target_lufs=-14.0, two_pass=True)
     if not nm.get("ok"):
         return {"ok": False, "phase": "assemble", "reason": f"normalize: {nm}"}
-    (work / "final_norm.mp4").replace(work / "final.mp4")
     import hashlib
+    if (work / "final.mp4").exists():
+        try:
+            (work / "final.mp4").replace(_final_prev)  # 保留上一版可回滚
+        except OSError:
+            pass
+    _norm_cand.replace(work / "final.mp4")
     h = hashlib.sha256((work / "final.mp4").read_bytes()).hexdigest()
     store.record_artifact(project_id, "post_production", h)
     lm = loudness_measure(str(work / "final.mp4"))
@@ -1627,11 +1717,37 @@ def _clip_src(manifest: dict, shot_id: str, work: Path) -> str:
     return str(work / f"{shot_id}_clip.mp4")
 
 
-def _build_srt(storyboard: dict, tl: list[dict], manifest: Optional[dict] = None) -> str:
+_WRAP_PUNCT = "，。！？；、,!?;:"
+
+
+def _wrap_text(text: str, max_chars: int) -> str:
+    """轮44d:长句在最接近中点的标点处折两行。
+
+    §10.6 宽度红线(≤62% 屏宽)以前只拦不治——720p@46px 下 10 字旁白
+    烧出来 63.7%,验收门直接打死整条 assemble(E2E 实证)。中文排版惯例
+    是标点折行,渲染器多行 cue 基建早已就绪,这里在字幕生成侧一次治本
+    (两条烧录路径都读 SRT)。max_chars<=0 = 不折(旧行为)。
+    """
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    mid = len(text) / 2
+    best, best_d = -1, None
+    for i, ch in enumerate(text):
+        if ch in _WRAP_PUNCT and i > 0:
+            d = abs(i + 1 - mid)
+            if best_d is None or d < best_d:
+                best, best_d = i + 1, d
+    cut = best if best > 0 else max_chars
+    return text[:cut] + "\n" + text[cut:]
+
+
+def _build_srt(storyboard: dict, tl: list[dict], manifest: Optional[dict] = None,
+               max_line_chars: int = 0) -> str:
     """SRT：旁白 + 台词双轨字幕。
 
     台词镜：台词「角色: 文本」先说（窗口起点起，显示时长 = 台词实长+0.1s），
     旁白随后（align 算好的 narr_at 起）。无台词镜只出旁白。
+    max_line_chars>0 时超长行按标点折两行(轮44d,§10.6 宽度红线)。
     """
     narr = {s["shot_id"]: s.get("narration", "") for s in storyboard["shots"]}
     dlg = {s["shot_id"]: s.get("dialogue") for s in storyboard["shots"]}
@@ -1653,15 +1769,20 @@ def _build_srt(storyboard: dict, tl: list[dict], manifest: Optional[dict] = None
             name = ROLE_NAMES.get(role, role)
             dlg_sec = rec.get("dlg_sec") or 1.2
             d_show = min(dlg_sec + 0.1, w)
-            lines.append(f"{idx}\n{fmt(t)} --> {fmt(t + d_show)}\n{name}: {d['text']}\n")
+            # 轮44d:台词行带「角色: 」前缀,预算要给前缀留位
+            dtext = _wrap_text(f"{name}: {d['text']}",
+                               max(4, max_line_chars - 2))
+            lines.append(f"{idx}\n{fmt(t)} --> {fmt(t + d_show)}\n{dtext}\n")
             idx += 1
             if n:
                 ns = t + dlg_sec + 0.18
                 if ns < t + w - 0.05:
-                    lines.append(f"{idx}\n{fmt(ns)} --> {fmt(t + w)}\n{n}\n")
+                    lines.append(f"{idx}\n{fmt(ns)} --> {fmt(t + w)}\n"
+                                 f"{_wrap_text(n, max_line_chars)}\n")
                     idx += 1
         elif n:
-            lines.append(f"{idx}\n{fmt(t)} --> {fmt(t + w)}\n{n}\n")
+            lines.append(f"{idx}\n{fmt(t)} --> {fmt(t + w)}\n"
+                         f"{_wrap_text(n, max_line_chars)}\n")
             idx += 1
         t += w
     return "\n".join(lines)

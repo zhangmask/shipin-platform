@@ -7,6 +7,7 @@
 - run_assemble_phase 的 video_gen 闸门（未生成直接拦，不再静默混拼）
 """
 import json
+from pathlib import Path
 
 import pytest
 
@@ -204,6 +205,285 @@ class TestBudgetFuse:
              "scene": "咖啡店", "motion": "端起咖啡杯",
              "narration": narr[i - 1], "dialogue": ""}
             for i in range(1, 9)]}
+
+
+class TestLedgerAtomicity:
+    """轮43(七审 #5):成本账本旧实现三个洞——读-改-写无锁(并发丢行)、
+    截断式写(半路被杀留损坏 JSON)、_load_rows 损坏时静默返回 [](预算
+    闸判定"没花钱"重新放行,账本无声清零=给预算闸开后门)。"""
+
+    def test_corrupt_ledger_raises_not_silently_zeroed(self):
+        from shipin_platform.services.costing import (cost_file,
+                                                      _load_rows,
+                                                      LedgerCorruptError)
+        pid = "lg-corrupt"
+        fp = cost_file(pid)
+        fp.write_text('{"rows": [{"seq": 1, "usd', encoding="utf-8")  # 截断
+        try:
+            _load_rows(pid)
+            raise AssertionError("损坏账本必须抛 LedgerCorruptError")
+        except LedgerCorruptError:
+            pass
+        # 损坏文件被备份(不静默覆盖消失)
+        assert any(fp.parent.glob("cost.corrupt-*.json")), "应留下备份"
+
+    def test_record_cost_atomic_and_lock(self):
+        import uuid as _uuid_lg
+        from shipin_platform.services.costing import (cost_file,
+                                                      record_cost,
+                                                      cost_summary)
+        pid = f"lg-atomic-{_uuid_lg.uuid4().hex}"  # 唯一 PID(data 目录跨运行残留)
+        record_cost(pid, "video", model="m", units=2.0, note="a")
+        record_cost(pid, "video", model="m", units=1.0, note="b")
+        rows = json.loads(cost_file(pid).read_text(encoding="utf-8"))
+        assert [r["seq"] for r in rows] == [1, 2]
+        assert len(cost_summary(pid)["records"]) == 2
+        # 无残留临时文件
+        assert not list(cost_file(pid).parent.glob("cost.tmp-*"))
+
+    def test_save_is_atomic(self):
+        """轮43:_save 旧为截断式 write_text,半路被杀留半截 JSON →
+        _load 裸抛 → /report 500。"""
+        pid = "lg-save"
+        pr._save(pid, "final_review.json", {"verdict": "pass", "findings": []})
+        got = pr._load(pid, "final_review.json")
+        assert got["verdict"] == "pass"
+        assert not list(pr._project_dir(pid).glob("*.tmp"))
+
+
+class TestGenerateNoSilentSkip:
+    """轮44(E2E 三连挂根因):三次生成全败时,旧代码 `r is None → continue`
+    跳过 attempt 循环尾的 qc='fix',带着基准 manifest 深拷贝来的 stale
+    qc=="ok" 通过循环后检查 → generate 假报 ok:True → assemble 拿不存在
+    的基准 clip 拼接才在 stitch 炸("no packets")。变体/复用 manifest 的
+    场景必踩(潜伏 fail-open)。必须显式失败。"""
+
+    def _seed(self, pid: str):
+        pr._save(pid, "brief.json", {"product_info": "x", "duration_sec": 9,
+                                     "brand_name": "测试牌"})
+        pr._save(pid, "storyboard.json", {
+            "hero_shot": "S01",
+            "shots": [{"shot_id": "S01", "duration_sec": 3, "narration": "好",
+                       "beat": "hook", "scene": "门口", "subject": "杯",
+                       "motion": "steam rises slowly", "spatial": "center",
+                       "camera": "dolly in", "shot_size": "cu"}]})
+        ip = {"style_anchor": "soft light",
+              "shot_prompts": [{"shot_id": "S01", "prompt_en": "a cup"}]}
+        vp = {"shot_prompts": [{"shot_id": "S01", "prompt_text": "steam"}]}
+        pr._save(pid, "image_prompt.json", ip)
+        pr._save(pid, "video_prompt.json", vp)
+        from shipin_platform.contracts import stable_artifact_hash
+        store = ProjectStageStore(":memory:")
+        store.create_project(pid)
+        store.record_confirmation(pid, "script")
+        store.record_confirmation(pid, "storyboard")
+        store.record_artifact(pid, "script", "h")
+        store.record_artifact(pid, "storyboard", "h")
+        store.record_artifact(pid, "image_prompt", stable_artifact_hash(ip))
+        store.record_artifact(pid, "video_prompt", stable_artifact_hash(vp))
+        # 关键:stale qc=ok + clip 指向不存在的文件(基准拷贝的形态)
+        pr._save(pid, "manifest.json", {
+            "shots": {"S01": {"first_frame": str(pr._project_dir(pid)
+                                                 / "nope.jpg"),
+                              "qc": "ok",
+                              "clip": str(pr._project_dir(pid)
+                                          / "nope_clip.mp4")}}})
+        return store
+
+    def test_all_attempts_failed_returns_not_ok(self, monkeypatch):
+        pid = "gen-noskip"
+        store = self._seed(pid)
+
+        def _boom(*a, **k):
+            raise RuntimeError("agnes video endpoint 500")
+
+        monkeypatch.setattr(pr, "generate_video_agnes", _boom)
+
+        def _fake_img(*a, **k):
+            import subprocess as _sp2
+            out = pr._project_dir(pid) / "S01.jpg"
+            _sp2.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                      "-i", "color=c=blue:s=320x240:r=24",
+                      "-frames:v", "1", str(out)],
+                     check=True, capture_output=True)
+            return {"ok": True, "output": str(out)}
+
+        monkeypatch.setattr(pr, "generate_image_agnes", _fake_img)
+        r = pr.run_generate_phase(pid, store)
+        assert r["ok"] is False, r
+        assert "3 次生成未成功" in r["reason"], r["reason"]
+        # stale qc 必须被清掉,不允许 ok 离场
+        m = pr._load(pid, "manifest.json")
+        assert m["shots"]["S01"]["qc"] == "fix"
+
+    def test_successful_generation_still_ok(self, monkeypatch, tmp_path):
+        """轮44 反向:生成成功时流程照旧(修复不能误伤正常路径)。"""
+        import subprocess as _sp
+        pid = "gen-ok43"
+        store = self._seed(pid)
+
+        def _fake_gen(prompt, duration=5, resolution="720p", work_dir=None,
+                      first_frame=None, last_frame=None, output_path=None,
+                      negative_prompt="", **kw):
+            out = output_path or str(tmp_path / "f.mp4")
+            _sp.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                     "-i", "testsrc2=duration=3:size=320x240:r=24",
+                     "-c:v", "libx264", "-pix_fmt", "yuv420p", out],
+                    check=True, capture_output=True)
+            return {"ok": True, "output": out, "master_path": ""}
+
+        monkeypatch.setattr(pr, "generate_video_agnes", _fake_gen)
+
+        def _fake_img(*a, **k):
+            import subprocess as _sp2
+            out = pr._project_dir(pid) / "S01.jpg"
+            _sp2.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                      "-i", "testsrc2=duration=1:size=320x240:r=24",
+                      "-frames:v", "1", str(out)],
+                     check=True, capture_output=True)
+            return {"ok": True, "output": str(out)}
+
+        monkeypatch.setattr(pr, "generate_image_agnes", _fake_img)
+        r = pr.run_generate_phase(pid, store)
+        assert r["ok"] is True, str(r.get("reason"))[:200]
+        m = pr._load(pid, "manifest.json")
+        assert m["shots"]["S01"]["qc"] == "ok"
+
+    # ── 轮44:池化 clip(变体复用基准素材)的新鲜度判据 ────────────────
+
+    def _seed_pooled(self, pid: str, pool_dir: Path, motion: str):
+        """变体形态:manifest 的 clip/first_frame 指向**别的项目目录**
+        (共享素材池),qc=ok + clip_shot_sha 已随深拷贝携带。"""
+        pr._save(pid, "brief.json", {"product_info": "x", "duration_sec": 9,
+                                     "brand_name": "测试牌",
+                                     "style_anchor": "teal tones"})
+        pr._save(pid, "storyboard.json", {
+            "hero_shot": "S01",
+            "shots": [{"shot_id": "S01", "duration_sec": 3, "narration": "好",
+                       "beat": "hook", "scene": "门口", "subject": "杯",
+                       "motion": motion, "spatial": "center",
+                       "camera": "dolly in", "shot_size": "cu"}]})
+        ip = {"style_anchor": "teal tones",
+              "shot_prompts": [{"shot_id": "S01", "prompt_en": "a cup"}]}
+        vp = {"shot_prompts": [{"shot_id": "S01", "prompt_text": "steam"}]}
+        pr._save(pid, "image_prompt.json", ip)
+        pr._save(pid, "video_prompt.json", vp)
+        from shipin_platform.contracts import stable_artifact_hash
+        store = ProjectStageStore(":memory:")
+        store.create_project(pid)
+        store.record_confirmation(pid, "script")
+        store.record_confirmation(pid, "storyboard")
+        store.record_artifact(pid, "script", "h")
+        store.record_artifact(pid, "storyboard", "h")
+        store.record_artifact(pid, "image_prompt", stable_artifact_hash(ip))
+        store.record_artifact(pid, "video_prompt", stable_artifact_hash(vp))
+        # 池化素材:clip/首帧都在 pool_dir(他方项目),且带 base 的指纹
+        shot = {"shot_id": "S01", "duration_sec": 3, "subject": "杯",
+                "scene": "门口", "motion": motion}
+        pool_dir.mkdir(parents=True, exist_ok=True)
+        (pool_dir / "S01_clip.mp4").write_bytes(b"pooled-clip")
+        import subprocess as _sp_pool
+        _sp_pool.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                      "-i", "testsrc2=duration=1:size=320x240:r=24",
+                      "-frames:v", "1", str(pool_dir / "S01.jpg")],
+                     check=True, capture_output=True)
+        pr._save(pid, "manifest.json", {
+            "shots": {"S01": {"first_frame": str(pool_dir / "S01.jpg"),
+                              "last_frame": str(pool_dir / "S01.jpg"),
+                              "qc": "ok",
+                              "clip": str(pool_dir / "S01_clip.mp4"),
+                              "clip_shot_sha": pr._clip_shot_sha("S01", 3,
+                                                                 shot)}}})
+        return store
+
+    def test_pooled_clip_reused_when_shot_definition_unchanged(
+            self, monkeypatch, tmp_path):
+        """轮44:变体改 style_anchor(prompt 变)但镜头定义没变 → 池化
+        复用合法(轮42 的原始 prompt 指纹误杀了它,E2E 三连挂根因)。"""
+        pid = "pool-reuse"
+        store = self._seed_pooled(pid, tmp_path / "pool",
+                                  "steam rises slowly")
+        called = []
+
+        def _boom(*a, **k):
+            called.append(1)
+            raise RuntimeError("不应触发重新生成")
+
+        monkeypatch.setattr(pr, "generate_video_agnes", _boom)
+        monkeypatch.setattr(
+            pr, "generate_image_agnes",
+            lambda *a, **k: {"ok": True, "output": "x.jpg"})
+        r = pr.run_generate_phase(pid, store)
+        assert r["ok"] is True, str(r.get("reason"))[:200]
+        assert not called, "池化复用不得触发重新生成"
+        rows = [x for x in r["report"] if x.get("shot_id") == "S01"]
+        assert rows and rows[0].get("cached") and rows[0].get("pooled"), rows
+
+    def test_pooled_clip_regenerated_when_shot_definition_changed(
+            self, monkeypatch, tmp_path):
+        """轮44 另一面:/rewrite 改了镜头动作(定义变)→ 即使池化也强制
+        重生(七审 #3 的关切不放松)。"""
+        pid = "pool-regen"
+        store = self._seed_pooled(pid, tmp_path / "pool2",
+                                  "steam rises slowly")
+        # 篡改分镜:动作变了(模拟 /rewrite)
+        sb = pr._load(pid, "storyboard.json")
+        sb["shots"][0]["motion"] = "cup tips over suddenly"
+        pr._save(pid, "storyboard.json", sb)
+        called = []
+
+        def _fake_gen(prompt, duration=5, resolution="720p", work_dir=None,
+                      first_frame=None, last_frame=None, output_path=None,
+                      negative_prompt="", **kw):
+            called.append(1)
+            import subprocess as _sp3
+            out = output_path or str(tmp_path / "f.mp4")
+            _sp3.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                      "-i", "testsrc2=duration=3:size=320x240:r=24",
+                      "-c:v", "libx264", "-pix_fmt", "yuv420p", out],
+                     check=True, capture_output=True)
+            return {"ok": True, "output": out, "master_path": ""}
+
+        monkeypatch.setattr(pr, "generate_video_agnes", _fake_gen)
+        monkeypatch.setattr(
+            pr, "generate_image_agnes",
+            lambda *a, **k: {"ok": True,
+                             "output": str(pr._project_dir(pid) / "S01.jpg")})
+        r = pr.run_generate_phase(pid, store)
+        assert called, "镜头定义变了必须重生"
+        assert r["ok"] is True, str(r.get("reason"))[:200]
+
+
+class TestSubtitleWrap:
+    """轮44d:§10.6 宽度红线治本——720p@46px 下 10 字旁白烧出来
+    63.7%,验收门(轮27)直接打死整条 assemble(E2E 实证)。中文排版惯例
+    是标点折两行,渲染器多行 cue 基建早已就绪,在字幕生成侧一次治本。"""
+
+    def test_long_line_wraps_at_punctuation(self):
+        got = pr._wrap_text("加班后的倦，无人诉说", 9)
+        assert "\n" in got and max(len(x) for x in got.split("\n")) <= 9
+
+    def test_short_line_unchanged(self):
+        assert pr._wrap_text("深夜街头，冷色如冰", 9) == "深夜街头，冷色如冰"
+        assert pr._wrap_text("短句", 9) == "短句"
+
+    def test_no_punctuation_hard_cut(self):
+        got = pr._wrap_text("没有标点的超长字幕文本需要硬切处理", 9)
+        assert "\n" in got
+
+    def test_zero_budget_means_no_wrap(self):
+        assert pr._wrap_text("加班后的倦，无人诉说", 0) == "加班后的倦，无人诉说"
+
+    def test_build_srt_wraps_narration(self):
+        sb = {"shots": [{"shot_id": "S01", "duration_sec": 3,
+                         "narration": "加班后的倦，无人诉说",
+                         "dialogue": ""}]}
+        tl = [{"shot_id": "S01", "window_sec": 3.0}]
+        srt = pr._build_srt(sb, tl, max_line_chars=9)
+        assert "\n无人诉说" in srt, srt
+        # 不传预算 = 旧行为(单行)
+        srt_old = pr._build_srt(sb, tl)
+        assert "加班后的倦，无人诉说" in srt_old
 
 
 class TestClipCacheFingerprint:

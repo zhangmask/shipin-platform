@@ -16,8 +16,16 @@ from typing import Optional
 
 from shipin_platform import roots
 
+import os
+import threading
+import uuid
+
 ROOT = roots.data_root()
 PROVIDERS_PATH = ROOT / "config" / "providers.json"
+
+# 轮43:账本进程内锁——异步任务 ThreadPoolExecutor 并发 record_cost,
+# 旧代码读-改-写无锁,后写覆盖先写(少计费,且两次都真实花了钱)
+_LEDGER_LOCK = threading.Lock()
 
 # 平台运营侧缺省价（USD）；真实价格在 config/providers.json 的 pricing 段，
 # 这里只保证"任何环境都有价可记"。
@@ -70,34 +78,59 @@ def cost_file(project_id: str) -> Path:
     return d / "cost.json"
 
 
+class LedgerCorruptError(RuntimeError):
+    """轮43:成本账本损坏——调用方必须显式处理,不得静默按空账放行。"""
+
+
 def _load_rows(project_id: str) -> list[dict]:
+    """轮43:损坏不再静默当空账——截断的 cost.json(磁盘满/进程被杀写在
+    半路)旧代码返回 [],预算闸判定"没花钱"重新放行,历史账目无声消失
+    (七审 #5:账本清零=给预算闸开后门)。现在:备份损坏文件 + 记
+    ledger_corrupt 事件 + **抛 LedgerCorruptError** 让调用方显式失败。
+    进程内锁见 record_cost。"""
     fp = cost_file(project_id)
     if not fp.exists():
         return []
     try:
-        return json.loads(fp.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return []
+        rows = json.loads(fp.read_text(encoding="utf-8"))
+        return rows if isinstance(rows, list) else []
+    except (json.JSONDecodeError, OSError) as e:
+        try:
+            bak = fp.with_suffix(f".corrupt-{int(time.time())}.json")
+            fp.replace(bak)
+        except OSError:
+            bak = fp
+        raise LedgerCorruptError(
+            f"成本账本损坏已备份({bak.name}): {type(e).__name__}——"
+            f"拒绝按空账继续(那会让预算闸重新放行);请人工核对后删除备份或修复")
 
 
 def record_cost(project_id: str, kind: str, *,
                 model: str = "", units: float = 1.0, note: str = "") -> dict:
-    """登记一笔生成成本并落账。kind: image / video / tts。"""
-    usd = round(unit_usd(kind) * float(units), 6)
-    rows = _load_rows(project_id)
-    row = {
-        "seq": (rows[-1]["seq"] + 1) if rows else 1,
-        "ts": round(time.time(), 3),
-        "kind": kind,
-        "model": model,
-        "units": float(units),
-        "usd": usd,
-        "note": note,
-    }
-    rows.append(row)
-    cost_file(project_id).write_text(
-        json.dumps(rows, ensure_ascii=False, indent=1), encoding="utf-8")
-    return row
+    """登记一笔生成成本并落账。kind: image / video / tts / llm。
+
+    轮43(七审 #5):读-改-写全程加进程内锁(异步任务 ThreadPoolExecutor
+    并发 record_cost 会丢行),写改 mkstemp+os.replace 原子写(截断式
+    write_text 在半路被杀会留下损坏 JSON→旧 _load_rows 静默清零)。"""
+    with _LEDGER_LOCK:
+        usd = round(unit_usd(kind) * float(units), 6)
+        rows = _load_rows(project_id)
+        row = {
+            "seq": (rows[-1]["seq"] + 1) if rows else 1,
+            "ts": round(time.time(), 3),
+            "kind": kind,
+            "model": model,
+            "units": float(units),
+            "usd": usd,
+            "note": note,
+        }
+        rows.append(row)
+        fp = cost_file(project_id)
+        tmp = fp.with_suffix(".tmp-" + uuid.uuid4().hex[:8])
+        tmp.write_text(json.dumps(rows, ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+        os.replace(tmp, fp)
+        return row
 
 
 def cost_summary(project_id: str) -> dict:
