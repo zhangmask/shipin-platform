@@ -139,6 +139,59 @@ class TestLlmReviewUnavailable:
         assert r["decision"] not in ("pass", "pass_with_warnings"), r
 
 
+class TestPromptStageCache:
+    """轮29:prompt 阶段 PASS 缓存必须过内容哈希。
+
+    旧逻辑 row.status != "PASS" 才重审——分镜文本变了(shot_id 集合
+    不变,如 _bind_brand 绑实品牌名、用户 /rewrite 改主体描述)时新派生
+    prompt 被整个丢弃、生成用盘上的旧 prompt:品牌注入丢失要等终审
+    BRAND_MISSING 才炸(钱已花完),且 prompt 阶段对新输入再无审查
+    (审查过的输入 ≠ 实际使用的输入)。"""
+
+    def _row(self, status: str, h: str):
+        class _R:
+            def __init__(self):
+                self.status = status
+                self.artifact_hash = h
+
+            def keys(self):
+                return ["status", "artifact_hash"]
+
+            def __getitem__(self, k):
+                return getattr(self, k)
+        return _R()
+
+    def test_same_hash_is_cache_hit(self):
+        from shipin_platform.contracts import stable_artifact_hash
+        from shipin_platform.orchestration import pipeline_runner as pr
+        data = {"style_anchor": "x",
+                "shot_prompts": [{"shot_id": "S01", "prompt_en": "A"}]}
+        row = self._row("PASS", stable_artifact_hash(data))
+        assert pr._prompt_stage_stale(row, data) is False
+
+    def test_changed_input_is_stale(self):
+        from shipin_platform.contracts import stable_artifact_hash
+        from shipin_platform.orchestration import pipeline_runner as pr
+        old = {"style_anchor": "x",
+               "shot_prompts": [{"shot_id": "S01", "prompt_en": "A"}]}
+        new = {"style_anchor": "x",
+               "shot_prompts": [{"shot_id": "S01", "prompt_en": "B"}]}
+        row = self._row("PASS", stable_artifact_hash(old))
+        assert pr._prompt_stage_stale(row, new) is True
+
+    def test_empty_hash_is_stale(self):
+        from shipin_platform.orchestration import pipeline_runner as pr
+        data = {"style_anchor": "x", "shot_prompts": []}
+        assert pr._prompt_stage_stale(self._row("PASS", ""), data) is True
+
+    def test_non_pass_row_not_stale(self):
+        from shipin_platform.contracts import stable_artifact_hash
+        from shipin_platform.orchestration import pipeline_runner as pr
+        data = {"style_anchor": "x", "shot_prompts": []}
+        row = self._row("BLOCKED", stable_artifact_hash({"other": 1}))
+        assert pr._prompt_stage_stale(row, data) is False
+
+
 class TestIterateDurationLoop:
     """轮25 回归:_iterate 的时长闭环收尾块曾引用三个从未赋名的变量
     (fitted_total/dev/llm_meta)——stage="script" 且 brief 带

@@ -730,11 +730,19 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
     for stage, data in (("image_prompt", {"style_anchor": style, "shot_prompts": img_prompts}),
                         ("video_prompt", {"shot_prompts": vid_prompts})):
         row = store.get_stage(project_id, stage)
-        if row is None or row["status"] != "PASS":
-            r = _iterate(stage, data, project_id, store, use_llm=False)
-            if r["decision"] not in ("pass", "pass_with_warnings"):
-                return {"ok": False, "phase": "generate",
-                        "reason": f"{stage} 审核不通过: {r['stats']}"}
+        # 轮29:PASS 缓存必须过内容哈希——旧逻辑只看 status==PASS 就整段
+        # 跳过,分镜文本变了(shot_id 集合不变,如 _bind_brand 绑实品牌/
+        # 用户 rewrite)时新派生 prompt 被丢弃、生成用旧 prompt,品牌注入
+        # 丢失要等终审 BRAND_MISSING 才炸(钱已花完),且 prompt 阶段对
+        # 新输入再无审查。派生数据与已审哈希一致=真缓存命中才跳过。
+        if _prompt_stage_stale(row, data):
+            pass  # 走下面重审
+        elif row is not None and row["status"] == "PASS":
+            continue
+        r = _iterate(stage, data, project_id, store, use_llm=False)
+        if r["decision"] not in ("pass", "pass_with_warnings"):
+            return {"ok": False, "phase": "generate",
+                    "reason": f"{stage} 审核不通过: {r['stats']}"}
 
     ip = _load(project_id, "image_prompt.json")
     shots = storyboard["shots"]
@@ -1033,6 +1041,33 @@ def _tts_text_sha(s: dict) -> str:
              else str(dlg or ""))
     payload = f"{str(s.get('narration') or '')}\x00{dtext}"
     return _hl3.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _prompt_stage_stale(row, data: dict) -> bool:
+    """轮29:prompt 阶段 PASS 缓存是否已脱钩(输入变了但状态仍 PASS)。
+
+    旧逻辑 `row.status != "PASS"` 才重审——分镜文本变了(shot_id 集合
+    不变,如 _bind_brand 绑实品牌名、用户 /rewrite 改主体描述)时,新派生
+    prompt 被整个丢弃、生成用盘上的旧 prompt:品牌注入丢失要等终审
+    BRAND_MISSING 才炸( generation 钱已花完),且 prompt 阶段对新输入
+    再无审查。判据:派生数据哈希 != 已审 artifact_hash → 脱钩,必须重审。
+    行缺失/哈希为空(旧数据)视为脱钩(安全方向:重审一遍)。"""
+    if row is None:
+        return False
+    try:
+        if str(row["status"]) != "PASS":
+            return False
+    except (KeyError, IndexError, TypeError):
+        return False
+    recorded = str((row["artifact_hash"] if "artifact_hash" in row.keys()
+                    else "") or "")
+    if not recorded:
+        return True
+    try:
+        from shipin_platform.contracts import stable_artifact_hash
+        return stable_artifact_hash(data) != recorded
+    except Exception:
+        return True
 
 
 def _mtime(p: str) -> float:
