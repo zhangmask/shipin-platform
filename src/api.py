@@ -58,7 +58,7 @@ from shipin_platform.orchestration.pipeline_runner import (
 )
 from shipin_platform.services.costing import (
     record_cost, cost_summary, global_cost_summary, global_budget_exceeded,
-    read_global_budget, set_global_budget)
+    read_global_budget, set_global_budget, LedgerCorruptError)
 from shipin_platform.services.rate_limiter import (
     check_rate, rate_state, rate_config)
 from shipin_platform.services import audit_store
@@ -2400,7 +2400,20 @@ def _enforce_budget(project_id: str, store) -> None:
     b = _read_budget(project_id)
     if not b or b["max_budget_usd"] is None:
         return
-    used = cost_summary(project_id)["total_usd"]
+    try:
+        used = cost_summary(project_id)["total_usd"]
+    except LedgerCorruptError as e:
+        # 轮43(七审 #5):账本损坏绝不静默放行——旧 _load_rows 损坏时返回
+        # [] 让预算闸判定"没花钱"重新放行,历史账目无声消失
+        store.record_event(
+            project_id, "ledger_corrupt",
+            f"成本账本损坏,预算核对中止: {str(e)[:160]}",
+            stage="summary", detail=f"blocked={_now_iso()} (ledger)")
+        raise HTTPException(
+            status_code=422,
+            detail=f"成本账本损坏、无法核对预算: {str(e)[:160]}。"
+                   f"请修复或删除 data/projects/{project_id}/cost.json "
+                   f"的损坏备份后重试")
     if used > b["max_budget_usd"]:
         store.record_event(
             project_id, "budget_exceeded",
