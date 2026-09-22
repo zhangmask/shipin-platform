@@ -1170,6 +1170,23 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
             times = None
     except Exception:
         times = None
+    # 轮38:尾部覆盖——final.mp4 长于 Σ分镜时长时(拼接余量/音频床溢出),
+    # 旧代码尾段一帧不采也无覆盖断言:未审内容直接进发布物(五审 #3 的
+    # 尾部子项)。补采尾段(shot_idx=None → tag「尾部」,批次提示词的叙事
+    # 连续检查照看;分镜预期段本就不为无 shot_idx 的帧出行)。
+    if times and shots:
+        try:
+            _shots_total = sum(float(s.get("duration_sec") or 0)
+                               for s in shots if isinstance(s, dict))
+            _tail = video_dur - _shots_total
+            if _tail > 0.5:
+                _n_tail = min(4, max(1, int(_tail)))
+                for _k in range(_n_tail):
+                    times.append((round(_shots_total
+                                        + _tail * (_k + 0.5) / _n_tail, 2),
+                                  None))
+        except Exception:
+            pass
     dropped_frames: list[dict] = []
     _tmp_dirs: list[str] = []  # 轮19:批次编码完成后统一删除
     try:
@@ -1183,7 +1200,9 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
                     ["ffmpeg", "-v", "error", "-ss", f"{t}", "-i", str(video),
                      "-frames:v", "1", "-vf", "scale=960:-2", "-y", str(p)],
                     capture_output=True, text=True)
-                tag = f"镜头{shots[shot_idx].get('shot_id', shot_idx + 1)}"
+                # 轮38:shot_idx=None = 尾段帧(无分镜归属)
+                tag = (f"尾部+{t:.2f}s" if shot_idx is None
+                       else f"镜头{shots[shot_idx].get('shot_id', shot_idx + 1)}")
                 if p.exists() and p.stat().st_size > 1000:
                     frames.append({"t": round(t, 2), "path": str(p),
                                    "shot": tag, "shot_idx": shot_idx})
@@ -1208,6 +1227,9 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
     coverage_gaps: list[dict] = []
     if times:
         for _, shot_idx in times:
+            if shot_idx is None:
+                continue  # 轮38:尾段帧无分镜归属,按 frames 里的「尾部
+                         # +X.XXs」tag 直接计数,不进 seed
             tag = f"镜头{shots[shot_idx].get('shot_id', shot_idx + 1)}"
             shot_coverage[tag] = shot_coverage.get(tag, 0)
         for f in frames:

@@ -131,6 +131,23 @@ class TestFinalReviewContext:
         p2 = _batch_prompt("1.0", 1, None)
         assert "笔记本" not in p2
 
+    def test_tail_beyond_shots_is_sampled(self, monkeypatch, tmp_path):
+        """轮38(五审 #3 尾部子项):final.mp4 长于 Σ分镜时长时(拼接余量/
+        音频床溢出),旧代码尾段一帧不采也无覆盖断言——未审内容直接进
+        发布物。现在尾段必须进采样与覆盖计数。"""
+        _vlm_stub(monkeypatch)
+        from shipin_platform.review import hard_gates
+        clip = _make_motion_clip(tmp_path / "tail.mp4", 6.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "主角"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "主角"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=8,
+                                        context=ctx)
+        cov = r["shot_coverage"]
+        assert any(k.startswith("尾部") for k in cov), cov
+        assert sum(v for k, v in cov.items()
+                   if k.startswith("尾部")) >= 2, cov
+
     def test_shot_boundaries_and_frames(self):
         """_context_frames: 每镜全覆盖采样——不丢镜头、帧落在镜内、含中段。"""
         from shipin_platform.review.hard_gates import (_shot_boundaries,
