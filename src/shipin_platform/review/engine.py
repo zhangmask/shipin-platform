@@ -883,8 +883,20 @@ class ReviewEngine:
                     failure_mode=cls["mode"], revision_strategy=cls["strategy"],
                     proposed_fix="把台词拆短到 ≤20 字(一句台词一个意思)",
                 ))
-            if str(s.get("narration", "")).strip() and \
-                    text.split("，")[0] in str(s.get("narration", "")):
+            # 轮37:旧规则只比 text.split("，")[0] in narration——首子句
+            # 之后的分句与旁白逐字重复(或仅标点不同)完全逃逸。改任一
+            # 分句(归一化后 ≥4 字,避开"好的"类 trivial 匹配)或整句互相
+            # 包含即报。注:语义级复述(换了字复述同一信息)是 LLM 审片
+            # rubric 的职责,字面层到这里为止。
+            _nnorm = _norm_narration_key(str(s.get("narration", "")))
+            _dnorm = _norm_narration_key(text)
+            _clauses = [c for c in re.split(r"[，。！？；、,.!?;]", text)
+                        if len(_norm_narration_key(c)) >= 4]
+            _dupe = bool(_nnorm) and (
+                any(_norm_narration_key(c) in _nnorm for c in _clauses)
+                or (len(_dnorm) >= 4
+                    and (_dnorm in _nnorm or _nnorm in _dnorm)))
+            if _dupe:
                 cls = self.classifier.classify("script", "dialogue_dupe_narration", text[:16])
                 findings.append(Finding(
                     dimension="dialogue", severity=Severity.CRITICAL,

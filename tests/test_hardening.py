@@ -1432,7 +1432,7 @@ class TestBlackFrameGate:
         assert "FINAL_BLACK_FRAMES" in codes, r["findings"]
 
     def test_final_black_near_boundary_exempted(self, monkeypatch, tmp_path):
-        """黑段贴在镜头边界 ±1.5s 内(叠化压黑过渡)→ 不拦。"""
+        """黑段贴在镜头边界 ±1.5s 内(叠化压黑)→ 不拦。"""
         _vlm_stub(monkeypatch)
         from shipin_platform.review import hard_gates
         clip = self._black_clip(tmp_path / "bk_bnd.mp4", 1.8, 0.3,
@@ -1444,6 +1444,31 @@ class TestBlackFrameGate:
                                         context=ctx)
         assert "FINAL_BLACK_FRAMES" not in {f["code"]
                                             for f in r["findings"]}
+
+    def test_deterministic_guard_isolates_single_failure(self, monkeypatch,
+                                                         tmp_path):
+        """轮37(五审补充项):确定性层四检查独立守卫——motion_energy 炸
+        只废 audio_motion 一项,黑帧检查照跑。旧代码一个 try 包全部,
+        单点探测失败(ffprobe 字段 "N/A" 等)= 整体放弃确定性防线。"""
+        _vlm_stub(monkeypatch)
+        from shipin_platform.review import clip_qc, hard_gates
+
+        def _boom(_v):
+            raise ValueError("probe field N/A")
+
+        monkeypatch.setattr(clip_qc, "motion_energy", _boom)
+        clip = self._black_clip(tmp_path / "guard.mp4", 3.6, 0.8)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "主角"},
+            {"shot_id": "S02", "duration_sec": 4.0, "subject": "主角"},
+            {"shot_id": "S03", "duration_sec": 2.0, "subject": "主角"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=6,
+                                        context=ctx)
+        codes = {f["code"] for f in r["findings"]}
+        assert "FINAL_BLACK_FRAMES" in codes, r["findings"]  # 黑帧检查幸存
+        err = [f for f in r["findings"]
+               if f["code"] == "DETERMINISTIC_PASS_ERROR"]
+        assert err and "audio_motion" in err[0]["message"], err
 
 
 class TestSubtitleAcceptance:

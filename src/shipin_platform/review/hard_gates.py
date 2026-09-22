@@ -1042,10 +1042,30 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
         _video_sha = ""
 
     # ── layer 1: deterministic structure pass ──────────────────────
-    from .clip_qc import detect_cut_times, _duration_and_dims
-    deterministic: dict = {"cut_times": [], "internal_cuts": [], "avg_shot_sec": None}
+    # 轮37:每个确定性检查独立 try——旧代码五大检查(硬切/音频/运动/
+    # 瞬变/黑帧)包在同一个 try 里,任一处探测异常(ffprobe 字段 "N/A"
+    # 转 float、黑帧解析炸…)会把**全部**确定性检查降级成一条
+    # DETERMINISTIC_PASS_ERROR suggestion:单点失败=整体放弃确定性防线
+    # (五审补充项)。现在单点失败只废那一个检查。
+    from .clip_qc import (detect_cut_times, _duration_and_dims,
+                          _ffprobe, black_spans, transient_spikes)
+    from .clip_qc import motion_energy as _motion_energy
+    deterministic: dict = {"cut_times": [], "internal_cuts": [],
+                           "avg_shot_sec": None}
     det_findings: list[dict] = []
-    try:
+    video_dur = 0.0
+
+    def _det_guard(name: str, fn) -> None:
+        try:
+            fn()
+        except Exception as e:
+            det_findings.append({
+                "severity": "suggestion", "code": "DETERMINISTIC_PASS_ERROR",
+                "message": f"确定性检查[{name}]失败: {type(e).__name__}: "
+                           f"{e}"[:200]})
+
+    def _check_cuts() -> None:
+        nonlocal video_dur
         video_dur, _dims = _duration_and_dims(video)
         cuts = detect_cut_times(video, threshold=0.3)
         deterministic["cut_times"] = cuts
@@ -1072,9 +1092,10 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
             det_findings.append({
                 "severity": "suggestion", "code": "CUT_DENSITY_HIGH",
                 "message": f"全片检测到 {len(cuts)} 处场景突变（无分镜上下文，仅提示）"})
+
+    def _check_audio_motion() -> None:
         # M6(2026-09-21 审计):成片层物理完整性扇区——音频流存在性 + 运动能量。
         # 静态帧 VLM 看不到运动/冻结/J 帧,这是确定性层唯一能补的两块廉价检查。
-        from .clip_qc import _ffprobe, motion_energy as _motion_energy
         _streams = _ffprobe(video).get("streams", [])
         audio_ok = any(s.get("codec_type") == "audio"
                        and float(s.get("duration", 0) or 0) > 0.3
@@ -1094,10 +1115,11 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
             det_findings.append({
                 "severity": "warning", "code": "FINAL_MOTION_LOW",
                 "message": f"成片运动能量仅 {me:.2f}(<2.5)——运动不足,注意局部冻结帧"})
+
+    def _check_transient() -> None:
         # 审计 G2:全片亮度瞬变(闪白/闪黑/单帧崩坏)。叠化拼接在镜头边界
         # 前后 ~1s 内会有亮度过渡,属正常;边界之外的瞬变才是病。
-        from .clip_qc import transient_spikes as _transient_spikes
-        spikes = _transient_spikes(video)
+        spikes = transient_spikes(video)
         if shots:
             bounds = _shot_boundaries(shots)
             spikes = [s for s in spikes
@@ -1114,11 +1136,12 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
                 "severity": "warning", "code": "FINAL_TRANSIENT_SPIKES",
                 "message": (f"成片检测到 1 处镜头边界外的亮度瞬变闪帧"
                             f"(t={spikes[0]['t']}s)——建议复核该时刻")})
+
+    def _check_black() -> None:
         # 轮22:全片黑帧(blackdetect)。叠化拼接的边界两侧 ~1s 内允许
         # 压黑过渡;此外的整段黑屏=生成失败/渲染残帧。与 per-clip 的
         # BLACK_FRAMES 同源不同层:clip 层管素材,这里管成片。
-        from .clip_qc import black_spans as _black_spans
-        _bspans = _black_spans(video, min_dur=0.5)
+        _bspans = black_spans(video, min_dur=0.5)
         deterministic["black_spans"] = _bspans
         _bnds = _shot_boundaries(shots) if shots else []
         _bad_black = [sp for sp in _bspans
@@ -1131,9 +1154,11 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
                 "message": (f"成片检测到 {len(_bad_black)} 处镜内整段黑屏"
                             f"(t={[(round(s, 2), round(e, 2)) for s, e, _ in _bad_black]})"
                             f"——生成失败/渲染残帧,需定位重生成")})
-    except Exception as e:
-        det_findings.append({"severity": "suggestion", "code": "DETERMINISTIC_PASS_ERROR",
-                             "message": f"确定性结构检查失败: {e}"})
+
+    _det_guard("cuts_pacing", _check_cuts)
+    _det_guard("audio_motion", _check_audio_motion)
+    _det_guard("transient", _check_transient)
+    _det_guard("black", _check_black)
 
     # ── layer 2: VLM walk-through (per-shot coverage sampling) ─────
     try:

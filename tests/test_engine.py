@@ -399,6 +399,51 @@ class TestAbstractQualityGates:
         report = ReviewEngine().run_review("script", _mk_script([NARR1, NARR1, NARR2]))
         assert any(f.failure_mode == "NARRATION_DUPLICATED" for f in report.findings)
 
+    # ── 轮37:台词-旁白重复判定扩到分句+整句包含(五审 #6b) ──────────
+
+    def test_dialogue_dupe_second_clause_flagged(self):
+        """轮37:旧规则只比 text.split('，')[0] in narration——重复信息
+        在第二分句时完全逃逸(配音仍念两遍)。台词第二分句与旁白逐字
+        重复必须报。(注:换字复述的语义级重复是 LLM 审片职责,字面层
+        到这里为止。)"""
+        shots = [
+            {"shot_id": "S01", "duration_sec": 4,
+             "narration": "清晨的阳光落在窗台", "scene": "晨间厨房"},
+            {"shot_id": "S02", "duration_sec": 4,
+             "narration": "每一颗豆子都经匠心烘焙，香气四溢",
+             "scene": "晨间厨房",
+             "dialogue": {"role_code": "hero_male",
+                          "text": "这杯真好喝，匠心烘焙"}}]
+        report = ReviewEngine().run_review(
+            "script", {"duration_sec": 8, "shots": shots})
+        assert any("台词与旁白重复" in f.issue
+                   for f in report.findings), \
+            [f.issue for f in report.findings]
+
+    def test_dialogue_dupe_full_containment_flagged(self):
+        """轮37:整句互相包含(台词被旁白原样吸收)同样报。"""
+        shots = [{"shot_id": "S01", "duration_sec": 4,
+                  "narration": "欢迎光临本店慢慢喝",
+                  "scene": "晨间厨房",
+                  "dialogue": {"role_code": "hero_male",
+                               "text": "欢迎光临"}}]
+        report = ReviewEngine().run_review(
+            "script", {"duration_sec": 4, "shots": shots})
+        assert any("台词与旁白重复" in f.issue
+                   for f in report.findings)
+
+    def test_dialogue_distinct_info_not_flagged(self):
+        """轮37 反向:台词与旁白信息互补(不重复)不得误报。"""
+        shots = [{"shot_id": "S01", "duration_sec": 4,
+                  "narration": "每一颗豆子都经匠心烘焙",
+                  "scene": "晨间厨房",
+                  "dialogue": {"role_code": "hero_male",
+                               "text": "今天天气真好啊"}}]
+        report = ReviewEngine().run_review(
+            "script", {"duration_sec": 4, "shots": shots})
+        assert not any("台词与旁白重复" in f.issue
+                       for f in report.findings)
+
     def test_script_clean_no_narration_duplicate(self):
         report = ReviewEngine().run_review("script", _mk_script([NARR1, NARR2]))
         assert not any(f.failure_mode == "NARRATION_DUPLICATED" for f in report.findings)
