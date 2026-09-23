@@ -454,6 +454,186 @@ class TestGenerateNoSilentSkip:
         assert r["ok"] is True, str(r.get("reason"))[:200]
 
 
+class TestGenerateFailureDiagnosis:
+    """轮45(E2E 第 6 次挂:S08 3 次生成未成功、reason 无任何细节):
+    生成全败的失败原因必须可诊断。旧代码 reason 只带网络异常 error,
+    而 generate_video_agnes 要么抛异常要么返回 dict——「生成成功但
+    QC 判 fix」这一整类失败(参考图漂移/内部切镜/形态突变)在 reason
+    里无迹可寻,attempts 也只记 verdict+cuts,findings 全文丢弃。
+    E2E 现场正是这个形态:43 分钟跑到 S08,三连 fix,零细节。"""
+
+    _seed = TestGenerateNoSilentSkip._seed
+
+    def _fake_gen_writing_clip(self, pid, tmp_path, payload):
+        def _fake_gen(prompt, duration=5, resolution="720p", work_dir=None,
+                      first_frame=None, last_frame=None, output_path=None,
+                      negative_prompt="", **kw):
+            out = output_path or str(tmp_path / "f.mp4")
+            import subprocess as _sp
+            _sp.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                     "-i", "testsrc2=duration=3:size=320x240:r=24",
+                     "-c:v", "libx264", "-pix_fmt", "yuv420p", out],
+                    check=True, capture_output=True)
+            return payload(out)
+        return _fake_gen
+
+    def _fake_img(self, pid):
+        def _fake_img(*a, **k):
+            import subprocess as _sp2
+            out = pr._project_dir(pid) / "S01.jpg"
+            _sp2.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                      "-i", "testsrc2=duration=1:size=320x240:r=24",
+                      "-frames:v", "1", str(out)],
+                     check=True, capture_output=True)
+            return {"ok": True, "output": str(out)}
+        return _fake_img
+
+    def _qc_fix_stub(self, monkeypatch, code="REF_MISMATCH"):
+        monkeypatch.setattr(pr, "qc_clip", lambda *a, **k: {
+            "verdict": "fix",
+            "checks": {"internal_cuts": {"value": 0}},
+            "findings": [
+                {"severity": "critical", "code": code,
+                 "message": "镜头S01 首帧与参考图感知距离 58 (fail>46)"},
+                {"severity": "suggestion", "code": "REF_DRIFT",
+                 "message": "偏大，建议人工复核"}],
+            "next_action": "按 findings 重新生成该镜头"})
+
+    def test_qc_critical_code_surfaces_in_reason(self, monkeypatch,
+                                                 tmp_path):
+        """QC 判 fix 的失败:reason 必须带 critical 编码+attempt,attempts
+        必须带 findings 全文(否则运营拿到『3 次未成功』无从下手)。"""
+        pid = "gen-diag-qc"
+        store = self._seed(pid)
+        monkeypatch.setattr(
+            pr, "generate_video_agnes",
+            self._fake_gen_writing_clip(
+                pid, tmp_path, lambda out: {"ok": True, "output": out,
+                                            "master_path": ""}))
+        monkeypatch.setattr(pr, "generate_image_agnes", self._fake_img(pid))
+        self._qc_fix_stub(monkeypatch)
+        r = pr.run_generate_phase(pid, store)
+        assert r["ok"] is False, r
+        # reason:critical 编码 + attempt 号(三次同码不同 attempt 都要在)
+        assert "QC: " in r["reason"], r["reason"]
+        assert "REF_MISMATCH#1" in r["reason"], r["reason"]
+        assert r["reason"].count("REF_MISMATCH#") == 3, r["reason"]
+        assert "旧素材/过期 qc 状态不得复用" in r["reason"], r["reason"]
+        # attempts:findings 全文(含 suggestion 与 message)不得再丢弃
+        att = r["report"][-1]["attempts"]
+        assert len(att) == 3, att
+        f0 = att[0]["findings"][0]
+        assert f0["code"] == "REF_MISMATCH"
+        assert f0["severity"] == "critical"
+        assert "58" in f0["message"], f0
+        assert any(f["severity"] == "suggestion" for f in att[0]["findings"])
+
+    def test_silent_none_return_is_recorded(self, monkeypatch, tmp_path):
+        """生成器静默返回 None(不抛异常):必须留痕『返回空结果』——
+        旧代码 r is None → continue 静默跳过,该 attempt 无迹可寻。"""
+        pid = "gen-diag-none"
+        store = self._seed(pid)
+        monkeypatch.setattr(pr, "generate_video_agnes",
+                            self._fake_gen_writing_clip(
+                                pid, tmp_path, lambda out: None))
+        monkeypatch.setattr(pr, "generate_image_agnes", self._fake_img(pid))
+        r = pr.run_generate_phase(pid, store)
+        assert r["ok"] is False, r
+        assert "3 次生成未成功" in r["reason"], r["reason"]
+        assert "生成器返回空结果" in r["reason"], r["reason"]
+        att = r["report"][-1]["attempts"]
+        assert len(att) == 3, att
+        assert all(a.get("error") == "生成器返回空结果(无异常)"
+                   for a in att), att
+
+    def test_network_error_takes_priority_over_findings(self, monkeypatch,
+                                                        tmp_path):
+        """异常与 QC 败并存时 reason 以异常为主(更可操作),findings 仍
+        完整落在 attempts 里可查。"""
+        pid = "gen-diag-mix"
+        store = self._seed(pid)
+        state = {"n": 0}
+
+        def _flaky(prompt, duration=5, resolution="720p", work_dir=None,
+                   first_frame=None, last_frame=None, output_path=None,
+                   negative_prompt="", **kw):
+            state["n"] += 1
+            if state["n"] == 1:
+                raise RuntimeError("429 Too Many Requests")
+            out = output_path or str(tmp_path / "f.mp4")
+            import subprocess as _sp
+            _sp.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                     "-i", "testsrc2=duration=3:size=320x240:r=24",
+                     "-c:v", "libx264", "-pix_fmt", "yuv420p", out],
+                    check=True, capture_output=True)
+            return {"ok": True, "output": out, "master_path": ""}
+
+        monkeypatch.setattr(pr, "generate_video_agnes", _flaky)
+        monkeypatch.setattr(pr, "generate_image_agnes", self._fake_img(pid))
+        self._qc_fix_stub(monkeypatch, code="INTERNAL_CUTS")
+        r = pr.run_generate_phase(pid, store)
+        assert r["ok"] is False, r
+        assert "429" in r["reason"], r["reason"]
+        assert "QC:" not in r["reason"], r["reason"]
+        att = r["report"][-1]["attempts"]
+        assert att[0]["error"].startswith("429"), att[0]
+        assert any(f["code"] == "INTERNAL_CUTS"
+                   for a in att for f in a.get("findings") or []), att
+
+
+    def test_real_qc_static_clip_diagnosed(self, monkeypatch, tmp_path):
+        """真 qc_clip 链路:静态图卡(motion=0)三连 STATIC_SLIDESHOW——
+        不用 fake qc,只 stub VLM 网络,证明诊断对真实 QC 败同样成立
+        (S08 logo 卡正是这一类的现实候选)。"""
+        pid = "gen-diag-real"
+        store = self._seed(pid)
+        monkeypatch.setattr(
+            pr, "generate_video_agnes",
+            self._fake_gen_writing_clip(
+                pid, tmp_path,
+                lambda out: {"ok": True, "output": out, "master_path": ""}))
+        # 静态卡:-loop 1 单图 3s,motion_energy=0
+        def _static_gen(prompt, duration=5, resolution="720p", work_dir=None,
+                        first_frame=None, last_frame=None, output_path=None,
+                        negative_prompt="", **kw):
+            import subprocess as _sp
+            img = pr._project_dir(pid) / "S01.jpg"
+            _sp.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                     "-i", "testsrc2=duration=1:size=320x240:r=24",
+                     "-frames:v", "1", str(img)],
+                    check=True, capture_output=True)
+            _sp.run(["ffmpeg", "-y", "-loglevel", "error", "-loop", "1",
+                     "-i", str(img), "-t", "3",
+                     "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                     output_path or str(tmp_path / "f.mp4")],
+                    check=True, capture_output=True)
+            return {"ok": True, "output": output_path, "master_path": ""}
+
+        monkeypatch.setattr(pr, "generate_video_agnes", _static_gen)
+        monkeypatch.setattr(pr, "generate_image_agnes", self._fake_img(pid))
+        # VLM 两调用均不可用(vlm stun):协议失败只进 note,不得伪装 critical
+        from shipin_platform.review import clip_qc as _cq
+        monkeypatch.setattr(_cq, "vlm_same_scene",
+                            lambda *a, **k: {"available": False,
+                                             "reason": "vlm timeout (stub)"})
+        monkeypatch.setattr(_cq, "vlm_morph_check",
+                            lambda *a, **k: {"available": False,
+                                             "reason": "vlm timeout (stub)"})
+        r = pr.run_generate_phase(pid, store)
+        assert r["ok"] is False, r
+        assert "QC: " in r["reason"], r["reason"]
+        assert "STATIC_SLIDESHOW#1" in r["reason"], r["reason"]
+        # 协议失败不得升级成判定:findings 里只有确定性 critical,无 VLM 伪 critical
+        att = r["report"][-1]["attempts"]
+        codes = {f["code"] for a in att for f in a.get("findings") or []}
+        assert "STATIC_SLIDESHOW" in codes, codes
+        assert "REF_VLM_MISMATCH" not in codes, codes
+        assert "MORPH_DETECTED" not in codes, codes
+        # VLM 不可用原因进 note(可解释),不进 critical
+        assert all("vlm timeout" in str(a.get("vlm_note"))
+                   for a in att), att
+
+
 class TestSubtitleWrap:
     """轮44d:§10.6 宽度红线治本——720p@46px 下 10 字旁白烧出来
     63.7%,验收门(轮27)直接打死整条 assemble(E2E 实证)。中文排版惯例

@@ -991,6 +991,11 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                     if net_retries >= 2:
                         break
             if r is None:
+                # 轮45:生成器静默返回空(不抛异常)同样要留痕——否则该
+                # attempt 在 attempts 里无迹可寻,「3 次未成功」连失败
+                # 方式都分不清(网络异常/QC 败/空返回三者不可混淆)
+                attempts.append({"attempt": attempt + 1,
+                                 "error": "生成器返回空结果(无异常)"})
                 continue
             mrec["master"] = r.get("master_path")
             record_cost(project_id, "video", model="agnes-video",
@@ -999,8 +1004,16 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                          expected_duration_sec=dur,
                          reference_image=mrec["first_frame"],
                          use_vlm=True)  # M5(2026-09-21 审计):dHash 盲区用 VLM 补
+            # 轮45:findings 全文进 attempts——旧代码只记 verdict+cuts,
+            # 生成成功但 QC 判 fix 时失败原因(哪条 critical、dHash 多少)
+            # 全部丢弃,E2E 实测「S08 3 次生成未成功」无任何细节不可诊断
             attempts.append({"attempt": attempt + 1, "qc": qc["verdict"],
-                             "cuts": qc["checks"]["internal_cuts"]["value"]})
+                             "cuts": qc["checks"]["internal_cuts"]["value"],
+                             "findings": [
+                                 {"severity": f["severity"], "code": f["code"],
+                                  "message": str(f.get("message", ""))[:200]}
+                                 for f in qc.get("findings") or []],
+                             "vlm_note": qc.get("note")})
             if qc["verdict"] == "ok":
                 generated = True
                 mrec["qc"] = "ok"
@@ -1058,11 +1071,22 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
         report.append({"shot_id": sid, "qc": mrec.get("qc"), "attempts": attempts})
         if mrec.get("qc") != "ok":
             _save(project_id, "manifest.json", manifest)
+            # 轮45:失败原因必须可诊断——网络异常(error)与 QC 败(findings)
+            # 都要带出来,按「异常优先、critical 编码(含 attempt)其次、
+            # VLM 不可用原因兜底」组织,空信息才真是无迹可寻
             _errs = [str(a.get("error"))[:80] for a in attempts
                      if a.get("error")][:2]
+            _crit = []
+            for _a in attempts:
+                for _f in _a.get("findings") or []:
+                    if _f.get("severity") == "critical":
+                        _crit.append(f"{_f.get('code')}#{_a.get('attempt')}")
+            _crit = list(dict.fromkeys(_crit))[:4]
+            _detail = ("; ".join(_errs) if _errs else
+                       ("QC: " + "/".join(_crit) if _crit else ""))
             return {"ok": False, "phase": "generate",
                     "reason": (f"{sid} 3 次生成未成功"
-                               + (f"（{'; '.join(_errs)}）" if _errs else "")
+                               + (f"（{_detail}）" if _detail else "")
                                + "——旧素材/过期 qc 状态不得复用"),
                     "report": report}
 
