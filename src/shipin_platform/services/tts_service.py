@@ -31,6 +31,7 @@ class TtsSegment:
     output_path: str = ""
     duration_sec: float = 0.0
     error: str = ""
+    voice_fallback: str = ""  # 轮54:role_code 回落默认音色的原因(空=正常解析)
 
 
 class TtsService:
@@ -41,22 +42,40 @@ class TtsService:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = db_path
         self._roles: dict[str, CastRole] = {}
+        self._roles_error = ""  # 轮54:角色表加载失败的可诊断原因
         self._load_roles()
 
     def _load_roles(self) -> None:
+        # 轮54(九审 P3-12):db 存在但无 cast_roles 表(半成品库/被外部
+        # 改过)旧代码让 sqlite3.OperationalError 穿透 create_tts_service
+        # → generate 阶段 500 且报错不可诊断。缺表/坏库按「无角色
+        # 配置」降级(build_segment 的默认音色路径照常工作),原因落在
+        # _roles_error 供调用方呈现。
         if not self.db_path.exists():
             return
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
-        for row in conn.execute(
-            "SELECT role_code, edge_voice, rate FROM cast_roles"
-        ):
-            self._roles[row["role_code"]] = CastRole(
-                role_code=row["role_code"],
-                edge_voice=row["edge_voice"],
-                rate=row["rate"] or "0%",
-            )
-        conn.close()
+        conn = None
+        try:
+            conn = sqlite3.connect(str(self.db_path))
+            conn.row_factory = sqlite3.Row
+            for row in conn.execute(
+                "SELECT role_code, edge_voice, rate FROM cast_roles"
+            ):
+                self._roles[row["role_code"]] = CastRole(
+                    role_code=row["role_code"],
+                    edge_voice=row["edge_voice"],
+                    rate=row["rate"] or "0%",
+                )
+        except sqlite3.Error as e:
+            self._roles = {}
+            self._roles_error = (
+                f"cast_roles 加载失败({type(e).__name__}: {e})"
+                "——按无角色配置降级(默认音色)")
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
 
     def get_role(self, role_code: str) -> Optional[CastRole]:
         return self._roles.get(role_code)
@@ -65,13 +84,24 @@ class TtsService:
                       role_code: Optional[str] = None,
                       voice: Optional[str] = None,
                       rate: str = "-6%") -> TtsSegment:
-        """Build a TtsSegment resolving voice from cast_roles DB."""
+        """Build a TtsSegment resolving voice from cast_roles DB.
+
+        轮54(九审 P3-11):指定了 role_code 但库里没有(大小写笔误/空格/
+        改名)时旧代码静默回落默认音色——同角色跨镜换人无任何信号,
+        与 §10.7「同角色同音色」只差一条日志。回落时在段上记
+        voice_fallback,调用方(TTS 报告/节点 meta)可 surfaced。"""
+        fallback = ""
         if voice is None and role_code:
             role = self._roles.get(role_code)
             if role:
                 voice = role.edge_voice
                 rate = role.rate or "-6%"
-        return TtsSegment(shot_id=shot_id, text=text, voice=voice, rate=rate)
+            else:
+                fallback = f"role_code {role_code!r} 未在 cast_roles 配置——回落默认音色"
+        seg = TtsSegment(shot_id=shot_id, text=text, voice=voice, rate=rate)
+        if fallback:
+            seg.voice_fallback = fallback
+        return seg
 
     def list_roles(self) -> list[dict]:
         return [

@@ -1165,6 +1165,15 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                     "reason": ("TTS 合成失败(旧音频已作废,拒绝盖新指纹): "
                                + "; ".join(f"{s.shot_id}:{str(s.error)[:60]}"
                                            for s in _failed[:3]))}
+        # 轮54(九审 P3-11):role_code 回落默认音色(拼写/大小写笔误)不
+        # 静默——同角色跨镜换人违反 §10.7,浮到 generate 响应
+        _voice_fb = [(getattr(x, "shot_id", "?"),
+                      getattr(x, "voice_fallback", ""))
+                     for x in (_synth or [])
+                     if getattr(x, "voice_fallback", "")]
+        if _voice_fb:
+            report.append({"note": "voice_fallback",
+                           "fallbacks": [f"{sid}:{fb}" for sid, fb in _voice_fb[:5]]})
     for s in shots:
         p = _tts_of(s["shot_id"])
         dlg = s.get("dialogue")
