@@ -1613,7 +1613,8 @@ def run_assemble_phase(project_id: str, store) -> dict:
                      for s, t in zip(shots, tl)]}
     from shipin_platform.review.hard_gates import (vlm_review_final,
                                                    check_timeline,
-                                                   check_narration_presence)
+                                                   check_narration_presence,
+                                                   check_narration_content)
     # M7(2026-09-21 审计):成片层的素材复用/时序红线在此自动挂载为硬门,
     # 不再是工厂手动 API 端点。timeline 按 align 窗口构造:每镜一条,
     # at=该镜绝对开始时间、end=start+window,dur=window_sec。
@@ -1655,6 +1656,19 @@ def run_assemble_phase(project_id: str, store) -> dict:
                                      else None)}
                    for s, t in zip(shots, tl)]
     nchk = check_narration_presence(str(work / "final.mp4"), _narr_shots)
+    # 轮46:旁白**内容**符合度(ASR)——存在性门只证明「窗口里有声」,
+    # 这里证明「说的就是剧本这一句」(TTS 串轨/文本漂移的终片层残留)。
+    # 协议失败(无 whisper/模型缺失)判 skip 不并审:不伪造判定也不
+    # 冒充覆盖缺口(与 VLM 层同一分类学)
+    nct = check_narration_content(str(work / "final.mp4"), _narr_shots)
+    nchk["content"] = {"verdict": nct.get("verdict"),
+                       "available": nct.get("available", True),
+                       "stats": nct.get("stats") or {},
+                       "reason": nct.get("reason")}
+    nchk["findings"] = list(nchk.get("findings") or []) + list(
+        nct.get("findings") or [])
+    if any(f.get("severity") == "critical" for f in nchk["findings"]):
+        nchk["verdict"] = "fix"
     _save(project_id, "narration_check.json", nchk)
     out["narration_check"] = {"verdict": nchk.get("verdict"),
                               "findings": nchk.get("findings", [])}

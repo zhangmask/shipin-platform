@@ -20,6 +20,7 @@ allowlist, resolve-and-block private/loopback/link-local IPs, no redirects.
 from __future__ import annotations
 
 import base64
+import difflib
 import ipaddress
 import json
 import os
@@ -296,6 +297,156 @@ def check_narration_presence(video: str, shots: list[dict]) -> dict:
                               for f in findings) else "fix"
     return {"verdict": verdict, "findings": findings,
             "stats": {"checked": checked}}
+
+
+# ── 轮46:每镜旁白**内容**符合度(ASR) ─────────────────────────────
+# check_narration_presence(轮14)只能证明「窗口里有声」,证明不了
+# 「说的就是剧本这一句」:TTS 串轨/换轨/文本漂移时画面照演、声轨
+# 照响,内容对不上剧本(与轮42 修的「新指纹盖旧音频」是同一病族的
+# 终片层残留)。whisper 权重就位(本地缓存 base/tiny)后解除此前
+# 「ASR 内容核查待定」的挂账决策项。
+_NARR_CONTENT_CRIT = 0.45   # 相似度低于此:说的不是这个词(critical)
+_NARR_CONTENT_WARN = 0.65   # 相似度低于此:内容漂移(warning)
+_NARR_CONTENT_PAD = 0.25    # 窗口外扩:ASR 段边界不必与窗口严丝合缝
+
+
+def _norm_text(t: str) -> str:
+    """归一化:小写 + 繁体转简体 + 去空白标点,只留字母数字与 CJK。
+    繁简归一是实测必需:whisper(zh)对简体剧本的转写会吐繁体
+    (「香氣很濃」vs「香气很浓」),短句整句繁简差异可把相似度压低
+    到误报 critical(2026-09-23 真 ASR 校准实测 sim 0.857,短句会更低)。
+    zhconv 缺失时降级为不转换(相似度只会偏保守)。"""
+    try:
+        import zhconv
+        t = zhconv.convert(str(t or ""), "zh-hans")
+    except Exception:
+        t = str(t or "")
+    return "".join(ch for ch in t.lower()
+                   if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+
+
+def _asr_segments_default(video: str) -> list[dict]:
+    """默认 ASR 后端:WhisperService(zh)整片转写,读回 segments。
+    协议失败向上抛由调用方转 available=False——本层绝不吞
+    (静默 None/空 List 冒充审过正是轮45 修掉的病)。"""
+    import json as _json
+    from ..tools.whisper_service import WhisperService
+    tmp = Path(tempfile.mkdtemp(prefix="narr_content_"))
+    try:
+        svc = WhisperService(model=os.environ.get("SHIPIN_ASR_MODEL",
+                                                  "base"),
+                             language="zh")
+        r = svc.transcribe(Path(video), output_dir=tmp,
+                           output_format="json", word_timestamps=False)
+        data = _json.loads(Path(r["json_path"]).read_text(encoding="utf-8"))
+        return [{"start": float(s.get("start") or 0),
+                 "end": float(s.get("end") or 0),
+                 "text": str(s.get("text") or "")}
+                for s in data.get("segments") or []]
+    finally:
+        _cleanup_tmp(tmp)
+
+
+def _shot_voice_text(s: dict) -> tuple[str, str]:
+    """旁白/台词文本提取(轮46 与存在性门同一口径)。
+    返回 (text, kind);无文本返回 ("", "")。"""
+    narration = str(s.get("narration") or "").strip()
+    _dlg = s.get("dialogue")
+    dialogue = (str(_dlg.get("text") or "").strip()
+                if isinstance(_dlg, dict) else str(_dlg or "").strip())
+    if narration:
+        return narration, "旁白"
+    if dialogue:
+        return dialogue, "台词"
+    return "", ""
+
+
+def check_narration_content(video: str, shots: list[dict],
+                            transcriber=None) -> dict:
+    """轮46:每镜旁白内容符合度。返回 verdict ∈ ok|fix|skip:
+    - skip = ASR 协议失败(无 whisper/模型加载/转写异常):available=False,
+      **不得**伪装成判定也不冒充覆盖缺口(与 VLM 层同一分类学);
+    - 窗口内无语音 → 跳过该镜(存在性门的地盘),stats 记账;
+    - 相似度 < CRIT → critical NARRATION_MISMATCH;< WARN → warning
+      NARRATION_DRIFT。
+    transcriber 可注入(测试/替代后端),形如
+    ``f(video) -> [{start, end, text}]``;默认 WhisperService。"""
+    def _skip(reason: str) -> dict:
+        return {"verdict": "skip", "available": False, "findings": [],
+                "reason": reason, "stats": {"checked": 0}}
+
+    # 没有任何文本可核的片子(纯画面镜)直接 ok——不白付 ASR 成本,
+    # 语义与存在性门一致:没有台词的镜头不要求有声
+    if not any(_shot_voice_text(s)[0] for s in shots if isinstance(s, dict)):
+        return {"verdict": "ok", "available": True, "findings": [],
+                "stats": {"checked": 0}}
+
+    if transcriber is None:
+        try:
+            segments = _asr_segments_default(video)
+        except Exception as e:
+            return _skip(f"ASR 不可用(协议失败,非判定): {str(e)[:120]}")
+    else:
+        try:
+            segments = transcriber(video) or []
+        except Exception as e:
+            return _skip(f"ASR 后端不可用(协议失败,非判定): {str(e)[:120]}")
+
+    findings: list[dict] = []
+    checked, skipped_no_speech = 0, 0
+    sims: list[dict] = []
+    for s in shots:
+        if not isinstance(s, dict):
+            continue
+        text, kind = _shot_voice_text(s)
+        if not text:
+            continue
+        raw_at = s.get("narr_at")
+        if raw_at is None:
+            raw_at = s.get("audio_start_sec")
+        try:
+            at = float(raw_at)
+        except (TypeError, ValueError):
+            continue
+        try:
+            tts = float(s.get("tts_sec") or 0)
+        except (TypeError, ValueError):
+            tts = 0.0
+        win = tts if tts > 0.2 else (float(s.get("duration_sec") or 0) or 3.0)
+        a, b = max(at, 0.0), max(at, 0.0) + min(win, 12.0)
+        lo, hi = a - _NARR_CONTENT_PAD, b + _NARR_CONTENT_PAD
+        heard = _norm_text("".join(
+            str(g.get("text") or "") for g in segments
+            if float(g.get("end") or 0) >= lo
+            and float(g.get("start") or 0) <= hi))
+        exp = _norm_text(text)
+        if not exp:
+            continue
+        if not heard:
+            # 窗口内无语音:存在性门(NARRATION_MISSING)的地盘,此处不重复报
+            skipped_no_speech += 1
+            continue
+        checked += 1
+        sim = difflib.SequenceMatcher(None, exp, heard).ratio()
+        sims.append({"shot_id": s.get("shot_id", "?"), "sim": round(sim, 3)})
+        sid = s.get("shot_id", "?")
+        if sim < _NARR_CONTENT_CRIT:
+            findings.append({
+                "severity": "critical", "code": "NARRATION_MISMATCH",
+                "message": (f"镜头{sid} {kind}内容不符:ASR 听到「{heard[:36]}」"
+                            f"」≠ 剧本「{exp[:36]}」(相似度 {sim:.2f} < "
+                            f"{_NARR_CONTENT_CRIT})——说的不是这句词")})
+        elif sim < _NARR_CONTENT_WARN:
+            findings.append({
+                "severity": "warning", "code": "NARRATION_DRIFT",
+                "message": (f"镜头{sid} {kind}内容漂移:相似度 {sim:.2f} "
+                            f"< {_NARR_CONTENT_WARN}(ASR「{heard[:24]}」"
+                            f" vs 剧本「{exp[:24]}」)——可能吞字/串句/ASR 误差")})
+    verdict = ("fix" if any(f["severity"] == "critical" for f in findings)
+               else "ok")
+    return {"verdict": verdict, "available": True, "findings": findings,
+            "stats": {"checked": checked, "skipped_no_speech": skipped_no_speech,
+                      "shots": sims}}
 
 
 def _has_audio_stream(video: str) -> bool:

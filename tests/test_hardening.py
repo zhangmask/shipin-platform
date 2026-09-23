@@ -1497,6 +1497,149 @@ class TestNarrationPresence:
         assert r["stats"]["checked"] == 0
 
 
+class TestNarrationContent:
+    """轮46:每镜旁白**内容**符合度(ASR)——存在性门只证明「窗口里
+    有声」,这里证明「说的就是剧本这一句」。协议失败必须判 skip
+    (available=False),不得伪装成判定也不冒充覆盖缺口。"""
+
+    @staticmethod
+    def _shots(**kw):
+        base = {"shot_id": "S01", "narration": "深夜街角的咖啡香",
+                "narr_at": 0.2, "duration_sec": 2.0}
+        base.update(kw)
+        return [base]
+
+    @staticmethod
+    def _tr(segs):
+        return lambda video: segs
+
+    def test_matching_content_passes(self, tmp_path):
+        from shipin_platform.review.hard_gates import check_narration_content
+        r = check_narration_content(
+            str(tmp_path / "x.mp4"), self._shots(),
+            transcriber=self._tr([{"start": 0.0, "end": 2.0,
+                                   "text": "深夜街角的咖啡香"}]))
+        assert r["verdict"] == "ok", r["findings"]
+        assert r["available"] is True
+        assert r["stats"]["checked"] == 1
+
+    def test_mismatch_is_critical(self, tmp_path):
+        from shipin_platform.review.hard_gates import check_narration_content
+        r = check_narration_content(
+            str(tmp_path / "x.mp4"), self._shots(),
+            transcriber=self._tr([{"start": 0.0, "end": 2.0,
+                                   "text": "今天天气真好我们去公园散步吧"}]))
+        assert r["verdict"] == "fix"
+        hit = next(f for f in r["findings"]
+                   if f["code"] == "NARRATION_MISMATCH")
+        assert hit["severity"] == "critical"
+        assert "深夜街角" in hit["message"], hit
+
+    def test_partial_drift_warns_not_fixes(self, tmp_path):
+        from shipin_platform.review.hard_gates import check_narration_content
+        # 同句中段被换(相似度 0.57,落在 WARN~CRIT 之间):吞尾半是前缀
+        # 匹配 SequenceMatcher 会高估(0.77),必须用中段改写才能测出漂移
+        r = check_narration_content(
+            str(tmp_path / "x.mp4"),
+            self._shots(narration="夜晚的星空很亮"),
+            transcriber=self._tr([{"start": 0.0, "end": 2.0,
+                                   "text": "夜晚的炉火很暖"}]))
+        assert r["verdict"] == "ok", r["findings"]
+        codes = {f["code"] for f in r["findings"]}
+        assert "NARRATION_DRIFT" in codes, codes
+
+    def test_punctuation_and_space_normalized(self, tmp_path):
+        from shipin_platform.review.hard_gates import check_narration_content
+        r = check_narration_content(
+            str(tmp_path / "x.mp4"),
+            self._shots(narration="深夜街角的咖啡香。"),
+            transcriber=self._tr([{"start": 0.0, "end": 2.0,
+                                   "text": "深夜 街角 的，咖啡香"}]))
+        assert r["verdict"] == "ok", r["findings"]
+        assert r["findings"] == [], r["findings"]
+
+    def test_traditional_asr_does_not_false_critical(self, tmp_path):
+        """真 ASR 校准实测(2026-09-23):whisper(zh)对简体剧本吐繁体
+        转写——繁简不归一会把短句相似度压低到误报 critical。床头灯
+        级别的回归:6 字简体剧本 vs 全繁体转写必须 still ok。"""
+        from shipin_platform.review.hard_gates import check_narration_content
+        r = check_narration_content(
+            str(tmp_path / "x.mp4"),
+            self._shots(narration="咖啡香气很浓"),
+            transcriber=self._tr([{"start": 0.0, "end": 2.0,
+                                   "text": "咖啡香氣很濃"}]))
+        assert r["verdict"] == "ok", r["findings"]
+
+    def test_transcriber_protocol_failure_skips(self, tmp_path):
+        """协议失败 ≠ 判定:verdict=skip、零 findings、不得逼出 fix。"""
+        from shipin_platform.review.hard_gates import check_narration_content
+
+        def _boom(video):
+            raise RuntimeError("whisper model load failed")
+
+        r = check_narration_content(str(tmp_path / "x.mp4"), self._shots(),
+                                    transcriber=_boom)
+        assert r["verdict"] == "skip"
+        assert r["available"] is False
+        assert r["findings"] == []
+        assert "协议失败" in r["reason"]
+
+    def test_default_backend_failure_also_skips(self, tmp_path,
+                                                monkeypatch):
+        """默认后端(WhisperService)协议失败同样 skip——monkeypatch 掉
+        _asr_segments_default 避免真加载模型。"""
+        from shipin_platform.review import hard_gates as hg
+
+        def _boom(video):
+            raise ImportError("No module named 'whisper'")
+
+        monkeypatch.setattr(hg, "_asr_segments_default", _boom)
+        r = hg.check_narration_content(str(tmp_path / "x.mp4"),
+                                       self._shots())
+        assert r["verdict"] == "skip" and r["available"] is False
+        assert r["findings"] == []
+
+    def test_no_text_film_skips_asr_entirely(self, tmp_path):
+        """纯画面镜不付 ASR 成本,也不会把 ASR 缺失算成问题。"""
+        from shipin_platform.review.hard_gates import check_narration_content
+        called = []
+
+        def _spy(video):
+            called.append(video)
+            raise AssertionError("不应调用 ASR")
+
+        r = check_narration_content(
+            str(tmp_path / "x.mp4"),
+            [{"shot_id": "S08", "narration": "", "narr_at": 4.0,
+              "duration_sec": 2.0}], transcriber=_spy)
+        assert r["verdict"] == "ok" and called == []
+
+    def test_window_without_speech_skipped_not_reported(self, tmp_path):
+        """窗口内无语音 → 存在性门的地盘,内容门只记账不报 finding。"""
+        from shipin_platform.review.hard_gates import check_narration_content
+        r = check_narration_content(
+            str(tmp_path / "x.mp4"), self._shots(),
+            transcriber=self._tr([{"start": 8.0, "end": 10.0,
+                                   "text": "别的话"}]))
+        assert r["verdict"] == "ok"
+        assert r["stats"]["skipped_no_speech"] == 1
+        assert r["findings"] == []
+
+    def test_dialogue_only_checked(self, tmp_path):
+        from shipin_platform.review.hard_gates import check_narration_content
+        r = check_narration_content(
+            str(tmp_path / "x.mp4"),
+            [{"shot_id": "S03", "narration": "", "narr_at": 0.2,
+              "duration_sec": 2.0,
+              "dialogue": {"role": "女主", "text": "这杯咖啡真暖"}}],
+            transcriber=self._tr([{"start": 0.0, "end": 2.0,
+                                   "text": "完全不搭边的一句话"}]))
+        assert r["verdict"] == "fix"
+        hit = next(f for f in r["findings"]
+                   if f["code"] == "NARRATION_MISMATCH")
+        assert "台词内容不符" in hit["message"], hit
+
+
 class TestTempHygiene:
     """轮19(磁盘打满事故回归):审查调用结束后不得在 TEMP 遗留抽帧/
     身份判定临时目录。事故实证:真实审查一晚泄漏 2540 个目录/2.7G,
