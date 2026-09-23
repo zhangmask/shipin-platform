@@ -1,6 +1,7 @@
 """Subtitle renderer tests — the timestamp + ASS-generation functions that
 were fixed (×10 ms bug, invalid ASS output, no rollover carry)."""
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -121,6 +122,59 @@ class TestGenerateAssFromSrt:
         style_line = next(l for l in content.splitlines()
                           if l.startswith("Style: Default,"))
         assert len(style_line.split(",")) == 23
+
+    def test_playres_matches_video_size(self, tmp_path):
+        """轮53:PlayResX/Y 必须等于视频尺寸——libass 的 FontSize 是脚本
+        分辨率单位,ffmpeg 内部 SRT→ASS 的默认画布下 46px 会渲染成
+        ~86px(实测 1.9×),短行字幕超宽、§10.6 验收每次都拦。"""
+        srt = tmp_path / "a.srt"
+        srt.write_text(SRT_FIXTURE, encoding="utf-8")
+        ass = generate_ass_from_srt(srt, tmp_path / "a.ass", "",
+                                    width=1280, height=720)
+        content = ass.read_text(encoding="utf-8")
+        assert "PlayResX: 1280" in content
+        assert "PlayResY: 720" in content
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not available")
+class TestAssRenderScale:
+    """轮53 真渲染回归:E2E 第 8/9 次挂在「字幕验收 63.7%>62%」,
+    根因不是折行预算而是 **libass 策略把 46px 渲染成 ~86px**(1.9×)
+    ——ffmpeg 内部 SRT→ASS 画布与视频尺寸无关。修:转 PlayRes=视频
+    尺寸的 ASS 再烧。这里钉住渲染墨迹宽,防缩放病复发(1.9× 时短行
+    width_pct≈63%,正常时应 ≤55%)。"""
+
+    def _render_and_measure(self, tmp_path, text, w=1280, h=720, fs=46):
+        import subprocess
+        from shipin_platform.tools.subtitle_renderer import (
+            measure_text_px, render_subtitles_best)
+        base = tmp_path / "base.mp4"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                        "-i", f"color=c=black:s={w}x{h}:r=24:d=3",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(base)],
+                       check=True, capture_output=True)
+        srt = tmp_path / "t.srt"
+        srt.write_text(f"1\n00:00:00,000 --> 00:00:03,000\n{text}\n",
+                       encoding="utf-8")
+        r = render_subtitles_best(str(base), str(srt),
+                                  str(tmp_path / "fg.mp4"),
+                                  font_size=fs, margin_v=96, mode="subtitle")
+        assert r.get("ok"), r
+        cues = r.get("cues") or []
+        assert cues and cues[0].get("measured"), cues
+        pil = measure_text_px(text, fs) or 0
+        return cues[0]["width_pct"], pil
+
+    def test_short_line_not_rendered_oversized(self, tmp_path):
+        """短行(10 字)渲染宽度必须 <55%——1.9× 病态下是 63%+。"""
+        pct, pil = self._render_and_measure(tmp_path, "加班后的倦，无人诉说")
+        assert pct < 55.0, (pct, pil)
+
+    def test_long_line_within_budget(self, tmp_path):
+        """17 字长行(折行预算的极限形态)渲染后也必须 <55%。"""
+        pct, pil = self._render_and_measure(
+            tmp_path, "加班后的倦意涌上心头却无人可以诉说")
+        assert pct < 55.0, (pct, pil)
 
     def test_custom_style_applied(self, tmp_path):
         srt = tmp_path / "a.srt"

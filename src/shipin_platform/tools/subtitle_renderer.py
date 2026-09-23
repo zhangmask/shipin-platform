@@ -101,9 +101,15 @@ def _format_ass_ts(seconds: float) -> str:
     return f"{hours}:{minutes:02d}:{secs:02d}.{centis:02d}"
 
 
-def generate_ass_from_srt(srt_path: Path, ass_path: Path, style: str) -> Path:
+def generate_ass_from_srt(srt_path: Path, ass_path: Path, style: str,
+                           width: int = 1920, height: int = 1080) -> Path:
     """Convert SRT to ASS with a force_style string (same format as
-    build_ass_style output, e.g. "FontName=...,FontSize=...")."""
+    build_ass_style output, e.g. "FontName=...,FontSize=...").
+
+    轮53:width/height 写入 PlayResX/PlayResY——libass 的 FontSize 是
+    **脚本分辨率**单位,烧到不同尺寸视频时必须让 PlayRes 等于视频尺寸,
+    否则字号被缩放(实测 ffmpeg 内部 SRT→ASS 默认画布下 46px 渲染成
+    ~86px,短行字幕超宽 1.9×,§10.6 验收每次都拦)。"""
     import re
     srt_content = srt_path.read_text(encoding="utf-8")
     blocks = re.findall(
@@ -140,8 +146,8 @@ def generate_ass_from_srt(srt_path: Path, ass_path: Path, style: str) -> Path:
     ass_header = f"""[Script Info]
 Title: Auto-generated from SRT
 ScriptType: v4.00+
-PlayResX: 1920
-PlayResY: 1080
+PlayResX: {int(width)}
+PlayResY: {int(height)}
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
@@ -604,14 +610,24 @@ def render_subtitles_best(video_path, srt_path, output_path,
     out.parent.mkdir(parents=True, exist_ok=True)
 
     def _run_subtitle_pass():
-        src_path = karaoke_ass if karaoke_ass is not None else srt
-        srt_esc = escape_subtitles_path(src_path)
-        # karaoke ASS 自带逐词高亮样式，force_style 会覆盖 SecondaryColour
-        # 抹掉点亮效果；普通 SRT 才需要 force_style 强制字体。
-        vf = (f"subtitles='{srt_esc}'"
-              if karaoke_ass is not None else
-              f"subtitles='{srt_esc}':force_style='"
-              f"{build_ass_style(font_name='Microsoft YaHei', font_size=font_size, margin_v=margin_v)}'")
+        # 轮53:SRT 直接喂 ffmpeg 的 subtitles= 时,内部 SRT→ASS 转换的
+        # 画布与视频尺寸无关 → FontSize 被放大 ~1.9×(实测 46px 渲染成
+        # ~86px),短行字幕超宽、§10.6 验收每次都拦。改为先转成
+        # PlayRes=视频尺寸的 ASS 再烧——libass 的 FontSize 即视频像素,
+        # 与 drawtext/PIL 度量一致(ratio≈1.0)。
+        if karaoke_ass is not None:
+            src_path = karaoke_ass  # karaoke 自带样式,不 force_style
+            # (\k 逐词点亮的 SecondaryColour 会被 force_style 抹掉)
+            vf = f"subtitles='{escape_subtitles_path(src_path)}'"
+        else:
+            ass_path = out.parent / f"._{out.stem}.ass"
+            generate_ass_from_srt(
+                srt, ass_path,
+                build_ass_style(font_name="Microsoft YaHei",
+                                font_size=font_size, margin_v=margin_v),
+                width=w, height=h)
+            src_path = ass_path
+            vf = f"subtitles='{escape_subtitles_path(src_path)}'"
         r = _subprocess.run(
             ["ffmpeg", "-y", "-i", str(video),
              "-vf", vf,
