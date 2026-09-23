@@ -156,7 +156,10 @@ def _platform_from_aspect(w: int, h: int) -> str:
 
 
 def _tone_hint(pacing: str, narration: dict, black_ratio: float) -> str:
-    speech = narration.get("speech_ratio", 0.0)
+    # 轮57:speech_ratio=None(无音轨)不可推断——不进任何旁白相关判据
+    speech = narration.get("speech_ratio")
+    if speech is None:
+        return "中性,以参考片为准(参考片无音轨)"
     if str(pacing) == "fast" and speech >= 0.6:
         return "快节奏强信息(密集旁白)"
     if str(pacing) == "slow" and black_ratio >= 0.05:
@@ -183,11 +186,12 @@ def build_brief_prefill(metadata: dict, pacing: dict, black: dict,
                         source_path: str = "") -> dict:
     """剖析结果 → 9 维 brief 预填(三态) + 来源说明。"""
     dur = round(float(metadata.get("duration_sec", 0.0) or 0.0))
-    speech = narration.get("speech_ratio", 0.0)
+    # 轮57:None(无音轨)= 不可推断,不参与高旁白判定
+    speech = narration.get("speech_ratio")
     bl = black.get("ratio", 0.0)
     pace_label = str(pacing.get("label", "medium"))
 
-    if speech >= 0.7 and bl < 0.05 and scene_count <= 6:
+    if speech is not None and speech >= 0.7 and bl < 0.05 and scene_count <= 6:
         content_type, content_note = "talking_head", "高旁白 + 少黑场 + 少镜头 → 口播"
     elif bl >= 0.12:
         content_type, content_note = "product", "黑场占比大 → 产品片(黑底硬切)"
@@ -243,7 +247,13 @@ def profile_reference(video_path: str | Path, *,
     black_segs = _black_segments(path)
     black = black_stats(black_segs, duration)
     silences = _silence_segments(path) if meta.get("has_audio") else []
-    narr = _narration_density(silences, duration)
+    # 轮57(真实使用发现,子智能体 C):无音轨视频旧代码 silences=[] →
+    # speech_ratio=1.0「密集旁白」,brief_prefill 误判 talking_head。
+    # 无音轨 = 不可推断(该维 no_audio),不是 100% 语音。
+    narr = (_narration_density(silences, duration) if meta.get("has_audio")
+            else {"speech_ratio": None, "silence_count": 0,
+                  "silence_total_sec": 0.0, "longest_silence": 0.0,
+                  "density": "no_audio"})
 
     prefill = build_brief_prefill(
         meta, pacing, black, narr, scene_count, source_path=path)
@@ -262,8 +272,10 @@ def profile_reference(video_path: str | Path, *,
         "summary": (
             f"参考视频 {duration:.1f}s;{scene_count} 镜,节奏 "
             f"{pacing.get('label', '?')};黑场 {black['count']} 段"
-            f"({black['ratio'] * 100:.0f}%);旁白活跃 {narr['speech_ratio'] * 100:.0f}%"
-            f";预填 {sum(1 for d in prefill.values() if d['state'] == 'filled')}/9 维"),
+            f"({black['ratio'] * 100:.0f}%);"
+            + (f"旁白活跃 {narr['speech_ratio'] * 100:.0f}%"
+               if narr.get("speech_ratio") is not None else "参考片无音轨")
+            + f";预填 {sum(1 for d in prefill.values() if d['state'] == 'filled')}/9 维"),
     }
 
     result = {"ok": True, "report": report,

@@ -61,6 +61,12 @@ class TaskStore:
         self._pool = ThreadPoolExecutor(max_workers=max_workers)
         self._fns: dict[str, Callable[[], dict]] = {}
         self._lock = threading.Lock()
+        # 轮57(真实使用发现,子智能体 C):同项目互斥的检查-插入竞态——
+        # active_task_for() 查库与 INSERT 之间无锁,2 线程同项目并发
+        # 提交会双双 202(实测 3 轮 2 轮双放行)——正是互斥要防的
+        # 「两个 assemble 并发写同一目录」。单进程部署(start.sh/
+        # Dockerfile 均无 --workers)下进程内锁足以消除窗口。
+        self._submit_lock = threading.Lock()
         self._init_schema()
         self._hb_stop = threading.Event()
         self._hb_thread = threading.Thread(
@@ -132,26 +138,30 @@ class TaskStore:
                     allow_project_overlap: bool = False) -> dict:
         task_id = uuid.uuid4().hex
         now = _now_iso()
-        # 轮56(十审 P1-4):同项目互斥——已有活跃任务时拒绝(TaskConflict,
-        # 调用方翻译 409),不让两个 generate/assemble 并发写同一项目
-        # 目录。allow_project_overlap 给确需并发的内部场景显式逃逸。
-        if not allow_project_overlap:
-            active = self.active_task_for(project_id)
-            if active is not None:
-                raise TaskConflict(
-                    f"项目 {project_id} 已有进行中的任务 "
-                    f"{active['task_id']}({active['kind']}/"
-                    f"{active['status']})——同项目互斥,等它结束后再提交")
-        with self._lock:
-            self._fns[task_id] = fn
-        with self._conn() as conn:
-            conn.execute(
-                """INSERT INTO tasks (task_id, kind, project_id, caller,
-                                      status, max_retries, heartbeat_at,
-                                      created_at)
-                   VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)""",
-                (task_id, kind, project_id, caller, self.max_retries,
-                 now, now))
+        # 轮56(十审 P1-4) + 轮57(真实使用发现,子智能体 C):同项目互斥
+        # ——已有活跃任务时拒绝(TaskConflict,调用方翻译 409),不让两个
+        # generate/assemble 并发写同一项目目录。检查+插入整体持
+        # _submit_lock:旧代码两步之间无锁,并发提交可双双通过检查
+        # (实测 3 轮 2 轮双 202)。allow_project_overlap 给确需并发的
+        # 内部场景显式逃逸。
+        with self._submit_lock:
+            if not allow_project_overlap:
+                active = self.active_task_for(project_id)
+                if active is not None:
+                    raise TaskConflict(
+                        f"项目 {project_id} 已有进行中的任务 "
+                        f"{active['task_id']}({active['kind']}/"
+                        f"{active['status']})——同项目互斥,等它结束后再提交")
+            with self._lock:
+                self._fns[task_id] = fn
+            with self._conn() as conn:
+                conn.execute(
+                    """INSERT INTO tasks (task_id, kind, project_id, caller,
+                                          status, max_retries, heartbeat_at,
+                                          created_at)
+                       VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)""",
+                    (task_id, kind, project_id, caller, self.max_retries,
+                     now, now))
         self._pool.submit(self._execute, task_id)
         return self.task_status(task_id)
 

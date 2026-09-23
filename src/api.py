@@ -460,10 +460,14 @@ def project_confirm(req: ConfirmRequest, request: Request):
                                            note=req.note)
     except StageGateError as e:
         raise _gate_error_response(e)
+    # 轮57(真实使用发现,子智能体 A):next_action 不许指向 guide 明令
+    # agent 禁直调的底层端点(/api/generate/image、/api/generate/agnes-
+    # video)——受控入口是 /api/pipeline/{phase},底层端点只用于手工链。
+    # 另:confirm brief 的旧提示「生成剧本」时序含糊,改为受控入口。
     next_map = {
-        "brief": "next: POST /api/review/iterate (stage=script)，生成剧本",
-        "script": "next: 展示剧本摘要→确认后 POST /api/review/iterate (stage=storyboard)",
-        "storyboard": "next: /api/generate/image 逐镜首帧 → /api/generate/agnes-video (带 first_frame)",
+        "brief": "next: POST /api/pipeline/text {project_id, brief}（受控阶段一,内部完成 script/storyboard 生成与评审）",
+        "script": "next: 展示剧本摘要→确认后 POST /api/pipeline/text 继续（或由用户确认 storyboard 闸门）",
+        "storyboard": "next: POST /api/pipeline/generate {project_id}（受控阶段二:首帧图→锚定视频→QC→TTS→对齐）",
     }
     return {**result, "next_action": next_map.get(req.gate, "")}
 
@@ -1050,7 +1054,7 @@ def agent_guide():
             {"step": 1, "action": "POST /api/intake/questions", "note": "子问题清单：用自然语言向用户收集创意意图"},
             {"step": 2, "action": "POST /api/intake/draft", "note": "把用户回答组装成 brief JSON（缺失维度自动给默认值+标记）"},
             {"step": 3, "action": "POST /api/pipeline/text {project_id, brief}", "note": "受控阶段一（替代手工 review/iterate+LLM 写稿）：服务端例行 LLM 生成 brief审核→剧本→分镜→提示词，全部内嵌 review 循环；不收敛返回 blocked 与原因，逐字转述，禁止自行修改 JSON"},
-            {"step": 4, "action": "POST /api/project/confirm {project_id, gate, decision}", "note": "唯一人工闸门：script/storyboard 双确认，未确认任何下游都是 409 BLOCKED；上报给用户决策，代理不得代确认"},
+            {"step": 4, "action": "POST /api/project/confirm {project_id, gate, decision}", "note": "人工闸门:script/storyboard 双确认是 generate 的硬闸;**brief 确认是 pipeline/text 的硬闸(第三个闸门,未确认 brief 直接 409)**。全部上报用户决策,代理不得代确认"},
             {"step": 5, "action": "POST /api/pipeline/generate {project_id}", "note": "受控阶段二：首帧图→首尾帧链式策略→锚定视频→逐镜 QC（重试≤2）→TTS→旁白对齐，全确定性"},
             {"step": 6, "action": "POST /api/pipeline/assemble {project_id}", "note": "受控阶段三：对齐→落版卡→转场（链式=硬切/跳变=dissolve）→调色→字幕→声音设计（BGM 闪避+切点音效）→mux→归一化→双层终验→RELEASED"},
             {"step": 7, "action": "GET /api/pipeline/{project_id}/report", "note": "只读快照：阶段状态/确认闸门/manifest（首尾帧策略/逐镜 QC）/对齐结果；向用户展示从这里取数，不猜"},
@@ -1076,6 +1080,8 @@ def agent_guide():
             {"method": "POST", "path": "/api/audio/normalize", "body": {"input_audio": "...", "output_audio": "...", "target_lufs": -14.0}, "returns": "ok/measured_lufs"},
             {"method": "POST", "path": "/api/video/probe", "body": {"path": "..."}, "returns": "codec/resolution/fps/duration/audio"},
             {"method": "POST", "path": "/api/video/black-detect", "body": {"path", "min_dur"}, "returns": "[{start,end}]"},
+            {"method": "POST", "path": "/api/pipeline/{project_id}/restore", "body": {"stage": "brief|script|storyboard|image_prompt|video_prompt", "version": 1}, "returns": "ok/stage/version/hash/invalidated/next_action —— 轮57:破坏性回滚(dvc checkout 语义):写回旧版产物→该阶段重置待重跑+确认清除→下游全部 BLOCKED。唯一恢复路径见 next_action:调预算→重跑 pipeline/text 重建下游→重新 confirm→generate。回滚是全责操作,调用前必须向用户说明后果"},
+            {"method": "GET", "path": "/api/pipeline/{project_id}/versions/{stage}", "body": {}, "returns": "该阶段全部版本索引(v/hash/ts/caller);GET /versions/{stage}/{n} 取内容"},
         ],
         "review_contract": {
             "stages": ["brief", "script", "storyboard", "image_prompt", "video_prompt"],
@@ -2294,7 +2300,20 @@ def pipeline_generate(req: PipelineRunRequest, request: Request):
     _enforce_budget(req.project_id, store)
     store.record_event(req.project_id, "phase_started",
                        "阶段二 generate 启动（首帧/链式视频/TTS）", stage="video_gen")
-    r = run_generate_phase(req.project_id, store)
+    try:
+        r = run_generate_phase(req.project_id, store)
+    except ValueError as e:
+        # 轮55 的 id 白名单与参数类 ValueError:422(带原文)
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:  # noqa: BLE001 - 基础设施失败结构化,不裸 500
+        from shipin_platform.generation import local_media as _lm
+        if isinstance(e, _lm.LocalMediaError):
+            raise HTTPException(status_code=502, detail={
+                "code": "MEDIA_BACKEND_UNREACHABLE",
+                "message": str(e)[:200],
+                "next_action": ("检查同节点本地媒体服务(h3api/DGX,"
+                                "默认 127.0.0.1:9023)或改 SHIPIN_MEDIA_BACKEND=auto 重试")})
+        raise
     store.record_event(req.project_id, "phase_finished",
                        f"阶段二 generate 结束：{'ok' if r.get('ok') else 'failed'}",
                        stage="video_gen",
@@ -2654,9 +2673,16 @@ class RestoreRequest(BaseModel):
 
 
 @app.post("/api/pipeline/{project_id}/restore")
-def pipeline_restore(project_id: str, req: RestoreRequest):
+def pipeline_restore(project_id: str, req: RestoreRequest, request: Request):
     """P2 回滚（dvc checkout 语义）：写回旧版产物 → 清确认 → 闸门重置 →
-    下游全部失效 → 事件留痕。与 rewrite 同款「改完旧链条不再花钱」栅栏。"""
+    下游全部失效 → 事件留痕。与 rewrite 同款「改完旧链条不再花钱」栅栏。
+
+    轮57(真实使用发现,子智能体 A):(1) 旧代码 detail 里的 caller 记的是
+    **版本创建者**(entry.caller)而非本次回滚者,共享环境下无法归属——
+    改记真实 principal;(2) 响应只说「重新确认后再跑」没说路径——回滚后
+    该阶段 PENDING 且无直接改回的 API,唯一恢复路径是重跑 pipeline/text
+    重建下游(要花钱、可能被预算挡)。把这些写进 next_action,运营/agent
+    不用考古。"""
     from shipin_platform.services.artifact_store import (
         TRACKED_STAGES, read_version)
     from shipin_platform.orchestration.pipeline_runner import _project_dir, _save
@@ -2670,6 +2696,8 @@ def pipeline_restore(project_id: str, req: RestoreRequest):
     except StageGateError:
         raise HTTPException(status_code=404,
                             detail=f"project not found: {project_id}")
+    principal = getattr(getattr(request, "state", None), "principal", None)
+    caller = principal.caller if principal is not None else "anonymous"
     entry, content = read_version(_project_dir(project_id), req.stage,
                                   req.version)
     if entry is None or content is None:
@@ -2684,10 +2712,17 @@ def pipeline_restore(project_id: str, req: RestoreRequest):
         project_id, "stage_restored",
         f"回滚 {req.stage} 到 v{req.version}（hash {entry['hash'][:12]}…）",
         stage=req.stage,
-        detail=f"caller={entry.get('caller') or 'auto'}；"
+        detail=f"caller={caller}(版本创建者={entry.get('caller') or 'auto'})；"
                f"下游 {n} 个阶段已失效 → 重新确认后再跑")
     return {"ok": True, "stage": req.stage, "version": req.version,
-            "hash": entry["hash"], "invalidated": n, "event": ev}
+            "hash": entry["hash"], "invalidated": n, "event": ev,
+            "next_action": (
+                f"回滚后 {req.stage} 已重置为待重跑、下游 {n} 个阶段 BLOCKED。"
+                f"恢复路径(唯一):① 如预算不足先 POST /api/pipeline/"
+                f"{project_id}/budget 调整上限 → ② POST /api/pipeline/text "
+                f"{{project_id, brief}} 基于回滚后的 {req.stage} 重建下游 → "
+                f"③ 重新 confirm script/storyboard → ④ generate/assemble。"
+                f"跳过的后果:拿着与 {req.stage} 不一致的下游产物直接出片")}
 
 
 @app.post("/api/pipeline/{project_id}/budget")

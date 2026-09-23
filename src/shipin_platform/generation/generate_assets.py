@@ -30,6 +30,41 @@ _IMG_HOSTS = frozenset({"cos-platform-outputs.agnes-ai.cn",
 })
 
 
+# ---------------------------------------------------------------------------
+# 本地 DGX 后端分流（ZCode 集成）
+#   SHIPIN_MEDIA_BACKEND=local|agnes|auto；model 传 "local:<引擎>" 也可强制本地。
+# ---------------------------------------------------------------------------
+
+def _local_backend(model: str = "") -> bool:
+    """是否走本地 DGX 媒体后端（h3api）。"""
+    if str(model or "").lower().startswith(("local:", "dgx:")):
+        return True
+    mode = os.environ.get("SHIPIN_MEDIA_BACKEND", "auto").strip().lower()
+    if mode == "local":
+        return True
+    if mode == "agnes":
+        return False
+    try:
+        from shipin_platform.generation import local_media
+        return local_media.api_reachable()
+    except Exception:
+        return False
+
+
+def _local_engine(model: str, kind: str) -> str:
+    """从 "local:zimage" 或默认 env 解析本地引擎名。"""
+    m = str(model or "").lower()
+    if ":" in m:
+        return m.split(":", 1)[1]
+    env = {"image": "SHIPIN_LOCAL_IMAGE_ENGINE",
+           "video": "SHIPIN_LOCAL_VIDEO_ENGINE",
+           "tts": "SHIPIN_LOCAL_TTS_ENGINE",
+           "music": "SHIPIN_LOCAL_MUSIC_ENGINE"}.get(kind, "")
+    defaults = {"image": "zimage", "video": "h3", "tts": "vibevoice",
+                "music": "music3"}
+    return os.environ.get(env, defaults.get(kind, ""))
+
+
 def _agnes_creds(capability: str = "") -> tuple[str, str]:
     """Read Agnes credentials at CALL time via provider registry.
 
@@ -113,7 +148,21 @@ def generate_image_pil(prompt: str, width: int, height: int, out: str) -> dict:
 
 def generate_image_agnes(prompt: str, width: int, height: int, out: str,
                          model: str = "agnes-image-2.5-flash") -> dict:
-    """Generate image via Agnes AI (OpenAI-compatible /v1/images/generations)."""
+    """Generate image via Agnes AI (OpenAI-compatible /v1/images/generations).
+
+    本地模式（SHIPIN_MEDIA_BACKEND=local 或 model 以 local:/dgx: 开头）时，
+    改由同节点的 DGX 模型（Z-Image / Qwen-Image-2.1 / FLUX.2 / Krea-2）
+    经 h3api 生成；auto 模式下本地不可达则回退云端。
+    """
+    if _local_backend(model):
+        from shipin_platform.generation import local_media
+        try:
+            return local_media.local_image(
+                prompt, width, height, out,
+                engine=_local_engine(model, "image"))
+        except local_media.LocalMediaError:
+            if os.environ.get("SHIPIN_MEDIA_BACKEND", "auto") == "local":
+                raise
     key, base = _agnes_creds("image")
     if not key:
         raise ValueError("AGNES_KEY not configured")
@@ -207,7 +256,25 @@ def generate_video_agnes(prompt: str, model: str = "agnes-video-2.5-flash",
     首尾帧锚定是『单镜头内不再私开子镜头』的关键约束——分镜的每个镜头
     必须优先双图锚定；只有用户显式豁免（allow_unanchored）才允许纯
     文生视频，且结果里会带 unanchored 警告。
+
+    本地模式（SHIPIN_MEDIA_BACKEND=local 或 model 以 local:/dgx: 开头）时，
+    改由同节点的 DGX 模型（MiniMax-H3 / Wan 2.2）经 h3api 生成；auto 模式
+    下本地不可达则回退云端。
     """
+    if _local_backend(model):
+        from shipin_platform.generation import local_media
+        try:
+            return local_media.local_video(
+                prompt=prompt,
+                out=output_path or str((work_dir or Path(".")) / "local_video.mp4"),
+                first_frame=first_frame or "",
+                last_frame=last_frame or "",
+                duration=int(duration),
+                engine=_local_engine(model, "video"))
+        except local_media.LocalMediaError:
+            if os.environ.get("SHIPIN_MEDIA_BACKEND", "auto") == "local":
+                raise
+
     import time
     import requests as _req
     key, base = _agnes_creds("video")

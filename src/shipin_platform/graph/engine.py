@@ -145,7 +145,10 @@ def new_graph(name: str) -> dict:
 
 # ---------------------------------------------------------------- 校验
 def _cycle_members(g: dict) -> list[str]:
-    node_ids = [n["id"] for n in g.get("nodes", [])]
+    # 轮57:只收有 id 的节点——缺 id 的畸形节点由 validate_graph 报
+    # 「缺少 id 字段」,这里不再裸 KeyError(旧行为 500)
+    node_ids = [n["id"] for n in g.get("nodes", [])
+                if isinstance(n, dict) and n.get("id")]
     indeg = {nid: 0 for nid in node_ids}
     for e in g.get("edges", []):
         t = e.get("to")
@@ -166,10 +169,20 @@ def _cycle_members(g: dict) -> list[str]:
 
 def validate_graph(g: dict) -> list[str]:
     errs: list[str] = []
-    nodemap = {n["id"]: n for n in g.get("nodes", [])}
+    # 轮57(真实使用发现,子智能体 B):节点缺 id/type 字段时旧代码
+    # n["id"]/get_def(f["type"]) 裸 KeyError → 500(PUT 路径应 422
+    # INVALID_GRAPH)。这里一律转可读 err,与未知类型同款处理。
+    nodes = [n for n in g.get("nodes", []) if isinstance(n, dict)]
+    nodemap = {n["id"]: n for n in nodes if n.get("id")}
     seen_ids: set[str] = set()
     seen_edges: set[tuple] = set()
-    for n in g.get("nodes", []):
+    for idx, n in enumerate(g.get("nodes", [])):
+        if not isinstance(n, dict):
+            errs.append(f"节点 #{idx} 不是对象: {n!r}")
+            continue
+        if not n.get("id"):
+            errs.append(f"节点 #{idx} 缺少 id 字段")
+            continue
         if n["id"] in seen_ids:
             errs.append(f"重复节点 id: {n['id']}")
         seen_ids.add(n["id"])
@@ -184,7 +197,11 @@ def validate_graph(g: dict) -> list[str]:
         if not f or not t:
             errs.append(f"边指向未知节点: {e}")
             continue
-        fdef, tdef = get_def(f["type"]), get_def(t["type"])
+        try:
+            fdef, tdef = get_def(f["type"]), get_def(t["type"])
+        except KeyError:
+            errs.append(f"边端点类型未注册: {e}")
+            continue
         fport = next((p for p in fdef.outputs if p.name == e.get("from_port")), None)
         tport = next((p for p in tdef.inputs if p.name == e.get("to_port")), None)
         if not fport or not tport:
@@ -205,6 +222,13 @@ def _nodemap(g: dict) -> dict[str, dict]:
     return {n["id"]: n for n in g.get("nodes", [])}
 
 
+def _upstream_of(g: dict, node_id: str) -> list[str]:
+    """轮57:直接上游节点 id(有边指向 node_id 的源)——run_all 的
+    跳过判定用(上游失败则本节点 skipped)。"""
+    return [e.get("from") for e in g.get("edges", [])
+            if e.get("to") == node_id and e.get("from")]
+
+
 def _edge_value(graph: dict, node_id: str, port: str,
                 nodemap: dict[str, dict]) -> Any:
     for e in graph.get("edges", []):
@@ -215,6 +239,26 @@ def _edge_value(graph: dict, node_id: str, port: str,
             if v is not None:
                 return v
     return None
+
+
+def _param_text(v: Any) -> str:
+    """轮57(真实使用发现,子智能体 B):节点参数的文本化。
+
+    旧代码对 params 值裸 str():dict/list 被 Python repr 化
+    ("{'a': 1}" 单引号形态)静默注入下游提示词/剧本正文,数字也会
+    变成 "12345"。这里:str 原样;dict/list → JSON(ensure_ascii=False,
+    双引号标准形态,LLM/渲染器都不会误解);其余 → str()。仍不做
+    schema 级拒尽(那是 NodeCreate 的 TODO),但消灭 repr 注入。"""
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (dict, list)):
+        try:
+            return json.dumps(v, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(v)
+    return str(v)
 
 
 def resolved_input(graph: dict, node: dict, port_name: str,
@@ -260,24 +304,25 @@ def node_input_hash(graph: dict, node: dict, nodemap: dict[str, dict]) -> str:
 # ---------------------------------------------------------------- 执行器
 def _exec_text(graph: dict, node: dict, nodemap: dict[str, dict]) -> dict:
     txt = resolved_input(graph, node, "text", nodemap)
-    return {"kind": "text", "value": str(txt or "")}
+    # 轮57:走 _param_text(拒绝 repr 注入),见该函数注释
+    return {"kind": "text", "value": _param_text(txt)}
 
 
 # ---- 阶段流水线：内容由外部 AI 写入节点参数，执行 = 物化 + 校验记录 ----
 def _exec_script(graph: dict, node: dict, nodemap: dict[str, dict]) -> dict:
     p = node.get("params") or {}
-    content = str(p.get("content") or "").strip()
+    content = _param_text(p.get("content")).strip()
     if not content:                       # 未写正文 → 透传上游简报
-        content = str(resolved_input(graph, node, "brief", nodemap) or "")
+        content = _param_text(resolved_input(graph, node, "brief", nodemap))
     return {"kind": "text", "value": content,
             "meta": {"stage": "script", "chars": len(content)}}
 
 
 def _exec_storyboard(graph: dict, node: dict, nodemap: dict[str, dict]) -> dict:
     p = node.get("params") or {}
-    content = str(p.get("content") or "").strip()
+    content = _param_text(p.get("content")).strip()
     if not content:
-        content = str(resolved_input(graph, node, "script", nodemap) or "")
+        content = _param_text(resolved_input(graph, node, "script", nodemap))
     shots = [ln for ln in content.splitlines() if ln.strip()]
     return {"kind": "text", "value": content,
             "meta": {"stage": "storyboard", "shots": len(shots)}}
@@ -286,12 +331,16 @@ def _exec_storyboard(graph: dict, node: dict, nodemap: dict[str, dict]) -> dict:
 def _exec_frame_prompts(graph: dict, node: dict, nodemap: dict[str, dict]) -> dict:
     """多输出：首帧提示词 / 尾帧提示词（各成一个输出端口，供两个 image_gen 连线）"""
     p = node.get("params") or {}
-    first = str(p.get("first_prompt") or "").strip()
-    last = str(p.get("last_prompt") or "").strip()
+    first = _param_text(p.get("first_prompt")).strip()
+    last = _param_text(p.get("last_prompt")).strip()
+    _board = _param_text(resolved_input(graph, node, "board", nodemap))
     if not first:
-        first = f"依据分镜首帧：{str(resolved_input(graph, node, 'board', nodemap) or '')}"
+        first = f"依据分镜首帧：{_board}"
     if not last:
-        last = first
+        # 轮57(真实使用发现,子智能体 B):尾帧提示词回退到 first 的
+        # 文案是「依据分镜**首帧**」——尾帧描述写成首帧,两个端口同值
+        # 且语义错。回退文本按端口各说各话。
+        last = f"依据分镜尾帧：{_board}"
     # 多输出：键 = 输出端口名，engine 按端口名写入 state.outputs
     return {"first_prompt": {"kind": "text", "value": first},
             "last_prompt": {"kind": "text", "value": last}}
@@ -412,7 +461,12 @@ def _exec_tts(graph: dict, node: dict, nodemap: dict[str, dict]) -> dict:
     if not text:
         raise ValueError("tts 需要文案")
     art_dir = _gdir(graph["id"]) / "artifacts"
-    svc = create_tts_service(str(art_dir), str(roots.data_dir() / "voice_cast.db"))
+    # 轮57(真实使用发现,子智能体 B):第二参必须传 Path——旧代码传
+    # str(roots.data_dir()/"voice_cast.db"),而 TtsService.__init__
+    # 不包装 Path,_load_roles 的 self.db_path.exists() 直接
+    # AttributeError → 画布 tts 节点 100% 失败(裸 AttributeError
+    # 还不可操作)。pipeline/api 两个调用方都传 Path,仅画布车道崩。
+    svc = create_tts_service(art_dir, roots.data_dir() / "voice_cast.db")
     seg = svc.build_segment(node["id"], str(text),
                             role_code=str(p.get("role", "biz_female")))
     res = svc.synthesize_segments_sync([seg])[0]
@@ -962,20 +1016,53 @@ def run_all(graph: dict, force: bool = False) -> dict:
             order.append(nid)
     publish(gid, {"type": "run_all", "pending": order, "force": bool(force)})
     results = {"order": order, "nodes": {}}
+    failed: list[str] = []
     for nid in order:
         n = nodemap[nid]
+        # 轮57(真实使用发现,子智能体 B):上游已败的节点不再执行,标记
+        # skipped + upstream_failed——旧代码让下游也去跑(或复述上游
+        # 错误),无法区分「本节点失败」与「上游失败被跳过」,且
+        # run-all 顶层恒 ok:true(只读 ok 的 agent 会判定全图成功)。
+        _up_bad = [u for u in _upstream_of(graph, nid)
+                   if results["nodes"].get(u, {}).get("ok") is False]
+        if _up_bad:
+            st = {"ok": False, "skipped": True,
+                  "upstream_failed": _up_bad,
+                  "error": f"上游 {_up_bad[0]} 失败,跳过本节点执行",
+                  "executed_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+            n["state"] = st
+            results["nodes"][nid] = {"ok": False, "state": st,
+                                     "skipped": True,
+                                     "upstream_failed": _up_bad}
+            failed.append(nid)
+            save_graph(graph)
+            publish(gid, {"type": "node", "node_id": nid, "status": "skipped",
+                          "kind": n.get("type"),
+                          "error": st["error"]})
+            continue
         try:
             st = run_node(graph, nid, force=force)
-            results["nodes"][nid] = {"ok": bool(st.get("ok")),
-                                     "state": st}
+            entry = {"ok": bool(st.get("ok")), "state": st,
+                     "blocked": bool(st.get("blocked_by_review")
+                                     or st.get("blocked_by_budget")
+                                     or st.get("blocked_by_qc"))}
+            results["nodes"][nid] = entry
+            if not entry["ok"]:
+                failed.append(nid)
         except RuntimeError as ex:
             msg = str(ex)
             results["nodes"][nid] = {
                 "ok": False,
                 "error": msg,
                 "blocked": "拦截" in msg,
+                "state": n.get("state"),
             }
+            failed.append(nid)
         except (ValueError, KeyError) as ex:
-            results["nodes"][nid] = {"ok": False, "error": str(ex)}
+            results["nodes"][nid] = {"ok": False, "error": str(ex),
+                                     "state": n.get("state")}
+            failed.append(nid)
     save_graph(graph)
+    results["failed"] = failed
+    results["ok"] = not failed  # 轮57:有失败节点就不是全图成功(消灭假成功)
     return results

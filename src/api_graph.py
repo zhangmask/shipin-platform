@@ -148,6 +148,13 @@ def graph_add_node(gid: str, req: NodeCreate):
                                    req.params, req.title)
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e))
+        except KeyError as e:
+            # 轮57(真实使用发现,子智能体 B):未知节点类型 get_def 抛
+            # KeyError,旧代码只捕 ValueError → 500 无 detail。与 PUT
+            # 路径的 INVALID_GRAPH 422 对齐。
+            raise HTTPException(status_code=422, detail={
+                "code": "UNKNOWN_NODE_TYPE",
+                "message": f"未知节点类型: {req.type}"})
     events.publish(gid, {"type": "node", "op": "add", "node": node})
     return {"ok": True, "node": node}
 
@@ -218,10 +225,18 @@ def graph_asset(gid: str, node_id: str):
     if exact.is_file() and not exact.is_dir():
         p = exact.resolve()
     else:
-        # 剥掉扩展名再按「node_id_」分隔前缀找(node_id 自身可能带 .)
+        # 轮57(真实使用发现,子智能体 B):无扩展名形态(n1)的兜底 glob。
+        # 产物真实命名是 **{node_id}.{ext}**(无下划线)——轮55 写的
+        # {stem}_* 对现有命名体系是死代码,docstring 承诺的「im1 或
+        # im1.png 均可」实际只有后者可用。两种形态都兼容:
+        #   {stem}.*      → n1.png / n1.mp3(现役命名)
+        #   {stem}_*      → n1_<uuid>.mp3(tts 的历史命名,向后兼容)
+        # 都不越界到别的节点('n10.png' 不匹配 'n1.*',因为 '.'≠'0')。
         stem = safe.rsplit(".", 1)[0] if "." in safe else safe
-        cands = sorted(fp for fp in root.glob(f"{stem}_*")
+        cands = sorted(fp for fp in root.glob(f"{stem}.*")
                        if fp.is_file())
+        cands += sorted(fp for fp in root.glob(f"{stem}_*")
+                        if fp.is_file())
         if not cands:
             raise HTTPException(status_code=404, detail="artifact not found")
         # 同 stem 多产物(如 n1.png 与 n1.mp3):按 mtime 取最新

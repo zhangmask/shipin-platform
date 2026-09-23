@@ -149,15 +149,35 @@ def test_unknown_tool_and_method():
 
 def test_http_business_refusal_transparent():
     """平台业务拒绝（闸门未确认）→ 200+ok:false 原样透传，AI 能看到
-    被哪个闸门拦了（GATE_NOT_CONFIRMED 等），而不是吞掉。"""
+    被哪个闸门拦了（GATE_NOT_CONFIRMED 等），而不是吞掉。
+
+    轮57(真实使用发现,子智能体 A):旧用例用**不存在的项目**充当
+    「闸门未确认」——失真(不存在项目现在回 PROJECT_NOT_FOUND,更
+    准确)。改用一个真实创建但未确认的项目,忠实覆盖本测试自己的
+    语义:闸门拒绝透明透传。注意必须建在 **app 实际使用的 store**
+    (api_mod._stage_store(),文件库)上——测试内自建的 :memory: 库
+    app 看不见。"""
+    pid = "mcp_unconfirmed_gate"
+    api_mod._stage_store().create_project(pid)
     h = ShipinMCP()
     h.register_tools()
-    r = _call(h, "shipin_pipeline_generate",
-              {"project_id": "mcp_does_not_exist_xyz"})
+    r = _call(h, "shipin_pipeline_generate", {"project_id": pid})
     assert r["result"]["isError"] is False      # 业务拒绝≠传输错误
     body = json.loads(_result_text(r))
     assert body["ok"] is False
-    assert "GATE_NOT_CONFIRMED" in body["reason"]
+    assert "GATE_NOT_CONFIRMED" in body["reason"], body
+
+
+def test_nonexistent_project_reason_is_accurate():
+    """轮57:不存在的项目必须回 PROJECT_NOT_FOUND(不再冒充闸门未确认
+    ——那会把运营指向「去确认 script」的错方向)。"""
+    h = ShipinMCP()
+    h.register_tools()
+    r = _call(h, "shipin_pipeline_generate",
+              {"project_id": "definitely_not_here_xyz"})
+    body = json.loads(_result_text(r))
+    assert body["ok"] is False
+    assert "PROJECT_NOT_FOUND" in body["reason"], body
 
 
 # ── P4：6 个新工具按『模拟 Codex 工作流』各调一次，服务端落账 ──────────

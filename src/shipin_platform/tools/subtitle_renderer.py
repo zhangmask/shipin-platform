@@ -508,6 +508,18 @@ def _build_drawtext_chain(cues, font: str, font_size: int, margin_v: int,
     return ",".join(nodes), len(nodes)
 
 
+def _video_duration(path: _Path) -> Optional[float]:
+    """轮57:视频时长探测(字幕 cue 越界判定用);失败返回 None。"""
+    try:
+        r = _subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, shell=False)
+        return float((r.stdout or "").strip())
+    except (ValueError, OSError):
+        return None
+
+
 def verify_subtitle_cues(baseline_video: _Path, burned_video: _Path,
                          cues: list[dict], font_size: int = 46,
                          margin_v: int = 96, w: int = 1920, h: int = 1080) -> list[dict]:
@@ -523,12 +535,23 @@ def verify_subtitle_cues(baseline_video: _Path, burned_video: _Path,
     line_h = int(font_size * 1.2)
     band_top = max(0, h - margin_v - line_h * 3)
     thr = 240  # *summed* RGB delta per pixel counts as "ink"
+    # 轮57(真实使用发现,子智能体 C):cue 超出视频时长时,中点 -ss 越
+    # EOF → ffmpeg 不产帧 → Image.open 裸抛 FileNotFoundError,冒到
+    # 端点是 404 + 内部 tmp 路径(调用方无法定位「字幕比片长」)。这里
+    # 先探片长,越界 cue 直接标记 beyond_duration + measured:False,
+    # 由 check_subtitle_cues 转 critical violation。
+    _dur = _video_duration(_Path(baseline_video))
     results = []
     for i, cue in enumerate(cues, 1):
         t = (cue["start"] + cue["end"]) / 2
         stats = {"index": i, "start": cue["start"], "end": cue["end"],
                  "measured": True, "found": False, "changed_px": 0,
                  "width_pct": 0.0, "height_px": 0, "rows": 0, "y_range": None}
+        if _dur is not None and (cue["end"] > _dur + 0.05 or t > _dur):
+            stats.update(measured=False, beyond_duration=True,
+                         video_duration=round(_dur, 2))
+            results.append(stats)
+            continue
         with _tempfile.TemporaryDirectory() as td:
             td = _Path(td)
             bg_p, fg_p = td / "bg.png", td / "fg.png"
@@ -537,7 +560,17 @@ def verify_subtitle_cues(baseline_video: _Path, burned_video: _Path,
                     ["ffmpeg", "-y", "-ss", f"{t:.3f}", "-i", str(src),
                      "-frames:v", "1", str(outp)],
                     capture_output=True, text=True, shell=False)
-            bg, fg = Image.open(bg_p).convert("RGB"), Image.open(fg_p).convert("RGB")
+            try:
+                bg = Image.open(bg_p).convert("RGB")
+                fg = Image.open(fg_p).convert("RGB")
+            except (FileNotFoundError, OSError) as e:
+                # 轮57:帧抽取失败(时点越界/文件损坏)标记 measured:False
+                # + 可读原因——旧行为裸抛 FileNotFoundError(内部 tmp 路径
+                # 泄露出端点是 404,调用方无法定位)
+                stats.update(measured=False,
+                             error=f"帧抽取失败: {type(e).__name__}")
+                results.append(stats)
+                continue
             bp, fp = bg.load(), fg.load()
             ww, hh = bg.size
             xmin, xmax, ymin, ymax = ww, -1, hh, -1
@@ -709,6 +742,10 @@ def check_subtitle_cues(cues: list, video_path: str,
     """字幕验收:返回 violations 列表(空=通过)。never raises。
 
     每项 {"cue": idx, "severity": "critical"|"warning", "issues": [...]}:
+      - beyond_duration=true    → critical(cue 结束于片长之后,不显示;
+                                  轮57,真实使用发现)
+      - measured=false          → warning(帧抽取失败等,不视为通过但不
+                                  误伤;轮57)
       - found=false            → critical(无墨迹,字幕没烧上)
       - width_pct > max_width  → critical(超宽出屏/被裁)
       - y 带越界              → warning(排版安全区,见上方说明)
@@ -726,7 +763,17 @@ def check_subtitle_cues(cues: list, video_path: str,
         if not isinstance(cue, dict):
             continue
         crit, warn = [], []
-        if not cue.get("found"):
+        # 轮57(真实使用发现,子智能体 C):cue 超出视频时长——该字幕永远
+        # 不会显示(手工 burn 链的常见输入:字幕比成片长)。critical,
+        # 文案带 cue 序号/结束秒/片长,不再让调用方猜。
+        if cue.get("beyond_duration"):
+            crit.append(f"字幕 cue #{cue.get('index')} 结束于 "
+                        f"{cue.get('end')}s,超出视频时长 "
+                        f"{cue.get('video_duration')}s——该字幕不会显示")
+        if cue.get("measured") is False and not cue.get("beyond_duration"):
+            warn.append(f"cue #{cue.get('index')} 未能测量"
+                        f"({cue.get('error', 'unknown')}),不视为通过")
+        if not cue.get("found") and not cue.get("beyond_duration"):
             crit.append("未检测到墨迹(found=false)")
         if float(cue.get("width_pct", 0) or 0) > max_width_pct:
             crit.append(f"宽度{cue.get('width_pct')}%超红线≤{max_width_pct:.0f}%")

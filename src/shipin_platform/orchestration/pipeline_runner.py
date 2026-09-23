@@ -760,9 +760,52 @@ def plan_keyframes(storyboard: dict) -> list[dict]:
     return plan
 
 
+def _media_error_result(sid: str, what: str, exc: Exception,
+                        report: list) -> dict:
+    """轮57(真实使用发现,子智能体 A/B):媒体生成本端基础设施失败
+    (h3api 不可达/AGNES 5xx/网络错)的结构化出口。
+
+    旧行为:LocalMediaError 等裸抛到 FastAPI → 500 纯文本
+    "Internal Server Error"——零诊断(不带原始状态码/端点),且崩溃
+    早于任务注册与审计落账(失败对 tasks/audit 双台账不可见),排障
+    断裂。这里与视频 attempt 的诊断(轮45)同范式:ok:False + 原始
+    异常 + 可操作 next_action,调用方(同步端点/异步 worker)都能
+    记账。"""
+    from shipin_platform.generation import local_media as _lm
+    name = type(exc).__name__
+    msg = str(exc)[:200]
+    if isinstance(exc, _lm.LocalMediaError):
+        code = "MEDIA_BACKEND_UNREACHABLE"
+        nxt = ("检查同节点本地媒体服务(h3api/DGX,默认 127.0.0.1:9023)是否在线;"
+               "或将 SHIPIN_MEDIA_BACKEND 改为 auto 回退云端 AGNES 端点后重试")
+    elif "429" in msg or "Too Many Requests" in msg:
+        code = "UPSTREAM_RATE_LIMITED"
+        nxt = "上游限流:稍后重试(平台已按 attempt 记录诊断),或降低并发"
+    elif "503" in msg or "Service Unavailable" in msg:
+        code = "UPSTREAM_UNAVAILABLE"
+        nxt = "上游服务暂不可用(503):稍后重试;持续失败请检查供应商状态页"
+    else:
+        code = "MEDIA_GENERATION_FAILED"
+        nxt = f"{what}生成失败({name}):{msg[:80]}——检查凭据/端点配置后重试"
+    return {"ok": False, "phase": "generate", "code": code,
+            "reason": f"{sid} {what}生成失败({name}): {msg}",
+            "next_action": nxt,
+            "upstream_error": {"type": name, "message": msg},
+            "report": report}
+
+
 def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) -> dict:
     """首帧图 → 首尾帧链 → 锚定视频 → QC(重试≤2)→ TTS → 对齐。
     全程确定性;LLM 不参与。返回逐镜报告。"""
+    # 轮57(真实使用发现,子智能体 A):项目不存在时旧代码要走到闸门
+    # 检查才以 GATE_NOT_CONFIRMED 200 返回——把运营指向"去确认
+    # script"的错方向。入口先查存在性,回准确原因码(仍 200+ok:false
+    # 透明透传,MCP 契约不变)。
+    try:
+        store._require_project(project_id)
+    except Exception:
+        return {"ok": False, "phase": "generate",
+                "reason": f"[PROJECT_NOT_FOUND] project not found: {project_id}"}
     gates = []
     for gate in ("script", "storyboard"):
         try:
@@ -857,7 +900,15 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
             continue  # 素材池命中(base dataRoot 共享),无需重生成
         fp = work / f"{sid}.jpg"
         if not fp.exists():
-            r = generate_image_agnes(img_map[sid], canvas_w, canvas_h, str(fp))
+            # 轮57(真实使用发现,子智能体 A/B):生图基础设施失败(h3api
+            # 不可达/AGNES 5xx/网络错)必须结构化 ok:False + 可操作
+            # next_action——旧代码让 LocalMediaError 裸抛到 FastAPI
+            # 变 500 零诊断,且失败早于任务注册/审计落账(双台账不可见)。
+            try:
+                r = generate_image_agnes(img_map[sid], canvas_w, canvas_h,
+                                         str(fp))
+            except Exception as e:
+                return _media_error_result(sid, "首帧图", e, report)
             if not r.get("ok"):
                 return {"ok": False, "phase": "generate",
                         "reason": f"{sid} 首帧图生成失败", "report": report}
@@ -1063,7 +1114,16 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                     mrec["clip_sha256"] = _hl.sha256(Path(clip).read_bytes()).hexdigest()
                 except OSError:
                     mrec.pop("clip_sha256", None)
-                store.record_clip_qc(project_id, sid, str(clip), "ok", {"attempts": attempts})
+                # 轮57(真实使用发现,子智能体 C):落账要带 QC 口径
+                # (expected_duration/tolerance/checks/findings)——旧代码
+                # 只写 {"attempts": ...},历史 ok 行无法复现「当时按什么
+                # 时长判的」(coffee-v7 实测:S05b 按 align 窗口 3.25s 重跑
+                # 判 fix,而库里只有 verdict=ok 没有口径,审计断裂)。
+                store.record_clip_qc(project_id, sid, str(clip), "ok",
+                                     {"attempts": attempts,
+                                      "verdict": qc.get("verdict"),
+                                      "checks": qc.get("checks"),
+                                      "findings": qc.get("findings")})
                 # 轮12:单镜 VLM 符合度诊断——每镜独立 ctx 逐帧对照分镜
                 # 文本预期(终审是一个 prompt 扛全部分镜,镜头一多预期被稀释,
                 # coffee-v7 实测 S05/S08 判定漂移)。只记录不拦生成:clip 过审
@@ -1687,8 +1747,26 @@ def run_assemble_phase(project_id: str, store) -> dict:
                            "time": t_["dlg_start_sec"] or t_["audio_start_sec"]})
         if narr_p:
             events.append({"path": narr_p, "time": t_["audio_start_sec"]})
+    # ZCode: 本地音乐生成——SHIPIN_LOCAL_MUSIC=1 时用 DGX 模型(Music3/ACE-Step)
+    # 按 brief 情绪生成 BGM，替代静态资产；生成失败回退静态文件。
+    bgm_path = str(BGM_PATH) if BGM_PATH.exists() else None
+    if os.environ.get("SHIPIN_LOCAL_MUSIC", "").strip() == "1" and bgm_path:
+        try:
+            from shipin_platform.generation import local_media
+            _dur = int(float(a_total(tl))) + 5
+            _mood = str((brief or {}).get("mood")
+                        or (brief or {}).get("style") or "cinematic warm")
+            _gen = local_media.local_music(
+                caption=f"TVC background music, {_mood}, instrumental, no vocals",
+                out=str(work / "bgm_local.wav"), duration=min(_dur, 120))
+            if Path(_gen["path"]).exists():
+                bgm_path = _gen["path"]
+                out["audio_bgm_source"] = "local:" + _gen.get("engine", "music3")
+        except Exception as _e:  # noqa: BLE001 - 生成失败回退静态 BGM
+            out["audio_bgm_source"] = f"static(local failed: {str(_e)[:120]})"
+
     ma = master_audio(None, float(a_total(tl)), str(work / "soundbed.wav"),
-                      bgm_path=str(BGM_PATH) if BGM_PATH.exists() else None,
+                      bgm_path=bgm_path,
                       bgm_gain_db=float(comp_snd.get("bgm_gain_db", -19.0)),
                       duck=bool(comp_snd.get("duck", True)),
                       narration_events=events,

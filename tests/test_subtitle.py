@@ -328,6 +328,66 @@ class TestBuildKaraokeAssFromAnchors:
                                   tmp_path / "o.mp4", mode="karaoke")
 
 
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not available")
+class TestCueBeyondDuration:
+    """轮57(真实使用发现,子智能体 C):cue 超出视频时长时,旧代码中点
+    -ss 越 EOF → ffmpeg 不产帧 → Image.open 裸抛 FileNotFoundError →
+    端点是 404 + 内部 tmp 路径(调用方无法定位「字幕比片长」)。现在:
+    verify 标 beyond_duration,check 转 critical violation。"""
+
+    def test_cue_beyond_duration_flagged_not_crash(self, tmp_path):
+        import subprocess as _sp
+        from shipin_platform.tools.subtitle_renderer import (
+            verify_subtitle_cues, check_subtitle_cues)
+        vid = tmp_path / "v.mp4"
+        _sp.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                 "-i", "color=c=black:s=320x240:r=24:d=5",
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", str(vid)],
+                check=True, capture_output=True)
+        burned = tmp_path / "b.mp4"
+        _sp.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(vid),
+                 "-c", "copy", str(burned)], check=True, capture_output=True)
+        cues = [{"index": 1, "start": 4.0, "end": 6.0, "text": "超长字幕"}]
+        stats = verify_subtitle_cues(vid, burned, cues, w=320, h=240)
+        assert stats[0]["beyond_duration"] is True, stats
+        assert stats[0]["measured"] is False
+        viol = check_subtitle_cues(stats, str(vid))
+        assert viol and viol[0]["severity"] == "critical", viol
+        assert "超出视频时长" in viol[0]["issues"][0], viol
+
+    def test_within_duration_not_flagged(self, tmp_path):
+        import subprocess as _sp
+        from shipin_platform.tools.subtitle_renderer import (
+            verify_subtitle_cues)
+        vid = tmp_path / "v2.mp4"
+        _sp.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                 "-i", "color=c=black:s=320x240:r=24:d=5",
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", str(vid)],
+                check=True, capture_output=True)
+        burned = tmp_path / "b2.mp4"
+        _sp.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(vid),
+                 "-c", "copy", str(burned)], check=True, capture_output=True)
+        cues = [{"index": 1, "start": 1.0, "end": 3.0, "text": "正常字幕"}]
+        stats = verify_subtitle_cues(vid, burned, cues, w=320, h=240)
+        assert stats[0].get("beyond_duration") is not True, stats
+
+
+class TestParamTextCoercion:
+    """轮57(真实使用发现,子智能体 B):节点参数非字符串被 Python repr
+    静默注入({‘a’: 1} 单引号形态)。_param_text 对 dict/list 走 JSON。"""
+
+    def test_dict_is_json_not_repr(self):
+        from shipin_platform.graph.engine import _param_text
+        out = _param_text({"a": 1, "b": [1, 2]})
+        assert out == '{"a": 1, "b": [1, 2]}', out  # 双引号 JSON,非 repr
+
+    def test_str_passthrough_and_numbers(self):
+        from shipin_platform.graph.engine import _param_text
+        assert _param_text("原文") == "原文"
+        assert _param_text(12345) == "12345"
+        assert _param_text(None) == ""
+
+
 def test_render_karaoke_degrades_to_drawtext_without_libass(tmp_path):
     """本机 ffmpeg libass 探测为 glyphs-absent 时,karaoke 模式必须如实退
     化为逐行 drawtext 并在结果里标 karaoke_degraded,绝不假报点亮。"""

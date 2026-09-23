@@ -40,7 +40,10 @@ class TtsService:
     def __init__(self, work_dir: Path, db_path: Path):
         self.work_dir = Path(work_dir)
         self.work_dir.mkdir(parents=True, exist_ok=True)
-        self.db_path = db_path
+        # 轮57(真实使用发现,子智能体 B):db_path 也包 Path——画布车道
+        # 曾传 str 导致 _load_roles 的 .exists()  AttributeError(节点
+        # 100% 崩且错误不可操作)。入口包装让「传 str」不再是要命形态。
+        self.db_path = Path(db_path)
         self._roles: dict[str, CastRole] = {}
         self._roles_error = ""  # 轮54:角色表加载失败的可诊断原因
         self._load_roles()
@@ -114,15 +117,34 @@ class TtsService:
         ]
 
     async def synthesize_segment(self, segment: TtsSegment) -> TtsSegment:
-        """Synthesise one narration segment using edge-tts.
+        """Synthesise one narration segment.
 
-        Voice selection priority: segment.voice > cast role > default female.
+        Backend priority (ZCode integration):
+          1. local DGX VibeVoice/Kokoro when SHIPIN_MEDIA_BACKEND=local
+             (edge-tts needs the public internet, unreachable from the DGX node);
+          2. edge-tts (default).
         """
+        import os
+        out = self.work_dir / f"{segment.shot_id}_{uuid.uuid4().hex[:8]}.mp3"
+        if os.environ.get("SHIPIN_MEDIA_BACKEND", "").strip().lower() == "local":
+            from shipin_platform.generation import local_media
+            try:
+                res = local_media.local_tts(
+                    segment.text, str(out),
+                    engine=os.environ.get("SHIPIN_LOCAL_TTS_ENGINE", "vibevoice"))
+                segment.output_path = res["path"]
+                segment.duration_sec = self._probe_duration(res["path"])
+                return segment
+            except Exception as e:  # noqa: BLE001 - 本地失败显式记录
+                segment.error = f"local tts failed: {e}"
+                segment.output_path = ""
+                segment.duration_sec = 0.0
+                return segment
+
         import edge_tts  # lazy import to avoid blocking main thread on init
 
         voice = segment.voice or "zh-CN-XiaoxiaoNeural"
         rate = segment.rate or "0%"
-        out = self.work_dir / f"{segment.shot_id}_{uuid.uuid4().hex[:8]}.mp3"
 
         communicate = edge_tts.Communicate(segment.text, voice, rate=rate)
         await communicate.save(str(out))

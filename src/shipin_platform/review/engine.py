@@ -782,16 +782,36 @@ class ReviewEngine:
         max_words = total_duration * NARRATION_RATE_ZH
 
         # Duration check
-        if abs(narration_words - max_words) > max_words * 0.1:
+        # 轮57(真实使用发现,子智能体 A):旧实现是双向 ±10% 带
+        # (abs(words-budget) > budget*0.1)——旁白**少于**预算 15% 也判
+        # critical,而文案只说「调整至 N 字以内」:34 字 vs 40 字预算被
+        # 打死,机械修复把句子截成病句,round2 stall 死锁(建议的修复
+        # 在 34 字时已满足条件)。改成方向明确的两支:
+        #   超预算 → critical NARRATION_TOO_LONG(名字即语义);
+        #   低于预算 → suggestion NARRATION_SPARSE(旁白少不是缺陷,
+        #        只提示,不 stall——最没信息量的答案不受最重的罚)。
+        if max_words > 0 and narration_words > max_words * 1.1:
             cls = self.classifier.classify("script", "duration_mismatch", "")
             findings.append(Finding(
                 dimension="duration",
                 severity=Severity.CRITICAL,
-                issue=f"旁白{narration_words}字 vs 预算{int(max_words)}字",
+                issue=f"旁白{narration_words}字 vs 预算{int(max_words)}字(超预算)",
                 evidence=f"narration_words={narration_words}, max_words={int(max_words)}",
                 failure_mode=cls["mode"],
                 revision_strategy=cls["strategy"],
-                proposed_fix=f"调整旁白至{int(max_words)}字以内",
+                proposed_fix=f"精简旁白至{int(max_words)}字以内",
+            ))
+        elif max_words > 0 and narration_words < max_words * 0.9:
+            cls = self.classifier.classify("script", "duration_mismatch", "")
+            findings.append(Finding(
+                dimension="duration",
+                severity=Severity.SUGGESTION,
+                issue=f"旁白{narration_words}字 vs 预算{int(max_words)}字(偏少)",
+                evidence=f"narration_words={narration_words}, max_words={int(max_words)}",
+                failure_mode=cls["mode"],
+                revision_strategy=cls["strategy"],
+                proposed_fix=(f"旁白少于预算 10% 以上,信息量可能不足;"
+                              f"如叙事完整可忽略(不阻断)"),
             ))
 
         # Subjective words check

@@ -205,7 +205,141 @@ def _patch_fake_tts(monkeypatch):
                         lambda work, db: _FakeTts(work, db))
 
 
-class TestCanvasStorageIntegrity:
+class TestRunAllSemantics:
+    """轮57(真实使用发现,子智能体 B):run-all 的结果语义——
+    (a) 顶层 ok 不许在有失败节点时恒 true(假成功);
+    (b) 上游失败的节点必须 skipped + upstream_failed,不许复述上游
+        错误冒充本节点失败;
+    (c) 条目 schema 统一(ok/state/blocked/skipped 键齐全)。"""
+
+    def test_failed_node_makes_run_all_not_ok(self, tmp_path,
+                                              monkeypatch):
+        monkeypatch.setattr(engine, "GRAPHS_DIR", tmp_path)
+        g = _make()
+        g["nodes"] = [{"id": "n1", "type": "tts", "x": 0, "y": 0,
+                       "params": {"text": "x"}}]
+        # 让 tts 执行失败(合成器抛)
+        import shipin_platform.services.tts_service as ts_mod
+
+        class _Boom(ts_mod.TtsService):
+            def synthesize_segments_sync(self, segs):
+                raise RuntimeError("edge-tts down")
+
+        monkeypatch.setattr(ts_mod, "create_tts_service", _Boom)
+        r = engine.run_all(g)
+        assert r["ok"] is False, r          # 假成功修复
+        assert r["failed"] == ["n1"], r
+        entry = r["nodes"]["n1"]
+        assert entry["ok"] is False
+        assert "edge-tts down" in entry["error"]
+
+    def test_upstream_failure_skips_downstream(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(engine, "GRAPHS_DIR", tmp_path)
+        g = _make()
+        # img1(生图)→ vid1(视频)→ qc1(质检):让生图失败,验证下游
+        # 全部 skipped(带 upstream_failed),而不是复述上游错误/
+        # 冒充本节点失败(旧行为,子智能体 B 实测)。
+        g["nodes"] = [
+            {"id": "img1", "type": "image_gen", "x": 0, "y": 0,
+             "params": {"model": "agnes-image-2.1-flash", "prompt": "x"}},
+            {"id": "vid1", "type": "video_gen", "x": 200, "y": 0,
+             "params": {"duration": 5, "prompt": "y"}},
+            {"id": "qc1", "type": "qc", "x": 400, "y": 0,
+             "params": {}},
+        ]
+        g["edges"] = [
+            {"from": "img1", "from_port": "image",
+             "to": "vid1", "to_port": "first_frame"},
+            {"from": "vid1", "from_port": "video",
+             "to": "qc1", "to_port": "video"},
+        ]
+        # image_gen 走 AGNES 图像端点——本地 H3/AGNES 都连不通即失败
+        import shipin_platform.generation.generate_assets as ga
+
+        def _boom(*a, **k):
+            raise RuntimeError("agnes image endpoint unreachable")
+
+        monkeypatch.setattr(ga, "generate_image_agnes", _boom)
+        r = engine.run_all(g)
+        # img1 失败 → vid1/qc1 全部 skipped(不是复述上游错误)
+        assert r["nodes"]["img1"]["ok"] is False
+        assert r["nodes"]["vid1"]["skipped"] is True
+        assert r["nodes"]["vid1"]["upstream_failed"] == ["img1"]
+        assert r["nodes"]["qc1"]["skipped"] is True
+        assert r["nodes"]["qc1"]["upstream_failed"] == ["vid1"]
+        assert r["ok"] is False
+        assert set(r["failed"]) == {"img1", "vid1", "qc1"}
+
+    def test_schema_keys_present_on_all_entries(self, tmp_path,
+                                                monkeypatch):
+        monkeypatch.setattr(engine, "GRAPHS_DIR", tmp_path)
+        g = _make()
+        g["nodes"] = [{"id": "n1", "type": "text", "x": 0, "y": 0,
+                       "params": {"text": "hi"}}]
+        r = engine.run_all(g)
+        for nid, e in r["nodes"].items():
+            assert "ok" in e and "state" in e, (nid, e)
+
+
+class TestApiGraphErrorMapping:
+    """轮57:画布端点的错误码契约——类型/字段错误一律 422 可读,
+    不再裸 500(旧:unknown type 走 KeyError→500、缺 id 走 KeyError→500)。"""
+
+    def _client(self, tmp_path, monkeypatch):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        import api_graph
+        monkeypatch.setattr(engine, "GRAPHS_DIR", tmp_path)
+        app = FastAPI()
+        app.include_router(api_graph.router)
+        return TestClient(app)
+
+    def test_unknown_node_type_is_422(self, tmp_path, monkeypatch):
+        client = self._client(tmp_path, monkeypatch)
+        g = engine.new_graph("t")
+        r = client.post(f"/api/graphs/{g['id']}/nodes",
+                        json={"type": "nope_type", "params": {}})
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["code"] == "UNKNOWN_NODE_TYPE"
+
+    def test_put_node_missing_id_is_422(self, tmp_path, monkeypatch):
+        client = self._client(tmp_path, monkeypatch)
+        g = engine.new_graph("t")
+        r = client.put(f"/api/graphs/{g['id']}",
+                       json={"nodes": [{"type": "text", "x": 0, "y": 0,
+                                        "params": {}}], "edges": []})
+        assert r.status_code == 422, r.text
+        body = r.json()["detail"]
+        assert body.get("code") == "INVALID_GRAPH"
+        assert any("id" in e for e in body.get("errors", [])), body
+
+    def test_tts_executor_passes_path_db(self, tmp_path, monkeypatch):
+        """轮57 P1-1:create_tts_service 双参都必须是 Path——旧画布
+        传 str 导致 TtsService._load_roles 的 .exists() AttributeError
+        (节点 100% 崩)。"""
+        import shipin_platform.services.tts_service as ts_mod
+        seen = {}
+
+        class _Spy(ts_mod.TtsService):
+            def __init__(self, work_dir, db_path):
+                seen["work"] = work_dir
+                seen["db"] = db_path
+                super().__init__(work_dir, db_path)
+
+            def synthesize_segments_sync(self, segs):
+                return []
+
+        monkeypatch.setattr(ts_mod, "create_tts_service", _Spy)
+        monkeypatch.setattr(engine, "GRAPHS_DIR", tmp_path)
+        g = _make()
+        g["nodes"] = [{"id": "n1", "type": "tts", "x": 0, "y": 0,
+                       "params": {"text": "x"}}]
+        try:
+            engine.run_node(g, "n1")
+        except Exception:
+            pass  # 合成返回空 → 后续会失败,这里只看入参类型
+        assert isinstance(seen.get("db"), Path), seen
+        assert isinstance(seen.get("work"), Path), seen
     """轮55(十审 P0-2/P1-1/P1-2):图存储完整性——
     (a) save_graph 原子写 + 按图 RMW 锁(并发 add_node 不丢节点,
         半截 JSON 不可见);
@@ -279,6 +413,29 @@ class TestCanvasStorageIntegrity:
         assert r.content == b"n1-audio", r.content
         r10 = client.get(f"/api/graphs/{g['id']}/assets/n10")
         assert r10.status_code == 200 and r10.content == b"n10-audio"
+
+    def test_asset_no_extension_resolves_dot_named_file(self, tmp_path,
+                                                        monkeypatch):
+        """轮57(真实使用发现,子智能体 B):docstring 承诺「im1 或 im1.png
+        均可」,但产物真实命名是 {node}.{ext}(无下划线)——轮55 的
+        {stem}_* 兜底 glob 对现役命名是死代码,无扩展名查询恒 404。"""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        import api_graph
+        monkeypatch.setattr(engine, "GRAPHS_DIR", tmp_path)
+        app = FastAPI()
+        app.include_router(api_graph.router)
+        client = TestClient(app)
+        g = engine.new_graph("assets3")
+        art = engine.artifact_dir(g["id"])
+        (art / "n7.png").write_bytes(b"png-7")
+        r = client.get(f"/api/graphs/{g['id']}/assets/n7")
+        assert r.status_code == 200, r.text
+        assert r.content == b"png-7"
+        # 带扩展名与不带都不串台
+        (art / "n10.png").write_bytes(b"png-10")
+        r2 = client.get(f"/api/graphs/{g['id']}/assets/n10")
+        assert r2.status_code == 200 and r2.content == b"png-10"
 
     def test_asset_exact_name_preferred(self, tmp_path, monkeypatch):
         from fastapi import FastAPI

@@ -34,8 +34,18 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
-CHAT_URL = "https://apihub.agnes-ai.com/v1/chat/completions"
+CHAT_URL = os.environ.get(
+    "AGNES_BASE_URL", "https://apihub.agnes-ai.com/v1").rstrip("/") \
+    + "/chat/completions"
 ALLOWED_HOST = {"apihub.agnes-ai.com"}
+try:
+    import urllib.parse as _urlparse
+    _h = _urlparse.urlparse(os.environ.get(
+        "AGNES_BASE_URL", "https://apihub.agnes-ai.com/v1")).hostname
+    if _h:
+        ALLOWED_HOST.add(_h)
+except Exception:
+    pass
 DEFAULT_FRAMES = 12
 # 每镜采样配额（帧/镜）：3 = 开-中-合四段全覆盖。成片时长越长帧数越多,
 # 修改: 布的 '只抽查了某几帧不完整' 即源于 2 帧/镜的 '点检' 采样。
@@ -635,6 +645,11 @@ def _key_ok(key: str) -> bool:
 def _check_ssrf(url: str) -> str:
     from urllib.parse import urlparse
     u = urlparse(url)
+    # ZCode: an operator-configured relay endpoint (AGNES_BASE_URL, e.g. an
+    # SSH reverse tunnel) may speak plain http; the default upstream stays
+    # https-only.
+    if u.hostname in ALLOWED_HOST and u.scheme == "http":
+        return url
     assert u.scheme == "https", "https only"
     assert u.hostname in ALLOWED_HOST, "host not in allowlist"
     # Host is in allowlist — skip RFC 2544 private-range check.
@@ -653,9 +668,22 @@ def _extract_frames(video: Path, count: int) -> tuple[list[dict], str]:
     `_cleanup_tmp(tmp_dir)`,否则每个审查调用泄漏一个含 N 张 960px
     PNG 的目录(磁盘打满事故的根因之一)。"""
     probe = subprocess.run(
-        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(video)],
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format",
+         str(video)],
         capture_output=True, text=True)
-    dur = float(json.loads(probe.stdout)["format"]["duration"])
+    # 轮57(真实使用发现,子智能体 C):目录/非媒体文件旧代码在
+    # json.loads(...)["format"]["duration"] 裸 KeyError('format')/
+    # ValueError——冒出到端点是 reason 里的 "'format'" 天书。先做
+    # 文件与探测守卫,失败抛可读 RuntimeError。
+    if not video.is_file():
+        raise RuntimeError(f"视频文件不存在: {video}")
+    try:
+        _fmt = json.loads(probe.stdout or "{}").get("format") or {}
+        dur = float(_fmt["duration"])
+    except (ValueError, KeyError, TypeError) as e:
+        raise RuntimeError(
+            f"视频探测失败({type(e).__name__},可能是目录/非媒体文件): "
+            f"{video}") from e
     # 轮47(八审 P4):旧实现候选 count+2 个点(首锚 + count 个铺点 +
     # 尾锚)后 `times[:count]` 按排序砍掉**最大**的几个——docstring
     # 许诺的 "start + spread + end" 里 end 锚点恒丢失(30s 片

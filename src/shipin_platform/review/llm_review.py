@@ -18,8 +18,19 @@ from typing import Optional
 
 import requests
 
-CHAT_URL = "https://apihub.agnes-ai.com/v1/chat/completions"
+# ZCode: honor AGNES_BASE_URL (.env.example documents it, but this module
+# hardcoded the URL so a relay/proxy endpoint could never be used).
+_AGNES_BASE = os.environ.get(
+    "AGNES_BASE_URL", "https://apihub.agnes-ai.com/v1").rstrip("/")
+CHAT_URL = f"{_AGNES_BASE}/chat/completions"
 ALLOWED_HOST = {"apihub.agnes-ai.com"}
+try:
+    import urllib.parse as _urlparse
+    _h = _urlparse.urlparse(_AGNES_BASE).hostname
+    if _h:
+        ALLOWED_HOST.add(_h)
+except Exception:
+    pass
 
 SCRIPT_RUBRIC = """你是严格的 TVC 审片人。依据文本事实（不要臆造画面）按以下维度评审脚本：
 1. story_structure：钩子（前3秒有反常细节/悬念）、痛点或冲突、转折（产品介入）、收束落版，四拍是否齐全且递进；
@@ -144,6 +155,11 @@ def _key_ok(key: str) -> bool:
 def _check_ssrf(url: str) -> str:
     from urllib.parse import urlparse
     u = urlparse(url)
+    # ZCode: an operator-configured relay endpoint (AGNES_BASE_URL, e.g. an
+    # SSH reverse tunnel to the real API) may speak plain http; the default
+    # upstream stays https-only with the IP checks below.
+    if u.hostname in ALLOWED_HOST and u.scheme == "http":
+        return url
     assert u.scheme == "https", "https only"
     assert u.hostname in ALLOWED_HOST, "host not in allowlist"
     for info in socket.getaddrinfo(u.hostname, u.port or 443, type=socket.SOCK_STREAM):

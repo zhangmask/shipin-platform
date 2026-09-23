@@ -8,6 +8,7 @@ missing, stale, or blocked.  This is the enforcement layer that used to be
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -123,13 +124,22 @@ class ProjectStageStore:
     # -- project lifecycle -------------------------------------------------
 
     def create_project(self, project_id: str, owner: str = "default") -> None:
-        if not project_id or not project_id.strip():
+        # 轮57(真实使用发现,子智能体 A):旧代码只查非空——`../zzcode_probe`
+        # 这类穿越 id 能建出幽灵项目(DB 有行、盘上无目录;pipeline/text
+        # 用它还会 500)。与 pipeline_runner._safe_project_id(轮55)同款
+        # 白名单:字母数字_-,≤64。
+        pid = str(project_id or "").strip()
+        if not pid:
             raise StageGateError("EMPTY_PROJECT_ID", "project_id must be non-empty")
+        if not re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", pid):
+            raise StageGateError(
+                "INVALID_PROJECT_ID",
+                f"project_id 含非法字符(仅允许字母数字_-,≤64): {project_id!r}")
         with self._conn() as conn:
             cur = conn.execute(
                 "INSERT OR IGNORE INTO projects (project_id, created_at, owner) "
                 "VALUES (?, ?, ?)",
-                (project_id.strip(), _now(), owner or "default"))
+                (pid, _now(), owner or "default"))
         # 只在"新建成功"时留痕（已存在的幂等重入不重复记）
         if cur.rowcount:
             self.record_event(project_id, "project_created",
@@ -275,9 +285,14 @@ class ProjectStageStore:
                 (_now(), project_id, *downstream))
         n = cur.rowcount
         if n > 0:
+            # 轮57(真实使用发现,子智能体 A):旧文案「失效下游 {n} 个阶段」
+            # 的 n 是 rowcount(有状态行的阶段),而 detail 列的是全部下游
+            # 名字——两者数量不一致(实测 3 vs 6),读的人以为漏了。统一:
+            # 文案与 detail 都带全下游名单 + 实际更新数。
             self.record_event(
                 project_id, "downstream_invalidated",
-                f"用户/系统改写 {stage} 后，失效下游 {n} 个阶段",
+                f"改写 {stage} 后，全部下游 {len(downstream)} 个阶段已置 "
+                f"BLOCKED（{','.join(downstream)}；其中 {n} 个原有状态被更新）",
                 stage=stage, detail=",".join(downstream))
         return n
 

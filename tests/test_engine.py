@@ -84,6 +84,35 @@ class TestReviewers:
         report = ReviewEngine().run_review("script", script)
         assert any(f.dimension == "duration" for f in report.findings)
 
+    # ── 轮57(真实使用发现,子智能体 A):字数门方向化 ──────────────────
+    # 旧实现是双向 ±10% 带(abs(words-budget) > budget*0.1):旁白少于
+    # 预算 15% 也判 critical,文案却说「调整至 N 字以内」——34 字 vs
+    # 40 字预算被打死,机械修复截出病句,round2 stall 死锁。
+
+    def test_under_budget_narration_is_suggestion_not_critical(self):
+        """低于预算 10% 以上只提示(不 stall)——子智能体 A 的确切形态
+        (旁白 34 字 vs 预算 ~41 字)。注:最小脚本会触发其它结构维度,
+        这里只钉 duration 维度的严重级与「不锁死」语义。"""
+        dur = 40 / 2.6  # 预算≈40 字
+        script = {"duration_sec": round(dur, 1),
+                  "shots": [{"narration": "字" * 34}]}
+        report = ReviewEngine().run_review("script", script)
+        d = [f for f in report.findings if f.dimension == "duration"]
+        assert d, report.findings
+        assert all(f.severity is Severity.SUGGESTION for f in d), d
+        # suggestion 不阻断:blocked 不得因它置位
+        assert getattr(report, "blocked", False) is False, report
+
+    def test_over_budget_narration_still_critical(self):
+        """超预算 10% 以上仍 critical(名字即语义)。"""
+        dur = 40 / 2.6
+        script = {"duration_sec": round(dur, 1),
+                  "shots": [{"narration": "字" * 50}]}
+        report = ReviewEngine().run_review("script", script)
+        d = [f for f in report.findings if f.dimension == "duration"]
+        assert d and all(f.severity is Severity.CRITICAL for f in d), d
+        assert any("超预算" in f.issue for f in d), d
+
     def test_script_match_passes(self):
         # 10s * 2.67 ≈ 27 chars budget (±10%) — two 13-char sentences pass
         script = {"duration_sec": 10,
