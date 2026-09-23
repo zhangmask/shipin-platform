@@ -205,7 +205,95 @@ def _patch_fake_tts(monkeypatch):
                         lambda work, db: _FakeTts(work, db))
 
 
-class TestCanvasTtsIntegrity:
+class TestCanvasStorageIntegrity:
+    """轮55(十审 P0-2/P1-1/P1-2):图存储完整性——
+    (a) save_graph 原子写 + 按图 RMW 锁(并发 add_node 不丢节点,
+        半截 JSON 不可见);
+    (b) new_graph id 唯一(秒级时间戳同秒创建曾互相覆盖);
+    (c) graph_asset 读侧不串台(n1 不得读到 n10 的产物)。"""
+
+    def test_concurrent_add_node_loses_nothing(self, tmp_path,
+                                               monkeypatch):
+        """走 API 端点的并发 add_node(PUT/ POST nodes 现已持按图 RMW
+        锁)——旧的无锁路径 8 线程只剩 1 个节点(十审实测)。"""
+        import threading
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        import api_graph
+        monkeypatch.setattr(engine, "GRAPHS_DIR", tmp_path)
+        app = FastAPI()
+        app.include_router(api_graph.router)
+        client = TestClient(app)
+        g = engine.new_graph("race")
+        errors = []
+
+        def add(i):
+            try:
+                r = client.post(f"/api/graphs/{g['id']}/nodes",
+                                json={"type": "text",
+                                      "params": {"text": f"t{i}"}})
+                if r.status_code != 200:
+                    errors.append(r.text)
+            except Exception as e:  # pragma: no cover - 防御
+                errors.append(str(e))
+
+        ts = [threading.Thread(target=add, args=(i,)) for i in range(8)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        assert not errors, errors
+        final = engine.load_graph(g["id"])
+        assert len(final["nodes"]) == 8, [n["id"] for n in final["nodes"]]
+
+    def test_new_graph_ids_unique_same_second(self, tmp_path,
+                                              monkeypatch):
+        monkeypatch.setattr(engine, "GRAPHS_DIR", tmp_path)
+        ids = {engine.new_graph(f"g{i}")["id"] for i in range(20)}
+        assert len(ids) == 20, "同秒批量建图不得碰撞"
+
+    def test_save_graph_leaves_no_tmp(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(engine, "GRAPHS_DIR", tmp_path)
+        g = engine.new_graph("atomic")
+        engine.add_node(g, "text", params={"text": "x"})
+        d = engine._gdir(g["id"])
+        assert (d / "graph.json").is_file()
+        assert not list(d.glob("*.tmp")), "原子写不得残留临时文件"
+
+    def test_asset_endpoint_no_cross_node(self, tmp_path, monkeypatch):
+        """n1 与 n10 产物共存时,取 n1 必须拿 n1 的文件——旧的无分隔
+        前缀 glob + 字典序首个小 bug('n10_x' < 'n1_y')。"""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        import api_graph
+        monkeypatch.setattr(engine, "GRAPHS_DIR", tmp_path)
+        app = FastAPI()
+        app.include_router(api_graph.router)
+        client = TestClient(app)
+        g = engine.new_graph("assets")
+        art = engine.artifact_dir(g["id"])
+        (art / "n1_aaaa.mp3").write_bytes(b"n1-audio")
+        (art / "n10_bbbb.mp3").write_bytes(b"n10-audio")
+        r = client.get(f"/api/graphs/{g['id']}/assets/n1")
+        assert r.status_code == 200, r.text
+        assert r.content == b"n1-audio", r.content
+        r10 = client.get(f"/api/graphs/{g['id']}/assets/n10")
+        assert r10.status_code == 200 and r10.content == b"n10-audio"
+
+    def test_asset_exact_name_preferred(self, tmp_path, monkeypatch):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        import api_graph
+        monkeypatch.setattr(engine, "GRAPHS_DIR", tmp_path)
+        app = FastAPI()
+        app.include_router(api_graph.router)
+        client = TestClient(app)
+        g = engine.new_graph("assets2")
+        art = engine.artifact_dir(g["id"])
+        (art / "n1.png").write_bytes(b"png-bytes")
+        (art / "n1_zzzz.mp3").write_bytes(b"mp3-bytes")
+        r = client.get(f"/api/graphs/{g['id']}/assets/n1.png")
+        assert r.status_code == 200 and r.content == b"png-bytes"
     """轮50(九审 P1-2):_exec_tts 旧实现丢弃返回值 + 无 _ 分隔前缀 glob
     + 字典序首个 → 节点 n1 串到 n10 的音频('0'<'_')、重跑选中旧文件、
     失败返回旧音频且状态 ok。三类错随 assemble 流出且无声画一致性门。"""

@@ -79,8 +79,24 @@ STORYBOARD_PROMPT = """你是严格的 TVC 分镜师。把剧本展开为分镜�
 主角锚定模板(第一镜 subject 用它,后续逐字复制):{actor_anchor}"""
 
 
+_PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+
+
+def _safe_project_id(project_id: str) -> str:
+    """轮55(十审 P0-1):project_id 白名单——旧代码只查非空
+    (stage_store._require_project),`../../pwned`/`/abs` 可让 _save/
+    _load 穿越 data/projects 围栏写到/读自任意目录(实测写到仓库根与
+    磁盘根)。与 graph/engine._safe、api_reference._SAFE_NAME 对齐。
+    返回安全 id;不合法直接抛 ValueError(调用方转 422)。"""
+    pid = str(project_id or "").strip()
+    if not _PROJECT_ID_RE.match(pid):
+        raise ValueError(
+            f"project_id 含非法字符(仅允许字母数字_- ,≤64): {project_id!r}")
+    return pid
+
+
 def _project_dir(project_id: str) -> Path:
-    d = PROJECTS_DIR / project_id
+    d = PROJECTS_DIR / _safe_project_id(project_id)
     d.mkdir(parents=True, exist_ok=True)
     return d
 

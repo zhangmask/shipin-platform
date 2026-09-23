@@ -226,6 +226,16 @@ async def _platform_auth(request: Request, call_next):
     if not path.startswith(_BODY_PROJECT_ENDPOINTS):
         m = re.match(r"^/api/(?:pipeline|project|variant)/([^/]+)",
                      request.url.path)
+        if m:
+            # 轮55(十审 P0-1):路径中的 id 先过白名单——`../../pwned`
+            # 这类穿越 id 曾能让 _save/_load 写出/读入 data/projects
+            # 之外的任意目录(实测写到仓库根/磁盘根)。合法字符外一律
+            # 422,不进端点。
+            _pid = m.group(1)
+            if not re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", _pid):
+                return JSONResponse(status_code=422, content={
+                    "detail": f"[INVALID_PROJECT_ID] project_id 含非法"
+                              f"字符(仅允许字母数字_-,≤64): {_pid!r}"})
         if m and not project_allowed(principal, m.group(1)):
             audit_store.record(caller=principal.caller, ip=client_ip,
                                method=request.method, route=path, status=403,

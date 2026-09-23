@@ -16,8 +16,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
@@ -53,12 +56,45 @@ def load_graph(gid: str) -> dict:
     return json.loads(p.read_text(encoding="utf-8"))
 
 
+# 轮55(十审 P0-2/P1-3 同族):并发写图的进程内串行化锁——旧 save_graph
+# 是裸 write_text 全量覆写:(a) 磁盘满/进程被杀留半截 JSON,load_graph
+# 之后 json.loads 裸抛 500;(b) 两个并发操作各拿旧快照互相覆盖,节点/
+# 边静默丢失(实测 8 线程 add_node 只剩 1 个)。单进程部署(start.sh/
+# Dockerfile 均无 --workers)下进程内锁足以消除 lost update;原子写
+# (tmp+os.replace)消除半截文件。
+_GRAPH_SAVE_LOCK = threading.Lock()
+_GRAPH_LOCKS: dict[str, threading.Lock] = {}
+_GRAPH_LOCKS_GUARD = threading.Lock()
+
+
+def graph_write(gid: str):
+    """轮55(十审 P0-2):按图的 read-modify-write 事务锁。
+
+    save_graph 内的锁只序列化**写**,lost update 发生在 load→改→save
+    周期(两个请求各拿旧快照,后保存者覆盖先保存者)。用方:
+        with graph_write(gid):
+            g = load_graph(gid); ...改...; save_graph(g)
+    锁按 gid 细分(不同图互不阻塞);单进程部署下足以消除丢失更新。
+    """
+    key = _safe(gid)
+    with _GRAPH_LOCKS_GUARD:
+        lk = _GRAPH_LOCKS.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _GRAPH_LOCKS[key] = lk
+    return lk
+
+
 def save_graph(g: dict) -> None:
     d = _gdir(gid_of(g))
     d.mkdir(parents=True, exist_ok=True)
     g["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    (d / "graph.json").write_text(
-        json.dumps(g, ensure_ascii=False, indent=1), encoding="utf-8")
+    payload = json.dumps(g, ensure_ascii=False, indent=1)
+    p = d / "graph.json"
+    with _GRAPH_SAVE_LOCK:
+        tmp = p.with_suffix("." + uuid.uuid4().hex[:8] + ".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, p)
 
 
 def gid_of(g: dict) -> str:
@@ -95,8 +131,13 @@ def list_graphs() -> list[dict]:
 
 
 def new_graph(name: str) -> dict:
+    # 轮55(十审 P1-1):秒级时间戳 id 在同秒创建时互相覆盖(外部 AI 批量
+    # 建画布/前端双击/apply 并发都可达)——第二个图 save_graph 覆盖第一个,
+    # 先建画布节点/边/产物静默丢失。追加 uuid8 后缀保唯一(时间戳保留
+    # 可读性)。
     from datetime import datetime
-    gid = "g-" + datetime.now().strftime("%Y%m%d%H%M%S")
+    gid = ("g-" + datetime.now().strftime("%Y%m%d%H%M%S")
+           + "-" + uuid.uuid4().hex[:8])
     g = {"id": gid, "name": name, "nodes": [], "edges": []}
     save_graph(g)
     return g

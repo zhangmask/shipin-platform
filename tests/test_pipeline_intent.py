@@ -824,6 +824,35 @@ class TestDialogueOnlyShots:
         assert any(f["code"] == "NARRATION_MISSING" for f in r["findings"])
 
 
+class TestProjectIdGuard:
+    """轮55(十审 P0-1):project_id 无白名单 → _save/_load 可穿越
+    data/projects 围栏写/读任意目录(实测 '../../pwned' 写到仓库根、
+    '/abs' 写到磁盘根)。既有 2098 个项目目录全部合规,不影响正常流。"""
+
+    @pytest.mark.parametrize("bad", ["../../pwned", "/abs", "..", "a/b",
+                                     "a\\b", "..x", "x y", "x;y", "",
+                                     "a" * 65])
+    def test_traversal_ids_rejected(self, bad):
+        from shipin_platform.orchestration import pipeline_runner as pr
+        with pytest.raises(ValueError):
+            pr._safe_project_id(bad)
+
+    @pytest.mark.parametrize("ok", ["coffee-v7", "e2e-629a730c",
+                                    "g3a1-e348a642", "bf-llm", "a" * 64])
+    def test_normal_ids_accepted(self, ok):
+        from shipin_platform.orchestration import pipeline_runner as pr
+        assert pr._safe_project_id(ok) == ok
+
+    def test_project_dir_stays_under_projects(self, tmp_path, monkeypatch):
+        from shipin_platform.orchestration import pipeline_runner as pr
+        monkeypatch.setattr(pr, "PROJECTS_DIR", tmp_path)
+        d = pr._project_dir("ok-pid")
+        assert d == tmp_path / "ok-pid"
+        with pytest.raises(ValueError):
+            pr._project_dir("../../pwned")
+        assert not (tmp_path.parent / "pwned").exists()
+
+
 class TestClipPoolSemantics:
     """轮47(八审 P3):_clip_is_pooled 旧判据(parent != 项目目录)把
     项目**子目录**里的 clip 也误判成池化——池化分支的新鲜度不比
