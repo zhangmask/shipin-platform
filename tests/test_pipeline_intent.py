@@ -841,6 +841,95 @@ class TestClipPoolSemantics:
         assert pr._clip_is_pooled(mrec, pid) is True
 
 
+class TestFinalPromotion:
+    """轮48(八审 P4 遗留):final 晋升序列崩溃安全。
+
+    轮43 旧序列 move 走旧片再 replace 新片,两步之间崩溃留下「盘上无
+    final.mp4」空窗,『可回滚』是空头支票。新序列:先拷贝备份(旧片
+    留岗)→ 原子替换;_recover_final 兜底恢复更早版本留存的残局。"""
+
+    def _mk(self, work: Path, name: str, content: bytes) -> Path:
+        p = work / name
+        p.write_bytes(content)
+        return p
+
+    def test_promote_first_time_no_backup(self, tmp_path):
+        from shipin_platform.orchestration import pipeline_runner as pr
+        work = tmp_path / "proj"
+        work.mkdir()
+        cand = self._mk(work, "final_norm.candidate.mp4", b"NEW")
+        r = pr._promote_final(work, cand)
+        assert r["ok"] is True, r
+        assert r["backed_up"] is False  # 首次晋升无旧片
+        assert (work / "final.mp4").read_bytes() == b"NEW"
+        assert not (work / "final.published.mp4").exists()
+        assert r["sha256"]
+
+    def test_promote_backs_up_old_and_keeps_it_on_duty(self, tmp_path):
+        """二次晋升:旧片内容进 published 备份,且晋升过程中盘上始终
+        有 final.mp4(无 move 空窗——备份是拷贝不是 move)。"""
+        from shipin_platform.orchestration import pipeline_runner as pr
+        work = tmp_path / "proj"
+        work.mkdir()
+        self._mk(work, "final.mp4", b"OLD")
+        cand = self._mk(work, "final_norm.candidate.mp4", b"NEW")
+        r = pr._promote_final(work, cand)
+        assert r["ok"] is True and r["backed_up"] is True
+        assert (work / "final.mp4").read_bytes() == b"NEW"
+        assert (work / "final.published.mp4").read_bytes() == b"OLD"
+
+    def test_promote_survives_missing_candidate(self, tmp_path):
+        """候选缺失(ex:磁盘满没写出来)→ 显式失败,旧片原封不动。"""
+        from shipin_platform.orchestration import pipeline_runner as pr
+        work = tmp_path / "proj"
+        work.mkdir()
+        self._mk(work, "final.mp4", b"OLD")
+        r = pr._promote_final(work, work / "nope_candidate.mp4")
+        assert r["ok"] is False, r
+        assert (work / "final.mp4").read_bytes() == b"OLD"
+
+    def test_recover_restores_published_when_final_missing(self, tmp_path):
+        from shipin_platform.orchestration import pipeline_runner as pr
+        work = tmp_path / "proj"
+        work.mkdir()
+        self._mk(work, "final.published.mp4", b"PUBLISHED")
+        r = pr._recover_final(work)
+        assert r == "restored_from_published", r
+        assert (work / "final.mp4").read_bytes() == b"PUBLISHED"
+
+    def test_recover_noop_when_final_present(self, tmp_path):
+        from shipin_platform.orchestration import pipeline_runner as pr
+        work = tmp_path / "proj"
+        work.mkdir()
+        self._mk(work, "final.mp4", b"LIVE")
+        self._mk(work, "final.published.mp4", b"OLD")
+        assert pr._recover_final(work) is None
+        assert (work / "final.mp4").read_bytes() == b"LIVE"
+
+    def test_recover_noop_when_nothing_to_recover(self, tmp_path):
+        from shipin_platform.orchestration import pipeline_runner as pr
+        work = tmp_path / "proj"
+        work.mkdir()
+        assert pr._recover_final(work) is None
+
+    def test_recover_copy_failure_is_not_fatal(self, tmp_path,
+                                               monkeypatch):
+        """备份拷贝失败(磁盘错)不炸 assemble——返回 None,由后续流程
+        自然报错(恢复是尽力而为,不能自己变成崩溃源)。"""
+        from shipin_platform.orchestration import pipeline_runner as pr
+        import shutil as _sh
+        work = tmp_path / "proj"
+        work.mkdir()
+        self._mk(work, "final.published.mp4", b"PUB")
+
+        def _boom(*a, **k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(_sh, "copy2", _boom)
+        assert pr._recover_final(work) is None
+        assert not (work / "final.mp4").exists()
+
+
 class TestSubtitleWrap:
     """轮44d:§10.6 宽度红线治本——720p@46px 下 10 字旁白烧出来
     63.7%,验收门(轮27)直接打死整条 assemble(E2E 实证)。中文排版惯例

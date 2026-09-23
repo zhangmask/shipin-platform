@@ -1369,6 +1369,63 @@ def _clip_is_pooled(mrec: dict, project_id: str) -> bool:
         return False
 
 
+def _promote_final(work: Path, norm_cand: Path) -> dict:
+    """轮48(八审 P4 遗留):candidate → final.mp4 原子晋升(可单测)。
+
+    轮43 的旧序列先把 final.mp4 move 成 final.published.mp4、再 replace
+    新片上岗——两步之间崩溃(磁盘满/进程被杀)留下「盘上无 final.mp4」
+    的空窗:finalize 只能 fail-closed 报 MISSING,『保留上一版可回滚』
+    因为没有恢复路径是空头支票。本函数把序列改为:
+      1) final.mp4 存在 → **拷贝**备份成 final.published.mp4(旧片仍
+         在上岗位,备份失败不阻断);
+      2) os.replace 原子晋升(同目录原子替换,任何时刻盘上都有一个
+         完整文件,无空窗)。
+    返回 {"ok", "sha256", "backed_up", "error"?}。"""
+    import hashlib as _hl
+    import shutil as _sh
+    final = work / "final.mp4"
+    prev = work / "final.published.mp4"
+    backed_up = False
+    if final.exists():
+        try:
+            _sh.copy2(final, prev)  # 备份,旧片留岗
+            backed_up = True
+        except OSError:
+            backed_up = False  # 备份失败不阻断晋升(旧语义)
+    try:
+        norm_cand.replace(final)  # 原子晋升,无空窗
+    except OSError as e:
+        return {"ok": False, "error": str(e)[:120]}
+    try:
+        sha = _hl.sha256(final.read_bytes()).hexdigest()
+    except OSError as e:
+        return {"ok": False, "error": f"hash: {str(e)[:80]}"}
+    return {"ok": True, "sha256": sha, "backed_up": backed_up}
+
+
+def _recover_final(work: Path) -> Optional[str]:
+    """轮48(八审 P4 遗留):assemble 晋升崩溃残局恢复。
+
+    轮43 的 candidate→published 晋升旧序列先把 final.mp4 move 成
+    final.published.mp4、再 replace 新片上岗——两步之间崩溃(磁盘满/
+    进程被杀)留下「final.mp4 缺失、final.published.mp4 存在」的残局:
+    finalize 四道门只能 fail-closed 报 MISSING,『保留上一版可回滚』
+    因为没有恢复路径是空头支票。新晋升序列(先拷贝备份再原子替换)
+    已无此空窗,本函数兜底恢复更早版本留存的残局——上一版已发布片
+    拷回上岗,本次重跑随后用新 candidate 正常替换它。
+
+    返回恢复动作字符串(无残局返回 None)。"""
+    import shutil as _sh
+    final, prev = work / "final.mp4", work / "final.published.mp4"
+    try:
+        if not final.exists() and prev.exists():
+            _sh.copy2(prev, final)
+            return "restored_from_published"
+    except OSError:
+        return None
+    return None
+
+
 def _mtime(p: str) -> float:
     from os.path import getmtime
     return getmtime(p)
@@ -1416,6 +1473,12 @@ def run_assemble_phase(project_id: str, store) -> dict:
                 "reason": "manifest 内容与 video_gen 验收时不一致(素材/分镜已变更)"
                           "——请重新运行 generate 阶段后再拼接"}
     work = _project_dir(project_id)
+    # 轮48(八审 P4 遗留):残局恢复——轮43 旧晋升序列(move 走旧片再
+    # replace 新片)在两步之间崩溃会留下「final.mp4 缺失 + final.published
+    # 存在」的残局。新序列已无空窗(先拷贝备份再原子替换),这里兜底
+    # 恢复更早版本留存的残局:上一版已发布片拷回上岗,本次重跑随后
+    # 会用新 candidate 正常替换它。
+    _final_recovered = _recover_final(work)
     brief = _load(project_id, "brief.json") or {}
     shots = storyboard["shots"]
     tl = manifest["align"]["timeline"]
@@ -1445,6 +1508,9 @@ def run_assemble_phase(project_id: str, store) -> dict:
     comp_sub = _component_defaults("subtitle")
     comp_snd = _component_defaults("sound_design")
     out = {}
+    # 轮48:残局恢复记录(发生了崩溃恢复时对运营可见)
+    if _final_recovered:
+        out["final_recovered"] = _final_recovered
 
     # 1) 落版卡:beat 含 落/out 的末镜 → kenburns(窗口+td,供转场借帧)
     last_sid = sids[-1]
@@ -1607,10 +1673,10 @@ def run_assemble_phase(project_id: str, store) -> dict:
     # 卡在任一步(磁盘满/ffmpeg 崩)时,磁盘上的 final.mp4 变成未归一化
     # 甚至截断的中间产物,而 store 里 post_production 仍 PASS、事件流仍
     # 写着"成片已发布":发布态与盘上文件脱节且不可回滚。改 candidate
-    # 中间产物 + 全部成功后才原子上岗;失败时保留上一版 final.mp4 并记
+    # 中间产物 + 全部成功后才经 _promote_final 原子上岗(先拷贝备份再
+    # 原子替换,无空窗;轮48);失败时保留上一版 final.mp4 并记
     # assemble_failed 事件(发布态若有,另行撤销见下方终验分支)。
     _final_cand = work / "final.candidate.mp4"
-    _final_prev = work / "final.published.mp4"
     mm = mux_audio_video(str(work / "subtitled.mp4"), str(work / "soundbed.wav"),
                          str(_final_cand))
     if not mm.get("ok"):
@@ -1620,14 +1686,11 @@ def run_assemble_phase(project_id: str, store) -> dict:
                             target_lufs=-14.0, two_pass=True)
     if not nm.get("ok"):
         return {"ok": False, "phase": "assemble", "reason": f"normalize: {nm}"}
-    import hashlib
-    if (work / "final.mp4").exists():
-        try:
-            (work / "final.mp4").replace(_final_prev)  # 保留上一版可回滚
-        except OSError:
-            pass
-    _norm_cand.replace(work / "final.mp4")
-    h = hashlib.sha256((work / "final.mp4").read_bytes()).hexdigest()
+    _promo = _promote_final(work, _norm_cand)
+    if not _promo.get("ok"):
+        return {"ok": False, "phase": "assemble",
+                "reason": f"final 晋升失败: {_promo.get('error')}"}
+    h = _promo["sha256"]
     store.record_artifact(project_id, "post_production", h)
     lm = loudness_measure(str(work / "final.mp4"))
     out["lufs"] = lm.get("input_i")
