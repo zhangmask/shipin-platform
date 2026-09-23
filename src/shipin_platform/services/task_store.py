@@ -38,6 +38,10 @@ _HEARTBEAT_INTERVAL_S = 15.0
 _HEARTBEAT_TTL_S = 45.0
 
 
+class TaskConflict(RuntimeError):
+    """轮56(十审 P1-4):同项目已有活跃任务——调用方翻译 409。"""
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -100,10 +104,44 @@ class TaskStore:
 
     # -- 生命周期 -----------------------------------------------------------
 
+    _ACTIVE_STATUS = ("queued", "running", "retry")
+
+    def active_task_for(self, project_id: str,
+                        kinds: Optional[tuple] = None) -> Optional[dict]:
+        """轮56(十审 P1-4):项目的活跃任务(queued/running/retry)。
+        旧 submit_task 只按 task_id 去重、不看项目——连续两次
+        POST /api/pipeline/{id}/assemble 会让两个 worker 同时
+        _save/_promote_final/record_artifact 同一 final.mp4(哈希
+        快照竞态、中间文件互相覆盖)。recover_stale 只清 heartbeat
+        超期的,不清正在跑的。"""
+        if not project_id:
+            return None
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE project_id = ? "
+                "AND status IN (?,?,?) ORDER BY created_at DESC",
+                (project_id, *self._ACTIVE_STATUS)).fetchall()
+        for row in rows:
+            task = dict(row)
+            if kinds is None or task.get("kind") in kinds:
+                return task
+        return None
+
     def submit_task(self, kind: str, project_id: str, caller: str,
-                    fn: Callable[[], dict]) -> dict:
+                    fn: Callable[[], dict],
+                    allow_project_overlap: bool = False) -> dict:
         task_id = uuid.uuid4().hex
         now = _now_iso()
+        # 轮56(十审 P1-4):同项目互斥——已有活跃任务时拒绝(TaskConflict,
+        # 调用方翻译 409),不让两个 generate/assemble 并发写同一项目
+        # 目录。allow_project_overlap 给确需并发的内部场景显式逃逸。
+        if not allow_project_overlap:
+            active = self.active_task_for(project_id)
+            if active is not None:
+                raise TaskConflict(
+                    f"项目 {project_id} 已有进行中的任务 "
+                    f"{active['task_id']}({active['kind']}/"
+                    f"{active['status']})——同项目互斥,等它结束后再提交")
         with self._lock:
             self._fns[task_id] = fn
         with self._conn() as conn:

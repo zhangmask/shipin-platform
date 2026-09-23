@@ -159,3 +159,62 @@ def test_version_content_endpoint():
     assert client.get(f"/api/pipeline/{pid}/versions/manifest/1").status_code == 422
     assert client.get(f"/api/pipeline/{pid}/versions/script/1") \
         .status_code == 200
+
+
+# ── 轮56(十审 P1-3):并发快照的版本唯一性与索引完整 ────────────────
+# 旧 snapshot 读-改-写无锁:两个并发快照都读到同一 prev、都算
+# version=1 → 索引出现两条 v1、磁盘只剩一个 v1.json;read_version 按
+# version 字典取最后一条 entry → hash 与内容错位,restore 静默回滚到
+# 错内容;索引 RMW 还会整份丢条目(实测 10 并发只剩 2 条)。
+
+def test_concurrent_snapshots_version_uniqueness(tmp_path):
+    import threading
+    proj = tmp_path / "p"
+    proj.mkdir()
+    errs = []
+
+    def snap(i):
+        try:
+            av.snapshot(proj, "script", {"v": i})
+        except Exception as e:  # pragma: no cover - 防御
+            errs.append(e)
+
+    ts_ = [threading.Thread(target=snap, args=(i,)) for i in range(10)]
+    for t in ts_:
+        t.start()
+    for t in ts_:
+        t.join()
+    assert not errs, errs
+    entries = av.list_versions(proj, "script")
+    versions = [e["version"] for e in entries]
+    assert len(entries) == 10, versions          # 索引不丢条目
+    assert sorted(versions) == list(range(1, 11)), versions  # 版本唯一递增
+    # 每个 entry 的 hash 与磁盘 v{n}.json 内容一致(不错位)
+    for e in entries:
+        entry2, content = av.read_version(proj, "script", e["version"])
+        assert entry2 is not None and content is not None, e
+        assert av._content_hash(content) == e["hash"], e
+    # 无临时文件残留(原子写)
+    assert not list(proj.rglob("*.tmp"))
+
+
+def test_snapshot_dedup_still_holds_under_concurrency(tmp_path):
+    """并发写同一内容:只产一个版本(哈希去重语义不被锁破坏)。"""
+    import threading
+    proj = tmp_path / "p2"
+    proj.mkdir()
+    errs = []
+
+    def snap():
+        try:
+            av.snapshot(proj, "brief", {"same": "content"})
+        except Exception as e:  # pragma: no cover - 防御
+            errs.append(e)
+
+    ts_ = [threading.Thread(target=snap) for _ in range(6)]
+    for t in ts_:
+        t.start()
+    for t in ts_:
+        t.join()
+    assert not errs, errs
+    assert len(av.list_versions(proj, "brief")) == 1

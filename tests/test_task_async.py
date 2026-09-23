@@ -241,3 +241,72 @@ def test_bound_key_cannot_read_other_project_task(monkeypatch):
         r = sc.get(f"/api/tasks/{other_task[0]['task_id']}",
                    headers={"X-API-Key": bound})
         assert r.status_code == 403
+
+
+# ── 轮56(十审 P1-4):同项目任务互斥 ────────────────────────────────
+# 旧 submit_task 只按 task_id 去重不看项目:连续两次
+# POST /api/pipeline/{id}/assemble 会让两个 worker 同时
+# _save/_promote_final/record_artifact 同一 final.mp4(哈希快照竞态、
+# 中间文件互相覆盖)。active_task_for + TaskConflict 现按项目拦。
+
+def test_same_project_second_submit_conflicts(tmp_path):
+    ts = TaskStore(str(tmp_path / "tasks.db"), stage_db_path=":memory:")
+    try:
+        pid = _pid("mtx")
+        ts.submit_task("probe", pid, "tester",
+                       lambda: (time.sleep(1.5), {"ok": True})[1])
+        from shipin_platform.services.task_store import TaskConflict
+        with pytest.raises(TaskConflict) as ei:
+            ts.submit_task("probe", pid, "tester",
+                           lambda: {"ok": True})
+        assert pid in str(ei.value)
+    finally:
+        ts.close()
+
+
+def test_different_projects_run_parallel(tmp_path):
+    ts = TaskStore(str(tmp_path / "tasks2.db"), stage_db_path=":memory:")
+    try:
+        p1, p2 = _pid("par1"), _pid("par2")
+        t1 = ts.submit_task("probe", p1, "tester",
+                            lambda: {"ok": True})
+        t2 = ts.submit_task("probe", p2, "tester",
+                            lambda: {"ok": True})
+        assert t1["task_id"] != t2["task_id"]
+    finally:
+        ts.close()
+
+
+def test_next_submit_ok_after_previous_finished(tmp_path):
+    ts = TaskStore(str(tmp_path / "tasks3.db"), stage_db_path=":memory:")
+    try:
+        pid = _pid("seq")
+        t1 = ts.submit_task("probe", pid, "tester",
+                            lambda: {"ok": True})["task_id"]
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if ts.get_task(t1)["status"] == "success":
+                break
+            time.sleep(0.2)
+        assert ts.get_task(t1)["status"] == "success"
+        # 前一个成功后才放行下一个(顺序重跑同项目是正常形态)
+        t2 = ts.submit_task("probe", pid, "tester",
+                            lambda: {"ok": True})
+        assert t2["task_id"] != t1
+    finally:
+        ts.close()
+
+
+def test_allow_overlap_escape_hatch(tmp_path):
+    """内部确需并发的场景可显式逃逸(默认互斥不变)。"""
+    ts = TaskStore(str(tmp_path / "tasks4.db"), stage_db_path=":memory:")
+    try:
+        pid = _pid("esc")
+        ts.submit_task("probe", pid, "tester",
+                       lambda: (time.sleep(1.5), {"ok": True})[1])
+        t2 = ts.submit_task("probe", pid, "tester",
+                            lambda: {"ok": True},
+                            allow_project_overlap=True)
+        assert t2["status"] in ("queued", "running")
+    finally:
+        ts.close()

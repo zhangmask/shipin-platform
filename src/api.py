@@ -345,7 +345,16 @@ def _enqueue_phase(request: Request, kind: str, project_id: str):
             r["preview_frames"] = _refresh_preview_frames(project_id)
         return r
 
-    task = ts.submit_task(kind, project_id, caller, _run)
+    try:
+        task = ts.submit_task(kind, project_id, caller, _run)
+    except Exception as e:
+        # 轮56(十审 P1-4):同项目互斥——两个 generate/assemble 并发会
+        # 互相覆盖同一目录的产物/哈希快照,409 让调用方等前一任务结束
+        from shipin_platform.services.task_store import TaskConflict
+        if isinstance(e, TaskConflict):
+            raise HTTPException(status_code=409, detail={
+                "code": "TASK_CONFLICT", "message": str(e)})
+        raise
     return JSONResponse(status_code=202, content=task)
 
 

@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import hashlib
 import json as _json
+import os
+import threading
 import time
+import uuid as _uuid
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +26,14 @@ TRACKED_STAGES = ("brief", "script", "storyboard",
                   "image_prompt", "video_prompt")
 
 META_NAME = "versions.json"
+
+
+def _atomic_write(p: Path, text: str) -> None:
+    """轮56:tmp+os.replace 原子写——截断式 write_text 在半路被杀
+    (磁盘满/进程被杀)时留半截 JSON,load 侧裸抛/静默返 {}。"""
+    tmp = p.with_suffix("." + _uuid.uuid4().hex[:8] + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, p)
 
 
 def _canonical(data) -> str:
@@ -39,6 +50,15 @@ def _versions_dir(project_dir: Path, stage: str) -> Path:
     return project_dir / "versions" / stage
 
 
+# 轮56(十审 P1-3):快照读-改-写的进程内串行化锁——旧 snapshot 无锁:
+# 两个并发快照(同 stage)都读到同一 prev、都算 version=1 → versions.json
+# 出现两条 v1、磁盘只剩一个 v1.json;read_version 按 version 字典取最后
+# 一条 entry →「entry.hash 说的是一份内容、v1.json 里是另一份」,restore
+# 静默回滚到错内容;索引 read-modify-write 还会整份丢条目(实测 10 并发
+# 只剩 2 条)。与 costing._LEDGER_LOCK 同范式。
+_SNAPSHOT_LOCK = threading.Lock()
+
+
 def snapshot(project_dir: Path, stage: str, data, caller: str = "auto",
              note: str = "") -> Optional[dict]:
     """写入一个版本快照。内容与最新版一致 → 返回 None（不产生新版本）。
@@ -48,20 +68,22 @@ def snapshot(project_dir: Path, stage: str, data, caller: str = "auto",
     if not project_dir.is_dir():
         return None
     h = _content_hash(data)
-    prev = list_versions(project_dir, stage)
-    if prev and prev[-1]["hash"] == h:
-        return None
-    vdir = _versions_dir(project_dir, stage)
-    vdir.mkdir(parents=True, exist_ok=True)
-    version = (prev[-1]["version"] + 1) if prev else 1
-    entry = {"version": version, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-             "hash": h, "caller": caller or "auto", "note": note or "",
-             "bytes": len(_canonical(data).encode("utf-8"))}
-    (vdir / f"v{version}.json").write_text(
-        _canonical(data), encoding="utf-8")
-    index = _load_index(project_dir)
-    index.setdefault(stage, []).append(entry)
-    _save_index(project_dir, index)
+    with _SNAPSHOT_LOCK:
+        prev = list_versions(project_dir, stage)
+        if prev and prev[-1]["hash"] == h:
+            return None
+        vdir = _versions_dir(project_dir, stage)
+        vdir.mkdir(parents=True, exist_ok=True)
+        version = (prev[-1]["version"] + 1) if prev else 1
+        entry = {"version": version,
+                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                 "hash": h, "caller": caller or "auto", "note": note or "",
+                 "bytes": len(_canonical(data).encode("utf-8"))}
+        # 版本文件与索引都走原子写(半路被杀不留半截 JSON)
+        _atomic_write(vdir / f"v{version}.json", _canonical(data))
+        index = _load_index(project_dir)
+        index.setdefault(stage, []).append(entry)
+        _save_index(project_dir, index)
     return entry
 
 
@@ -105,5 +127,6 @@ def _load_json(project_dir: Path) -> dict:
 
 
 def _save_index(project_dir: Path, index: dict) -> None:
-    (project_dir / META_NAME).write_text(
-        _json.dumps(index, ensure_ascii=False, indent=1), encoding="utf-8")
+    # 轮56:索引同样原子写(与 _SNAPSHOT_LOCK 内的 RMW 配对)
+    _atomic_write(project_dir / META_NAME,
+                  _json.dumps(index, ensure_ascii=False, indent=1))

@@ -42,3 +42,5 @@ assets/
 data/references/
 ._cues_*
 ._cues_*/
+data/*.json
+data/versions/
