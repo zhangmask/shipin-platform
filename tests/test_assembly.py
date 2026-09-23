@@ -55,6 +55,27 @@ class TestAlign:
         assert r["verdict"] == "fix"
         assert any(f["code"] == "SPILL" for f in r["findings"])
 
+    def test_corrupt_audio_probe_failure_is_critical(self, tmp_path):
+        """轮52(九审 P3-6):文件存在但不可解码(截断/损坏 mp3)——旧代码
+        探测返回 0.0 静默,「旁白比窗长」整类漏拦(fail-open)。必须
+        VOICE_PROBE_FAILED critical:测不出时长 = 无法保证人声落在窗内。"""
+        bad = tmp_path / "broken.mp3"
+        bad.write_bytes(b"not an audio file at all")
+        r = align_narration([{"shot_id": "S1", "duration_sec": 2.0,
+                              "narration_path": str(bad)}])
+        assert r["verdict"] == "fix", r["findings"]
+        assert any(f["code"] == "VOICE_PROBE_FAILED" for f in r["findings"])
+
+    def test_corrupt_dialogue_probe_failure_is_critical(self, tmp_path):
+        """台词轨坏文件同样 fail-closed(纯台词镜的窗口约束同源)。"""
+        bad = tmp_path / "broken_dlg.mp3"
+        bad.write_bytes(b"\x00\x01garbage")
+        r = align_narration([{"shot_id": "S1", "duration_sec": 2.0,
+                              "narration_path": None,
+                              "dialogue_path": str(bad)}])
+        assert r["verdict"] == "fix", r["findings"]
+        assert any(f["code"] == "VOICE_PROBE_FAILED" for f in r["findings"])
+
     def test_dead_air_flagged(self, tmp_path):
         nar = _sine_wav(tmp_path / "n.wav", 1.0)
         r = align_narration([{"shot_id": "S1", "duration_sec": 4.0,

@@ -45,6 +45,26 @@ def _ffprobe_duration(path: Path) -> float:
         return 0.0
 
 
+def _probe_voice_duration(path: Path) -> Optional[float]:
+    """轮52(九审 P3-6):人声轨时长探测(align 专用)——坏音频(截断/
+    损坏 mp3)旧代码经 _ffprobe_duration 返回 0.0 → 存在性检查与
+    voice_tail 都按 0s 算,「旁白比窗还长」整类漏拦(fail-open),
+    真实音频长度无约束、压顶下一镜;ffprobe 二进制缺失也走这条
+    (FileNotFoundError)。返回 None = 探测失败(调用方必须 fail-closed)。"""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, shell=False)
+    except OSError:
+        return None
+    out = (r.stdout or "").strip()
+    try:
+        return float(out)   # 空输出/「N/A」→ ValueError → None(探测失败)
+    except ValueError:
+        return None
+
+
 # ── 1. 旁白-镜头对齐门 ────────────────────────────────────────────────
 
 
@@ -79,8 +99,27 @@ def align_narration(shots: list[dict], min_tail: float = MIN_TAIL,
         sb_dur = float(s.get("duration_sec") or 0)
         np_ = s.get("narration_path")
         dp_ = s.get("dialogue_path")
-        tts = _ffprobe_duration(Path(np_)) if np_ else 0.0
-        dlg = _ffprobe_duration(Path(dp_)) if dp_ else 0.0
+        tts, dlg = 0.0, 0.0
+        # 轮52(九审 P3-6):人声轨探测失败(坏音频/ffprobe 缺失)必须
+        # fail-closed——旧代码 0.0 静默让「旁白比窗长」整类漏拦,
+        # 真实音频无约束压顶下一镜。文件缺失是另一条路径
+        # (NARRATION_MISSING,见下);存在但测不出 = VOICE_PROBE_FAILED。
+        if np_ and Path(np_).exists():
+            _d = _probe_voice_duration(Path(np_))
+            if _d is None:
+                findings.append({
+                    "severity": "critical", "code": "VOICE_PROBE_FAILED",
+                    "message": f"{sid} 旁白音频探测失败(损坏/不可解码/ffprobe 缺失): {np_}"})
+            else:
+                tts = _d
+        if dp_ and Path(dp_).exists():
+            _d = _probe_voice_duration(Path(dp_))
+            if _d is None:
+                findings.append({
+                    "severity": "critical", "code": "VOICE_PROBE_FAILED",
+                    "message": f"{sid} 台词音频探测失败(损坏/不可解码/ffprobe 缺失): {dp_}"})
+            else:
+                dlg = _d
         # 轮47(八审 P2#2):纯台词镜(narration 空、dialogue 有词)是合法
         # 剧本形态(模板:每镜 narration 或 dialogue 至少其一,全片至少
         # 2 镜 dialogue)——旧代码只要 narration_path 缺失/不存在就判
