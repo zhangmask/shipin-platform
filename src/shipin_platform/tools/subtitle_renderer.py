@@ -714,9 +714,21 @@ def render_subtitles_best(video_path, srt_path, output_path,
         stats = _measure()
         ink = sum(1 for c in stats if c.get("found"))
     if ink == 0:
-        raise RuntimeError(
-            "subtitle render painted no visible glyphs (subtitle + drawtext "
-            "both produced zero ink) — refusing to return a false pass")
+        # 轮58(复验发现,子智能体):全部 cue 都越界/无墨迹时,旧代码直接
+        # raise RuntimeError → 端点是裸 500,而 check_subtitle_cues 的
+        # beyond_duration critical 契约(ok:false + violations)来不及跑。
+        # 「拒绝假过」的方向保持:改为返回 ok:false + 原 measurements,
+        # 让验收层把越界/无墨迹翻译成 critical violation 交调用方判。
+        # (混合 SRT 有正常 cue 时本来就走 result 分支,单超时 cue 的
+        # SRT 才是这条路径——正是最常见的「字幕比片长」形态。)
+        result = {"ok": False, "output": str(out), "strategy": strategy,
+                  "font": font, "libass_probe": probe_libass(), "cues": stats,
+                  "error": "subtitle render painted no visible glyphs "
+                           "(subtitle + drawtext both produced zero ink) "
+                           "— refusing to return a false pass"}
+        if mode == "karaoke":
+            result["karaoke_degraded"] = karaoke_ass is None or strategy != "subtitle"
+        return result
     result = {"ok": True, "output": str(out), "strategy": strategy,
               "font": font, "libass_probe": probe_libass(), "cues": stats}
     if mode == "karaoke":

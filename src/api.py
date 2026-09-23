@@ -1301,31 +1301,47 @@ def generate_image(req: GenerateImageRequest, request: Request):
     def _bill(model: str, note: str) -> None:
         record_cost(req.project_id, "image", model=model, units=1.0, note=note)
 
+    # 轮58(复验发现,子智能体):裸生图端点旧代码对生成器异常零兜底
+    # ——ProviderSecurityError(SSRF 守卫拒本地代理)/网络错/ValueError
+    # 直接裸冒 FastAPI 成 500 纯文本。与 /api/generate/agnes-video 同款
+    # wiring:结构化 502/400,detail 带原文,绝不裸 500。
+    def _gen(fn, *a):
+        try:
+            return fn(*a)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:  # noqa: BLE001 - 结构化兜底,不裸 500
+            raise HTTPException(status_code=502, detail={
+                "code": "IMAGE_GENERATION_FAILED",
+                "message": f"{type(e).__name__}: {str(e)[:200]}",
+                "next_action": ("检查生图后端配置(SHIPIN_MEDIA_BACKEND/"
+                                "AGNES_BASE_URL/本地 h3api 可达性)后重试")})
+
     if req.mode == "agnes":
-        res = generate_image_agnes(req.prompt, req.width, req.height,
-                                    req.output_path)
+        res = _gen(generate_image_agnes, req.prompt, req.width, req.height,
+                   req.output_path)
         if res.get("ok"):
             _bill("agnes-image", req.shot_id or "")
         return res
     flux_key = os.environ.get("FLUX_API_KEY", "").strip()
     openai_img_key = os.environ.get("OPENAI_IMAGE_API_KEY", "").strip()
     if req.mode == "flux" and flux_key:
-        res = generate_image_flux(req.prompt, req.width, req.height,
-                                   req.output_path, flux_key)
+        res = _gen(generate_image_flux, req.prompt, req.width, req.height,
+                   req.output_path, flux_key)
         if res.get("ok"):
             _bill("flux-pro", req.shot_id or "")
         return res
     if req.mode == "openai" and openai_img_key:
-        res = generate_image_openai(req.prompt, req.width, req.height,
-                                     req.output_path, openai_img_key)
+        res = _gen(generate_image_openai, req.prompt, req.width, req.height,
+                   req.output_path, openai_img_key)
         if res.get("ok"):
             _bill("dall-e-3", req.shot_id or "")
         return res
     # auto: 有 AGNES_KEY 则自动用 Agnes，否则 PIL 占位
     agnes_key = os.environ.get("AGNES_KEY", "").strip()
     if req.mode == "auto" and agnes_key:
-        res = generate_image_agnes(req.prompt, req.width, req.height,
-                                    req.output_path)
+        res = _gen(generate_image_agnes, req.prompt, req.width, req.height,
+                   req.output_path)
         if res.get("ok"):
             _bill("agnes-image", req.shot_id or "")
         return res

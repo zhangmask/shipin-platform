@@ -37,9 +37,13 @@ def test_run_stage_stalls_on_manual_only_findings():
     report = p.run_stage("script", script)
     # 2026-09-16 起 duration/单句超长有机械修复器（_fix_narration_budget，
     # real-guard-10 实证 4 轮不收敛后补上）：第一轮即 applied，旁白被确定性
-    # 裁剪到位。行为从 STALL 变为「修复生效后仍 STOP/REVISE」，但关键是：
+    # 裁剪到位。轮57(字数门方向化)后又推进一步:裁剪到 ≤14 字后旁白低于
+    # 预算只出 suggestion(不再像旧双向 ±10% 带那样继续判 critical 维持
+    # stall——那正是真实使用中「34 字 vs 40 字预算被打死、round2 stall」
+    #的死锁)。因此最终 decision 收敛到 PASS/REVISE 皆属正确，关键是：
     # applied 必须含 NARRATION_TOO_LONG 且最终旁白 ≤14 字/句。
-    assert report.decision in (Decision.STOP, Decision.STALL, Decision.REVISE)
+    assert report.decision in (Decision.PASS, Decision.PASS_WITH_WARNINGS,
+                               Decision.STOP, Decision.STALL, Decision.REVISE)
     hist = p.state.revision_history
     assert any("NARRATION_TOO_LONG" in v["applied"] for v in hist.values())
     final = (p.state.stage_outputs.get("script") or {}).get("shots") or []

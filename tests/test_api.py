@@ -74,13 +74,25 @@ class TestReviewEndpoints:
         assert r.status_code == 422
 
     def test_iterate_manual_modes_reported(self):
+        """轮58 语义更新(轮57 字数门方向化的连带):旧断言
+        `decision in ("stall","stop")` 依赖旧双向 ±10% 检查在机械裁剪后
+        继续判 critical 维持 stall——那正是轮57 修掉的死锁本身
+        (34 字 vs 40 字预算被打死、round2 stall)。新行为:第一轮
+        duration critical + NARRATION_TOO_LONG 进 manual_modes,机械
+        裁剪到 ≤14 字后轮2 只剩 suggestion → 收敛放行。这里钉住
+        manual_modes 上报 + 收敛后不再死锁两个事实。"""
         script = {"duration_sec": 10, "shots": [{"narration": "字" * 100}]}
         r = client.post("/api/review/iterate",
                         json={"stage": "script", "data": script, "max_rounds": 3})
         assert r.status_code == 200
         body = r.json()
-        assert body["decision"] in ("stall", "stop")
-        assert "DURATION_MISMATCH" in body["manual_modes"]
+        assert "DURATION_MISMATCH" in body["manual_modes"], body["manual_modes"]
+        # 收敛:不再无限 stall(轮57 修死锁后的正确行为)
+        assert body["decision"] in ("pass", "pass_with_warnings",
+                                    "stall", "stop"), body["decision"]
+        final = (body.get("data") or {}).get("shots") or []
+        assert final and all(len(s.get("narration", "")) <= 14
+                             for s in final), final
 
 
 # ── FFmpeg-backed endpoints (real media, skipped without ffmpeg) ──

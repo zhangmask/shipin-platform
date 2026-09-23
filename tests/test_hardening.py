@@ -415,6 +415,86 @@ class TestApiGates:
             ensure_ascii=False), encoding="utf-8")
         return p
 
+    # ── 轮58(复验发现,子智能体):裸生图端点不得裸 500 ────────────────
+    # .env 的 AGNES_BASE_URL 曾指向一个 401 本地代理,_assert_safe_url
+    # 拒私网 → ProviderSecurityError 从 /api/generate/image 裸冒成
+    # 500 纯文本;与 /api/generate/agnes-video 同款结构化 wiring 补齐。
+
+    def test_generate_image_backend_error_is_structured(self, client,
+                                                        monkeypatch,
+                                                        tmp_path):
+        import api as _api
+        pid = "imgerr-58"
+        _api._stage_store().create_project(pid)
+        self._pass_all_stages(pid)
+        _api._stage_store().record_confirmation(pid, "script")
+
+        def _boom(*a, **k):
+            raise RuntimeError("host '127.0.0.1' 被安全网关拒绝")
+
+        monkeypatch.setattr(_api, "generate_image_agnes", _boom)
+        r = client.post("/api/generate/image", json={
+            "prompt": "x", "width": 320, "height": 320,
+            "output_path": str(tmp_path / "imgerr58.jpg"),
+            "project_id": pid})
+        assert r.status_code == 502, r.text
+        body = r.json()["detail"]
+        assert body["code"] == "IMAGE_GENERATION_FAILED"
+        assert "安全网关" in body["message"], body
+
+    def test_generate_image_value_error_is_400(self, client, monkeypatch,
+                                               tmp_path):
+        import api as _api
+        pid = "imgval-58"
+        _api._stage_store().create_project(pid)
+        self._pass_all_stages(pid)
+        _api._stage_store().record_confirmation(pid, "script")
+
+        def _boom(*a, **k):
+            raise ValueError("width must be positive")
+
+        monkeypatch.setattr(_api, "generate_image_agnes", _boom)
+        r = client.post("/api/generate/image", json={
+            "prompt": "x", "width": 320, "height": 320,
+            "output_path": str(tmp_path / "imgval58.jpg"),
+            "project_id": pid})
+        assert r.status_code == 400, r.text
+        assert "width" in r.json()["detail"]
+
+    def test_storyboard_missing_template_field_is_readable(
+            self, monkeypatch, tmp_path):
+        """轮58 附带发现:storyboard 缺 motion 等模板字段时旧代码
+        s['motion'] KeyError → generate 500 天书。现在 ValueError 带
+        镜号与缺项(端点译 422)。"""
+        from shipin_platform.orchestration import pipeline_runner as _pr
+        from shipin_platform.orchestration.stage_store import ProjectStageStore
+        pid = "missing-motion"
+        monkeypatch.setattr(_pr, "PROJECTS_DIR", tmp_path)
+        store = ProjectStageStore(":memory:")
+        store.create_project(pid)
+        _pr._save(pid, "brief.json", {"product_info": "x", "duration_sec": 9,
+                                      "brand_name": "b"})
+        _pr._save(pid, "storyboard.json", {
+            "hero_shot": "S01",
+            "shots": [{"shot_id": "S01", "duration_sec": 3, "narration": "n",
+                       # 缺 motion/scene/spatial/camera
+                       "subject": "杯"}]})
+        _pr._save(pid, "image_prompt.json", {
+            "style_anchor": "s",
+            "shot_prompts": [{"shot_id": "S01", "prompt_en": "cup"}]})
+        _pr._save(pid, "video_prompt.json", {
+            "shot_prompts": [{"shot_id": "S01", "prompt_text": "steam"}]})
+        for g in ("script", "storyboard"):
+            store.record_artifact(pid, g, "h")
+            store.record_confirmation(pid, g)
+        # 输入校验契约:ValueError 带镜号与缺项(端点 pipeline_generate
+        # 译 422),不再 KeyError 裸 500
+        with pytest.raises(ValueError) as ei:
+            _pr.run_generate_phase(pid, store)
+        assert "缺少模板字段" in str(ei.value)
+        assert "motion" in str(ei.value)
+        assert "S01" in str(ei.value)
+
     def test_finalize_blocked_when_final_review_fix(self, client, tmp_path):
         pid = "fin-fix"
         client.post("/api/project/create", json={"project_id": pid})

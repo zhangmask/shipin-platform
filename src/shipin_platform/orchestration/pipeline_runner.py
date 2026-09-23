@@ -843,6 +843,15 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
         spk = (str(s.get("speaking") or "").strip()
                if isinstance(dlg, dict) and dlg.get("text") else "")
         speaking_en = f" {spk}." if spk else ""
+        # 轮58(复验附带发现,子智能体):storyboard 缺 motion/subject 等
+        # 模板字段时旧代码 s['motion'] 裸 KeyError → generate 500 天书。
+        # 缺字段给可读缺项报错(断在哪镜缺哪项),不放任裸崩。
+        _miss = [k for k in ("subject", "motion", "scene", "spatial", "camera")
+                 if not str(s.get(k) or "").strip()]
+        if _miss:
+            raise ValueError(
+                f"storyboard 镜头 {s['shot_id']} 缺少模板字段 {_miss}"
+                "——分镜表不完整,先经 review/iterate 补全再 generate")
         img_prompts.append({"shot_id": s["shot_id"], "prompt_en":
                             f"{s['subject']}. {s['motion']}{speaking_en} "
                             f"Scene: {s['scene']}. "

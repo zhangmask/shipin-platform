@@ -372,6 +372,29 @@ class TestCueBeyondDuration:
         assert stats[0].get("beyond_duration") is not True, stats
 
 
+    def test_single_cue_beyond_duration_no_bare_500(self, tmp_path):
+        """轮58(复验发现,子智能体):**只有一条超时 cue** 的 SRT(最常见
+        的「字幕比片长」形态)旧代码在 render_subtitles_best 里 ink==0
+        直接 raise → 端点是裸 500,beyond_duration critical 来不及跑。
+        现在必须 200 + ok:false + violations 含「超出视频时长」。"""
+        import subprocess as _sp
+        from shipin_platform.tools.subtitle_renderer import render_subtitles_best
+        vid = tmp_path / "v5.mp4"
+        _sp.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                 "-i", "color=c=black:s=320x240:r=24:d=5",
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", str(vid)],
+                check=True, capture_output=True)
+        srt = tmp_path / "only.srt"
+        srt.write_text("1\n00:00:04,000 --> 00:00:06,000\n超长字幕\n",
+                       encoding="utf-8")
+        r = render_subtitles_best(vid, srt, tmp_path / "o.mp4",
+                                  font_size=46, margin_v=96)
+        assert r["ok"] is False, r          # 不再 raise 裸 500
+        assert "painted no visible glyphs" in r["error"]
+        cues = r.get("cues") or []
+        assert cues and cues[0].get("beyond_duration") is True, cues
+
+
 class TestParamTextCoercion:
     """轮57(真实使用发现,子智能体 B):节点参数非字符串被 Python repr
     静默注入({‘a’: 1} 单引号形态)。_param_text 对 dict/list 走 JSON。"""
