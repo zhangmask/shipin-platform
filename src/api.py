@@ -28,7 +28,7 @@ _shipin_root = _roots.data_root()  # 数据根：源码=项目根；打包=exe �
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from dotenv import load_dotenv
 
 load_dotenv(_shipin_root / ".env")
@@ -399,13 +399,16 @@ def project_status(project_id: str):
             "head_version": max((e["version"] for e in arts), default=None),
         })
     budget_cfg = _read_budget(project_id)
-    used = cost_summary(project_id)["total_usd"]
+    _snap = _cost_snapshot(project_id)  # 轮49:账本损坏不 500,诚实不可知
+    used = _snap.get("total_usd")
     budget = {
         "max_budget_usd": budget_cfg["max_budget_usd"] if budget_cfg else None,
         "set_at": budget_cfg["set_at"] if budget_cfg else None,
         "current_usd": used,
+        "ledger_corrupt": bool(_snap.get("ledger_corrupt")),
         "exceeded": bool(budget_cfg
                          and budget_cfg["max_budget_usd"] is not None
+                         and used is not None
                          and used > budget_cfg["max_budget_usd"]),
     }
     return {"project_id": project_id,
@@ -452,6 +455,19 @@ class AlignRequest(BaseModel):
     min_tail: float = 0.25
     max_gap: float = 0.8
     master_duration: float = 10.0
+
+    @field_validator("min_tail", "max_gap", "master_duration")
+    @classmethod
+    def _sane_floats(cls, v: float, info) -> float:
+        # 轮49(九审 P2-5):负 min_tail 曾让 align 放行「旁白越窗」——
+        # needed=voice_tail+min_tail 被负值压低,SPILL 判据
+        # (needed>master_duration)被绕过,window < tts 也判 ok;负
+        # master_duration 配无声镜甚至产出负窗口。钳到下限。
+        name = info.field_name
+        floor = 0.0 if name == "master_duration" else 0.05
+        if v != v or v < floor:  # NaN 或越下限
+            raise ValueError(f"{name} 必须 ≥ {floor}(负值会旁白越窗)")
+        return v
 
 
 @app.post("/api/audio/align")
@@ -1189,6 +1205,8 @@ def tts_narrate(req: TtsNarrateRequest, request: Request):
     script 未 PASS 即 409，产物记入 video_gen + 成本台账。"""
     _enforce_project_binding(request, req.project_id)
     store = _stage_store()
+    # 轮49(九审 P2-8):裸 TTS 端点补预算硬闸(与镜像/视频裸端点同口径)
+    _enforce_budget(req.project_id, store)
     try:
         store.assert_stage_pass(req.project_id, "script")
     except StageGateError as e:
@@ -1216,8 +1234,12 @@ def tts_narrate(req: TtsNarrateRequest, request: Request):
     from shipin_platform.contracts import stable_artifact_hash
     store.record_artifact(req.project_id, "video_gen",
                           stable_artifact_hash({"tts_segments": segments}))
+    # 轮49(九审 P2-8):只计成功段——旧代码 units=len(segments) 把合成
+    # 失败的段也计费(账目虚高),违背 pipeline 车道轮33 的 _ok_n 口径
+    _ok_n = sum(1 for s in segments
+                if not s.get("error") and s.get("output_path"))
     record_cost(req.project_id, "tts", model="tts-v1",
-                units=float(len(segments)), note="旁白")
+                units=float(_ok_n), note="旁白")
     return {"ok": True, "segments": segments,
             "total_duration_sec": sum(s["duration_sec"] for s in segments)}
 
@@ -1241,6 +1263,10 @@ def generate_image(req: GenerateImageRequest, request: Request):
     必须挂 project（storyboard PASS 且 script 已用户确认才允许、成本照记）。"""
     _enforce_project_binding(request, req.project_id)
     store = _stage_store()
+    # 轮49(九审 P2-8):裸生图端点补预算硬闸——pipeline/variant/retry 三条
+    # 车道都有 _enforce_budget,唯独裸端点缺失:超预算项目走裸端点照常
+    # 花钱,熔断一致性缺口
+    _enforce_budget(req.project_id, store)
     try:
         store.assert_stage_pass(req.project_id, "storyboard")
         store.assert_confirmed(req.project_id, "script")
@@ -1319,6 +1345,17 @@ class GenerateAgnesVideoRequest(BaseModel):
     project_id: str
     shot_id: Optional[str] = None
 
+    @field_validator("duration")
+    @classmethod
+    def _duration_sane(cls, v: int) -> int:
+        # 轮49(九审 P1-3):负/零 duration 曾让 record_cost 落负价行
+        # (total_usd 被拉低,预算闸 `used > max` 被反向掏空)且 ffmpeg
+        # 裁剪 `-t -5` 直接拒绝 → 只 warning 仍返回 ok: 负价 + 假成功。
+        # 钳到 [1, 60]:与 pipeline 车道 max(dur,2) 同向的硬下限。
+        if not isinstance(v, int) or v < 1:
+            raise ValueError("duration 必须 ≥1 秒")
+        return min(v, 60)
+
 
 @app.post("/api/generate/agnes-video")
 def generate_agnes_video(req: GenerateAgnesVideoRequest, request: Request):
@@ -1329,6 +1366,8 @@ def generate_agnes_video(req: GenerateAgnesVideoRequest, request: Request):
     _enforce_project_binding(request, req.project_id)
     from pathlib import Path as _Path
     store = _stage_store()
+    # 轮49(九审 P2-8):裸视频端点补预算硬闸(与镜像/tts 裸端点同口径)
+    _enforce_budget(req.project_id, store)
     try:
         store.assert_confirmed(req.project_id, "script")
         store.assert_stage_pass(req.project_id, "storyboard")
@@ -2167,8 +2206,20 @@ class PipelineTextRequest(BaseModel):
 
 def _reference_preloaded(reference_id: str) -> dict:
     """读取参考报告的 brief_prefill，只取 filled/suggested 维度的值。"""
-    refs_dir = _roots.data_dir() / "reference_reports"
-    fp = refs_dir / f"{reference_id}.json"
+    import re as _re
+    # 轮49(九审 P2-7):读侧与写侧(ingest 的 name 正则)对齐——旧代码
+    # 直接拼 `refs_dir/{reference_id}.json`,`../projects/<pid>/storyboard`
+    # 形态可探测任意 JSON 的存在性并回显 brief_prefill 段。白名单 +
+    # resolve 前缀双保险。
+    rid = str(reference_id or "").strip()
+    if (not rid or rid.startswith(".")
+            or not _re.fullmatch(r"[A-Za-z0-9_\-\.\u4e00-\u9fff]+", rid)):
+        raise HTTPException(status_code=422,
+                            detail=f"reference_id 含非法字符: {reference_id!r}")
+    refs_dir = (_roots.data_dir() / "reference_reports").resolve()
+    fp = (refs_dir / f"{rid}.json").resolve()
+    if not str(fp).startswith(str(refs_dir)):
+        raise HTTPException(status_code=422, detail="reference_id 路径越界")
     if not fp.is_file():
         raise HTTPException(
             status_code=404,
@@ -2308,7 +2359,7 @@ def pipeline_report(project_id: str):
     store = _stage_store()
     from shipin_platform.orchestration.pipeline_runner import _load
     brief = _load(project_id, "brief.json") or {}
-    costs = cost_summary(project_id)
+    costs = _cost_snapshot(project_id)  # 轮49:账本损坏不 500
     budget = _read_budget(project_id)
     return {"project_id": project_id,
             "stages": store.get_project_status(project_id),
@@ -2359,6 +2410,23 @@ def _read_budget(project_id: str) -> Optional[dict]:
         return None
     return {"max_budget_usd": data.get("max_budget_usd"),
             "set_at": data.get("set_at")}
+
+
+def _cost_snapshot(project_id: str) -> dict:
+    """轮49(九审 P3-10):成本快照的防崩包装——账本损坏时只读端点
+    (report/budget/detail/preflight)旧代码直接 500(LedgerCorruptError
+    只有 _enforce_budget 捕获)。返回带 ledger_corrupt 标记的诚实
+    快照:total_usd=None 表示"不可知",调用方按此呈现/判定,不猜数。"""
+    try:
+        snap = cost_summary(project_id)
+        if not isinstance(snap, dict):
+            snap = {"total_usd": None}
+        snap.setdefault("total_usd", 0.0)
+        snap["ledger_corrupt"] = False
+        return snap
+    except LedgerCorruptError as e:
+        return {"total_usd": None, "ledger_corrupt": True,
+                "reason": str(e)[:200], "by_kind": {}, "records": []}
 
 
 def _write_budget(project_id: str, max_usd: Optional[float], store) -> dict:
@@ -2613,8 +2681,10 @@ def pipeline_budget(project_id: str, req: BudgetRequest):
     except StageGateError:
         raise HTTPException(status_code=404, detail=f"project not found: {project_id}")
     budget = _write_budget(project_id, req.max_budget_usd, store)
+    _snap = _cost_snapshot(project_id)  # 轮49:账本损坏不 500
     return {"project_id": project_id, "budget": budget,
-            "current_usd": cost_summary(project_id)["total_usd"]}
+            "current_usd": _snap.get("total_usd"),
+            "ledger_corrupt": bool(_snap.get("ledger_corrupt"))}
 
 
 @app.post("/api/pipeline/{project_id}/preflight")
@@ -2676,10 +2746,18 @@ def pipeline_preflight(project_id: str):
     # 5) 预算
     b = _read_budget(project_id)
     if b and b["max_budget_usd"] is not None:
-        used = cost_summary(project_id)["total_usd"]
-        add("budget", used <= b["max_budget_usd"],
-            f"已用 ${used:.4f}/上限 ${b['max_budget_usd']}"
-            + ("" if used <= b["max_budget_usd"] else "（超限）"))
+        _snap = _cost_snapshot(project_id)
+        used = _snap.get("total_usd")
+        if _snap.get("ledger_corrupt"):
+            # 轮49(九审 P3-10):账本损坏 ≠ 没花钱——preflight 必须判
+            # 不可跑(预算无法核验),旧代码这里 500
+            add("budget", False,
+                f"成本账本损坏,预算无法核验({_snap.get('reason', '')[:80]})"
+                "——修复账本后再跑")
+        else:
+            add("budget", used <= b["max_budget_usd"],
+                f"已用 ${used:.4f}/上限 ${b['max_budget_usd']}"
+                + ("" if used <= b["max_budget_usd"] else "（超限）"))
     else:
         add("budget", True, "未设上限")
     # 6) 产物目录 & 宽表
@@ -2837,7 +2915,7 @@ def pipeline_timeline(project_id: str):
         "assets": assets,
         "qc": store.list_clip_qc(project_id),
         "versions": {k: len(v) for k, v in ver_idx.items()},
-        "cost": costing.cost_summary(project_id),
+        "cost": _cost_snapshot(project_id),  # 轮49:账本损坏不 500
         "preview_frames": _preview_frame_urls(project_id),
     }
 

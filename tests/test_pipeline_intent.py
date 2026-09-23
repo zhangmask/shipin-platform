@@ -251,6 +251,38 @@ class TestLedgerAtomicity:
         assert got["verdict"] == "pass"
         assert not list(pr._project_dir(pid).glob("*.tmp"))
 
+    # ── 轮49(九审 P1-3/P3-9/P3-10):账本数字诚信 ──────────────────
+
+    def test_negative_units_clamped_to_zero(self):
+        """负 units 曾把 total_usd 拉低——预算判据 `used > max` 被反向
+        掏空(裸端点注入负 duration 的复现实测:持续放行超预算项目)。"""
+        import uuid as _uuid_lg
+        from shipin_platform.services.costing import (cost_file,
+                                                      record_cost,
+                                                      cost_summary)
+        pid = f"lg-neg-{_uuid_lg.uuid4().hex}"
+        r = record_cost(pid, "video", model="m", units=-5.0, note="attack")
+        assert r["units"] == 0.0 and r["usd"] == 0.0, r
+        assert cost_summary(pid)["total_usd"] == 0.0
+
+    def test_structural_corrupt_ledger_raises_not_silent_zero(self):
+        """合法 JSON 但结构不是 list(dict/str/num):旧代码 isinstance
+        检查后静默返 [] = 预算闸判「没花钱」放行,与 LedgerCorruptError
+        的设计意图自相矛盾。"""
+        import uuid as _uuid_lg
+        from shipin_platform.services.costing import (LedgerCorruptError,
+                                                      _load_rows, cost_file)
+        pid = f"lg-struct-{_uuid_lg.uuid4().hex}"
+        fp = cost_file(pid)
+        fp.write_text('{"seq": 1, "usd": 99}', encoding="utf-8")  # dict
+        try:
+            _load_rows(pid)
+            raise AssertionError("结构损坏必须抛 LedgerCorruptError")
+        except LedgerCorruptError:
+            pass
+        # 损坏文件被备份(不硬删),便于人工核对
+        assert list(fp.parent.glob("cost.corrupt-*.json")), "应备份损坏账本"
+
 
 class TestGenerateNoSilentSkip:
     """轮44(E2E 三连挂根因):三次生成全败时,旧代码 `r is None → continue`
@@ -960,6 +992,120 @@ class TestSubtitleWrap:
         # 不传预算 = 旧行为(单行)
         srt_old = pr._build_srt(sb, tl)
         assert "加班后的倦，无人诉说" in srt_old
+
+    def test_build_srt_timestamps_never_roll_to_1000(self):
+        """轮49(九审 P1):sec/ms 独立取整会产出非法 `,1000`——平台自解析
+        读成 20.1s(应 21.0),字幕早 ~0.9s 显示、验收在错点量墨迹(假过),
+        ffmpeg 进位与 verify 错解析又造成间歇性硬失败。浮点命中的真实
+        形态:audit 实测 1.27% 项目至少一中。"""
+        import re
+        from shipin_platform.tools.subtitle_renderer import _srt_ts_to_seconds
+        tl = [{"shot_id": f"S{i:02d}", "window_sec": w, "tts_sec": 1.5,
+               "dlg_sec": d, "audio_start_sec": 0.0, "dlg_start_sec": 0.0}
+              for i, (w, d) in enumerate(zip(
+                  [1.74, 2.93, 2.02, 1.76, 5.77, 4.88, 2.96, 4.75],
+                  [2.89, 0.88, 1.13, 2.98, 1.18, 1.61, 1.8, 1.3]))]
+        sb = {"shots": [{"shot_id": f"S{i:02d}", "narration": "旁白文本",
+                         "dialogue": {"role_code": "hero_male",
+                                      "text": "台词"}} for i in range(8)]}
+        srt = pr._build_srt(sb, tl, {"canvas_w": 1280}, max_line_chars=10)
+        stamps = [ts for ln in srt.splitlines() if " --> " in ln
+                  for ts in ln.split(" --> ")]
+        assert stamps
+        for ts in stamps:
+            assert re.fullmatch(r"\d{2}:\d{2}:\d{2},\d{3}", ts), ts
+            assert int(ts.split(",")[1]) <= 999, f"毫秒越界: {ts}"
+            # 回环:解析值与名义值一致(不进位错位)
+            sec = float(ts[:2]) * 3600 + float(ts[3:5]) * 60 + \
+                float(ts[6:8]) + float(ts[9:12]) / 1000
+            back = _srt_ts_to_seconds(ts)
+            assert abs(back - sec) < 0.002, (ts, sec, back)
+
+
+class TestSubtitleWidthWrap:
+    """轮51(E2E 第 8 次唯一卡点):字符折行预算(1 字=1em)对 CJK 系统
+    性低估——46px 字号实测 advance≈48px,17 字=816px=63.7% 屏宽,
+    §10.6 验收门(≤62%)当场打死(generate 全过之后字幕成唯一卡点)。
+    治本:_wrap_to_width 用 drawtext/libass 实际渲染的同一字体度量。"""
+
+    BUDGET = int(1280 * 0.62)  # 793px
+
+    def _pct(self, line: str) -> float:
+        from shipin_platform.tools.subtitle_renderer import measure_text_px
+        px = measure_text_px(line, 46)
+        return (px or 0) / 1280 * 100
+
+    def test_long_line_wraps_within_budget(self):
+        from shipin_platform.orchestration.pipeline_runner import _wrap_to_width
+        out = _wrap_to_width("加班后的倦意涌上心头，却无人可以诉说",
+                             self.BUDGET, 46, 17)
+        lines = out.split("\n")
+        assert len(lines) >= 2
+        for ln in lines:
+            assert self._pct(ln) <= 62.0, (ln, self._pct(ln))
+
+    def test_seventeen_chars_fit_one_line(self):
+        """17 字是字符预算的极限值——px 度量下 61.1% 单行放得下,不再
+        被误折(也不超 62%)。"""
+        from shipin_platform.orchestration.pipeline_runner import _wrap_to_width
+        text = "加班后的倦意涌上心头却无人可以诉说"
+        out = _wrap_to_width(text, self.BUDGET, 46, 17)
+        assert "\n" not in out, out
+        assert self._pct(out) <= 62.0
+
+    def test_no_leading_punctuation_after_wrap(self):
+        """中文禁则:折行后行首不出标点(「…时刻 / ，从这里开始」这种
+        必须消掉)。"""
+        from shipin_platform.orchestration.pipeline_runner import _wrap_to_width
+        out = _wrap_to_width("晨光咖啡，享受每一个清醒的清晨时刻，从这里开始",
+                             self.BUDGET, 46, 17)
+        lines = [l for l in out.split("\n") if l]
+        assert len(lines) >= 2
+        for ln in lines[1:]:
+            assert ln[0] not in "，。！？；、,!?;:", ln
+
+    def test_no_single_char_orphan_line(self):
+        """硬切出的 1 字孤行要借字消掉(「…合不合 / 适」)。"""
+        from shipin_platform.orchestration.pipeline_runner import _wrap_to_width
+        out = _wrap_to_width("主角: 你喝一口试试看这个温度合不合适",
+                             self.BUDGET, 46, 17)
+        lines = [l for l in out.split("\n") if l]
+        assert all(len(l) > 1 for l in lines), lines
+
+    def test_font_unavailable_falls_back_to_char_wrap(self, monkeypatch):
+        """PIL/字体不可用 → measure 返回 None → 回退字符折行,不炸。"""
+        import shipin_platform.tools.subtitle_renderer as sr
+        monkeypatch.setattr(sr, "measure_text_px", lambda *a, **k: None)
+        from shipin_platform.orchestration.pipeline_runner import _wrap_to_width
+        out = _wrap_to_width("加班后的倦意涌上心头，却无人可以诉说",
+                             self.BUDGET, 46, 17)
+        assert "\n" in out  # 长句仍被折(字符口径)
+
+    def test_build_srt_px_mode_all_lines_within_62(self):
+        """assemble 的调用形态(px 模式):每条 cue 的每一行实测 ≤62%。"""
+        from shipin_platform.orchestration.pipeline_runner import _build_srt
+        from shipin_platform.tools.subtitle_renderer import measure_text_px
+        sb = {"shots": [
+            {"shot_id": "S01", "duration_sec": 3,
+             "narration": "加班后的倦意涌上心头，却无人可以诉说",
+             "dialogue": ""},
+            {"shot_id": "S02", "duration_sec": 3,
+             "narration": "短句",
+             "dialogue": {"role_code": "hero_male",
+                          "text": "你喝一口试试看这个温度合不合适"}}]}
+        tl = [{"shot_id": "S01", "window_sec": 3.0, "tts_sec": 2.5,
+               "dlg_sec": 0.0},
+              {"shot_id": "S02", "window_sec": 3.0, "tts_sec": 0.0,
+               "dlg_sec": 2.5}]
+        srt = _build_srt(sb, tl, {"canvas_w": 1280},
+                         max_line_px=self.BUDGET, font_size=46,
+                         max_line_chars=17)
+        for block in srt.split("\n\n"):
+            for ln in block.splitlines()[2:]:
+                if not ln.strip():
+                    continue
+                px = measure_text_px(ln, 46) or 0
+                assert px / 1280 * 100 <= 62.0, (ln, px / 1280 * 100)
 
 
 class TestClipCacheFingerprint:

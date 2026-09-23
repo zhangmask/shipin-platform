@@ -256,6 +256,63 @@ def _exec_frame_prompts(graph: dict, node: dict, nodemap: dict[str, dict]) -> di
             "last_prompt": {"kind": "text", "value": last}}
 
 
+def _graph_cost_pid(graph_id: str) -> str:
+    """轮50(九审 P1-4):画布车道的成本归属 id——graph-<gid>。
+
+    画布(engine/graph lane)此前的 image/video/tts 执行器直连付费
+    供应商但全车道零 record_cost、零预算闸:同一把 key 在 pipeline
+    车道被 422、画布车道可无限花钱且 showback 零可见(违反平台不变
+    量「每次真实生成都登记」)。用 graph-<gid> 作为台账 project_id
+    落在 data/projects/graph-<gid>/cost.json:global_cost_summary
+    扫 data/projects/* 自然纳入,预算文件同约定可配。"""
+    return f"graph-{graph_id}"
+
+
+def _record_graph_cost(graph: dict, kind: str, *, model: str = "",
+                       units: float = 1.0, note: str = "") -> None:
+    """画布节点生成入账(失败不计——调用方只在成功后调)。"""
+    try:
+        from shipin_platform.services.costing import record_cost
+        record_cost(_graph_cost_pid(graph["id"]), kind, model=model,
+                    units=units, note=note)
+    except Exception:
+        # 记账失败绝不阻断生成本身(pipeline 车道同口径:熔断由预算闸
+        # 负责,不由记账异常负责)——但也不静默:节点 state 的 meta 由
+        # 调用方可见,此处最差情况是 showback 少一行
+        pass
+
+
+def _budget_blocked(graph: dict) -> str:
+    """轮50(九审 P1-4):画布车道预算硬闸(每个花钱节点执行前复查)。
+
+    判据与 pipeline 车道同口径:全局月度闸(global_budget_exceeded)
+    + 本图(graph-<gid>)预算文件(若配置)。任一超限返回原因串;账本
+    损坏视为超限(不能按空账放行)。"""
+    try:
+        from shipin_platform.services.costing import (
+            LedgerCorruptError, cost_summary, global_budget_exceeded)
+        over, used, mx = global_budget_exceeded()
+        if over:
+            return f"全局月度预算超限：已用 ${used:.4f} > 上限 ${mx:.4f}"
+        pid = _graph_cost_pid(graph["id"])
+        fp = roots.data_dir() / "projects" / pid / "budget.json"
+        if not fp.is_file():
+            return ""
+        import json as _json
+        cfg = _json.loads(fp.read_text(encoding="utf-8"))
+        mx = cfg.get("max_budget_usd")
+        if mx is None:
+            return ""
+        used = cost_summary(pid)["total_usd"]
+        if used > float(mx):
+            return f"本图预算超限：已用 ${used:.4f} > 上限 ${float(mx):.4f}"
+    except LedgerCorruptError:
+        return "成本账本损坏，预算无法核验——拒绝按空账继续"
+    except Exception:
+        return ""  # 读预算失败不误伤(与 pipeline 的 _read_budget 容错一致)
+    return ""
+
+
 def _exec_image_gen(graph: dict, node: dict, nodemap: dict[str, dict]) -> dict:
     from shipin_platform.generation.generate_assets import (
         generate_image_agnes, generate_image_pil)
@@ -269,7 +326,12 @@ def _exec_image_gen(graph: dict, node: dict, nodemap: dict[str, dict]) -> dict:
     if model == "pil":
         generate_image_pil(prompt, w, h, out)
     else:
-        generate_image_agnes(prompt, w, h, out, model=model)
+        r = generate_image_agnes(prompt, w, h, out, model=model)
+        if isinstance(r, dict) and not r.get("ok", True):
+            raise RuntimeError(f"image_gen 失败: {r.get('error', r)}")
+        # 轮50(九审 P1-4):花钱生成必须入账(pil 占位不花钱,不记)
+        _record_graph_cost(graph, "image", model=str(model), units=1.0,
+                           note=node["id"])
     return {"kind": "image", "value": out}
 
 
@@ -293,6 +355,9 @@ def _exec_video_gen(graph: dict, node: dict, nodemap: dict[str, dict]) -> dict:
         output_path=out, work_dir=str(_gdir(graph["id"]) / "artifacts"))
     if not r.get("ok"):
         raise RuntimeError(f"video_gen 失败: {r.get('error', r)}")
+    # 轮50(九审 P1-4):视频按秒入账(与 costing 的 video 计价单位一致)
+    _record_graph_cost(graph, "video", model=model, units=float(dur),
+                       note=node["id"])
     return {"kind": "video", "value": out,
             "meta": {"model": r.get("model"),
                      "anchored": bool(r.get("anchored")),
@@ -309,11 +374,20 @@ def _exec_tts(graph: dict, node: dict, nodemap: dict[str, dict]) -> dict:
     svc = create_tts_service(str(art_dir), str(roots.data_dir() / "voice_cast.db"))
     seg = svc.build_segment(node["id"], str(text),
                             role_code=str(p.get("role", "biz_female")))
-    svc.synthesize_segments_sync([seg])
-    out = str(art_dir / f"{node['id']}.mp3")
-    if not Path(out).exists():
-        cands = sorted(art_dir.glob(f"{_safe(node['id'])}*"))
-        out = str(cands[0]) if cands else out
+    res = svc.synthesize_segments_sync([seg])[0]
+    # 轮50(九审 P1-2):以 synthesize 返回的 output_path 为权威值,失败
+    # 显式抛——旧代码丢弃返回值后先找永远不存在的 {node_id}.mp3,再
+    # sorted(art_dir.glob(f"{node_id}*"))[0](无 _ 分隔的前缀 glob +
+    # 字典序首个):'n10_x.mp3' < 'n1_y.mp3'('0'<'_')→ 节点 n1 串到
+    # n10 的音频;改文本重跑还可能选中上一轮旧音频;合成失败时 cands
+    # 非空 → 返回旧音频且节点状态 ok。三类错都随 assemble 流出且画布
+    # 车道无声画一致性门。与 pipeline 车道轮31「静默失败必须显式」同范式。
+    out = str(getattr(res, "output_path", "") or "")
+    err = str(getattr(res, "error", "") or "")
+    if err or not out or not Path(out).is_file():
+        raise RuntimeError(f"tts 合成失败: {err or '无输出文件'}")
+    _record_graph_cost(graph, "tts", model="tts-v1", units=1.0,
+                       note=node["id"])
     return {"kind": "audio", "value": out}
 
 
@@ -562,6 +636,9 @@ def _exec_card(graph: dict, node: dict, nodemap: dict[str, dict]) -> dict:
     return {"kind": "card", "value": str(rep), "meta": card}
 
 
+# 轮50(九审 P1-4):花钱节点类型——执行前过预算熔断、成功后入账
+_SPEND_NODE_TYPES = ("image_gen", "video_gen", "tts")
+
 EXECUTORS: dict[str, Callable[[dict, dict, dict], dict]] = {
     "text": _exec_text,
     "image_gen": _exec_image_gen,
@@ -572,8 +649,7 @@ EXECUTORS: dict[str, Callable[[dict, dict, dict], dict]] = {
     "script": _exec_script,
     "storyboard": _exec_storyboard,
     "frame_prompts": _exec_frame_prompts,
-    "video_prompt": _exec_video_prompt,
-    "review": _exec_review,
+    "video_prompt": _exec_video_prompt,    "review": _exec_review,
     "card": _exec_card,
 }
 
@@ -750,6 +826,23 @@ def run_node(graph: dict, node_id: str, force: bool = False) -> dict:
         fn = EXECUTORS.get(node.get("type"))
         if not fn:
             raise ValueError(f"未知节点类型: {node.get('type')}")
+        # 轮50(九审 P1-4):花钱节点执行前预算熔断(与 pipeline 车道
+        # 每 attempt 前复查同范式)——画布车道此前零预算闸,同一把 key
+        # 在 pipeline 被 422、这里可无限花钱
+        if node.get("type") in _SPEND_NODE_TYPES:
+            bblocked = _budget_blocked(graph)
+            if bblocked:
+                st = {"ok": False, "error": bblocked,
+                      "blocked_by_budget": True,
+                      "executed_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+                node["state"] = st
+                save_graph(graph)
+                publish(graph["id"], {"type": "node", "node_id": nid,
+                                      "status": "failed",
+                                      "kind": node.get("type"),
+                                      "error": bblocked,
+                                      "blocked_by_budget": True})
+                raise RuntimeError(f"节点 {nid} 预算熔断: {bblocked}")
         publish(graph["id"], {"type": "node", "node_id": nid,
                               "status": "running",
                               "kind": node.get("type")})

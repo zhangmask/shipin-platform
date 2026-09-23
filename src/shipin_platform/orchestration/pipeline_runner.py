@@ -1610,7 +1610,12 @@ def run_assemble_phase(project_id: str, store) -> dict:
     # §10.6 宽度红线治本——720p@46px 下 10 字行 63.7% 会被验收门打死)
     _fs = int(comp_sub.get("font_size", 46) or 46)
     _cw = int(manifest.get("canvas_w") or 0) or 1280
+    # 轮51:折行预算改真字体度量(0.62×屏宽的像素数)——字符预算
+    # (1字=1em)对 CJK 低估 ~4.3%,17 字=816px=63.7% 被 §10.6 验收
+    # 打死(E2E 第 8 次:generate 全过后唯一卡点)。max_line_chars 保留
+    # 为字体不可用时的回退。
     srt = _build_srt(storyboard, tl, manifest,
+                     max_line_px=int(_cw * 0.62), font_size=_fs,
                      max_line_chars=max(4, int(_cw * 0.62 / _fs)))
     srt_path = work / "subs.srt"
     srt_path.write_text(srt, encoding="utf-8")
@@ -1867,6 +1872,8 @@ def _clip_src(manifest: dict, shot_id: str, work: Path) -> str:
 
 
 _WRAP_PUNCT = "，。！？；、,!?;:"
+_WRAP_MIN_HEAD = 6    # 折点后最少保留字符(防「主角: 」前缀孤行)
+_WRAP_MIN_ORPHAN = 3  # 末行少于此长度才触发借字(1-2 字孤行)
 
 
 def _wrap_text(text: str, max_chars: int) -> str:
@@ -1876,7 +1883,9 @@ def _wrap_text(text: str, max_chars: int) -> str:
     烧出来 63.7%,验收门直接打死整条 assemble(E2E 实证)。中文排版惯例
     是标点折行,渲染器多行 cue 基建早已就绪,这里在字幕生成侧一次治本
     (两条烧录路径都读 SRT)。max_chars<=0 = 不折(旧行为)。
-    """
+
+    轮51:字符折行保留为**回退**路径——主路径是 `_wrap_to_width` 的
+    真字体度量(1 字≈1em 的估算对 CJK 系统性低估 4.3%)。"""
     if max_chars <= 0 or len(text) <= max_chars:
         return text
     mid = len(text) / 2
@@ -1890,22 +1899,132 @@ def _wrap_text(text: str, max_chars: int) -> str:
     return text[:cut] + "\n" + text[cut:]
 
 
+def _wrap_to_width(text: str, budget_px: int, font_size: int,
+                   max_chars: int = 0) -> str:
+    """轮51:按**真字体度量**折行,每行像素宽 ≤ budget_px。
+
+    E2E 第 8 次的教训:字符预算(1 字=1em)对 CJK 系统性低估——46px
+    字号实测 advance≈48px,17 字=816px=63.7% 屏宽,§10.6 验收门
+    (≤62%)当场打死,generate 全过之后字幕成为唯一卡点。度量用
+    drawtext/libass 实际渲染的同一字体(subtitle_renderer 解析),
+    字体/PIL 不可用时回退字符折行(_wrap_text)。
+    折点优先取**最后**一个可容纳前缀内的标点(标点留上行尾,中文
+    排版惯例),无标点硬切。"""
+    if not text:
+        return text
+    from shipin_platform.tools.subtitle_renderer import measure_text_px
+    text = str(text).strip()  # 尾随空白会折出纯空格孤行(fuzz 实证)
+
+    def _w(s: str) -> Optional[int]:
+        return measure_text_px(s, font_size)
+
+    def _fits(s: str) -> bool:
+        px = _w(s)
+        if px is not None:
+            return px <= budget_px
+        return max_chars <= 0 or len(s) <= max_chars
+
+    lines: list[str] = []
+    rest = text
+    guard = 0
+    while rest:
+        guard += 1
+        if guard > 200:  # 病态输入防死循环(理论不可达)
+            lines.append(rest)
+            break
+        if _fits(rest):
+            lines.append(rest)
+            break
+        # 最长可容纳前缀
+        k = 0
+        while k < len(rest) and _fits(rest[:k + 1]):
+            k += 1
+        if k <= 0:
+            k = 1  # 单字都超预算(极端小预算)硬切一字
+        head = rest[:k]
+        # head 内最后一个标点折行(留上行尾);要求折点后至少 _WRAP_MIN_HEAD
+        # 个字符——否则「主角: 」这类前缀会孤行(前缀折行对台词行极丑)。
+        # 没有合格标点则硬切 k。
+        cut = k
+        for i in range(len(head) - 1, _WRAP_MIN_HEAD - 1, -1):
+            if head[i - 1] in _WRAP_PUNCT:
+                cut = i
+                break
+        lines.append(head[:cut])
+        rest = head[cut:] + rest[k:]
+    # 轮51 排版禁则 + 孤行控制(纯后处理,不动主循环):
+    # 1) 行首标点移到上一行行尾——中文禁则(标点不出现在行首)。行1
+    #    顶格放不下时,从行1 借一个**非标点**字符下来给标点腾位
+    #    (「…时刻 / ，从这里开始」→「…时，/ 刻从这里开始」)。只借非
+    #    标点:两端都是标点时会乒乓无进展(实测死循环,40 字标点串)。
+    fixed = [lines[0]]
+    for ln in lines[1:]:
+        prev = fixed[-1]
+        steps = 0
+        while ln and ln[0] in _WRAP_PUNCT:
+            steps += 1
+            if steps > 4 * len(ln) + 8:  # 病态防爆(理论不可达)
+                break
+            if _fits(prev + ln[0]):
+                prev, ln = prev + ln[0], ln[1:]
+                continue
+            if (len(prev) > _WRAP_MIN_HEAD and len(ln) > 1
+                    and prev[-1] not in _WRAP_PUNCT
+                    and _fits(prev[:-1] + ln[0])):
+                prev, ln = prev[:-1] + ln[0], prev[-1] + ln[1:]
+                continue
+            break
+        fixed[-1] = prev
+        fixed.append(ln)
+    lines = [l for l in fixed if l and l.strip()]
+    # 2) 末行孤字(硬切出的「适」):从上一行尾部借**非标点**字符补到
+    #    _WRAP_MIN_ORPHAN。借标点会把行尾标点变成行首(违反上面的
+    #    禁则)——那种情况宁可留 5 字短行,不制造行首标点。
+    while len(lines) >= 2 and len(lines[-1]) < _WRAP_MIN_ORPHAN:
+        prev, last = lines[-2], lines[-1]
+        while (len(last) < _WRAP_MIN_ORPHAN and len(prev) > _WRAP_MIN_HEAD
+               and prev[-1] not in _WRAP_PUNCT):
+            if not _fits(prev[-1] + last):
+                break
+            prev, last = prev[:-1], prev[-1] + last
+        if len(last) <= len(lines[-1]):
+            break  # 借不动了(预算顶格/遇标点),保持原样
+        lines[-2], lines[-1] = prev, last
+    return "\n".join(lines)
+
+
 def _build_srt(storyboard: dict, tl: list[dict], manifest: Optional[dict] = None,
-               max_line_chars: int = 0) -> str:
+               max_line_chars: int = 0, max_line_px: int = 0,
+               font_size: int = 46) -> str:
     """SRT：旁白 + 台词双轨字幕。
 
     台词镜：台词「角色: 文本」先说（窗口起点起，显示时长 = 台词实长+0.1s），
     旁白随后（align 算好的 narr_at 起）。无台词镜只出旁白。
-    max_line_chars>0 时超长行按标点折两行(轮44d,§10.6 宽度红线)。
+    折行(轮44d 引入,轮51 治本)：优先 max_line_px 真字体度量折行；
+    max_line_px<=0 时回退 max_line_chars 字符折行；都为 0 不折。
     """
     narr = {s["shot_id"]: s.get("narration", "") for s in storyboard["shots"]}
     dlg = {s["shot_id"]: s.get("dialogue") for s in storyboard["shots"]}
     ROLE_NAMES = {"hero_male": "主角", "colleague_male": "同事",
                   "assistant_female": "助理", "biz_female": "旁白"}
 
+    def _wrap(s: str) -> str:
+        if max_line_px > 0:
+            return _wrap_to_width(s, max_line_px, font_size, max_line_chars)
+        return _wrap_text(s, max_line_chars)
+
     def fmt(t):
-        h, m = int(t // 3600), int(t % 3600 // 60)
-        sec, ms = int(t % 60), int(round((t % 1) * 1000))
+        # 轮49(九审 P1):total-ms 进位式——旧实现 sec/ms 各自独立取整,
+        # (t%1)*1000 因浮点落在整数下方时 round 出 1000 → 非法时间戳
+        # `00:00:20,1000`;平台自解析(_srt_ts_to_seconds)把它读成 20.1s
+        # (应 21.0),字幕比旁白早 ~0.9s 显示、验收门在错误时间点量墨迹
+        # → 假过发货;ffmpeg/libass 自己进位而 verify 用错解析 → 间歇性
+        # 硬失败被误诊为渲染抖动。与 tools/subtitle_renderer._format_ts
+        # 的 total_ms=round(seconds*1000)+divmod 对齐(实测 1.27% 项目命中)
+        total_ms = int(round(max(float(t), 0.0) * 1000))
+        h, rem = divmod(total_ms, 3600_000)
+        m, rem = divmod(rem, 60_000)
+        sec, ms = divmod(rem, 1000)
         return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
     lines, t = [], 0.0
     idx = 1
@@ -1918,20 +2037,25 @@ def _build_srt(storyboard: dict, tl: list[dict], manifest: Optional[dict] = None
             name = ROLE_NAMES.get(role, role)
             dlg_sec = rec.get("dlg_sec") or 1.2
             d_show = min(dlg_sec + 0.1, w)
-            # 轮44d:台词行带「角色: 」前缀,预算要给前缀留位
-            dtext = _wrap_text(f"{name}: {d['text']}",
-                               max(4, max_line_chars - 2))
+            # 台词行带「角色: 」前缀——px 度量模式前缀天然占位(轮44d
+            # 的 -2 字符补贴只服务字符回退模式)
+            dtext = (_wrap_to_width(f"{name}: {d['text']}", max_line_px,
+                                    font_size,
+                                    max(4, max_line_chars - 2))
+                     if max_line_px > 0
+                     else _wrap_text(f"{name}: {d['text']}",
+                                     max(4, max_line_chars - 2)))
             lines.append(f"{idx}\n{fmt(t)} --> {fmt(t + d_show)}\n{dtext}\n")
             idx += 1
             if n:
                 ns = t + dlg_sec + 0.18
                 if ns < t + w - 0.05:
                     lines.append(f"{idx}\n{fmt(ns)} --> {fmt(t + w)}\n"
-                                 f"{_wrap_text(n, max_line_chars)}\n")
+                                 f"{_wrap(n)}\n")
                     idx += 1
         elif n:
             lines.append(f"{idx}\n{fmt(t)} --> {fmt(t + w)}\n"
-                         f"{_wrap_text(n, max_line_chars)}\n")
+                         f"{_wrap(n)}\n")
             idx += 1
         t += w
     return "\n".join(lines)

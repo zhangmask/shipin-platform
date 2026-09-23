@@ -164,3 +164,147 @@ def test_api_router():
     assert "/api/graphs/{gid}/run" in paths
     assert "/api/graphs/kit/definitions" in paths
     assert "/api/graphs" in paths
+
+
+# ── 轮50(九审 P1-2/P1-4):画布车道 TTS 输出诚信 + 成本/预算 ─────────
+
+class _FakeSeg:
+    def __init__(self, sid: str):
+        self.shot_id = sid
+        self.output_path = ""
+        self.error = ""
+        self.text = "x"
+        self.duration_sec = 1.0
+        self.voice = "v"
+
+
+class _FakeTts:
+    """按真实命名({shot_id}_{uuid8}.mp3)落盘的假 TTS 服务。"""
+
+    def __init__(self, work, db):
+        self._work = Path(work)
+        self._work.mkdir(parents=True, exist_ok=True)  # 真服务会建工作目录
+
+    def build_segment(self, sid, text, role_code=None, voice=None,
+                      rate="-6%"):
+        return _FakeSeg(sid)
+
+    def synthesize_segments_sync(self, segs):
+        outs = []
+        for s in segs:
+            p = self._work / f"{s.shot_id}_deadbeef.mp3"
+            p.write_bytes(b"mp3-" + s.shot_id.encode())
+            s.output_path = str(p)
+            outs.append(s)
+        return outs
+
+
+def _patch_fake_tts(monkeypatch):
+    import shipin_platform.services.tts_service as ts_mod
+    monkeypatch.setattr(ts_mod, "create_tts_service",
+                        lambda work, db: _FakeTts(work, db))
+
+
+class TestCanvasTtsIntegrity:
+    """轮50(九审 P1-2):_exec_tts 旧实现丢弃返回值 + 无 _ 分隔前缀 glob
+    + 字典序首个 → 节点 n1 串到 n10 的音频('0'<'_')、重跑选中旧文件、
+    失败返回旧音频且状态 ok。三类错随 assemble 流出且无声画一致性门。"""
+
+    def test_two_nodes_do_not_cross_audio(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(engine, "GRAPHS_DIR", tmp_path)
+        _patch_fake_tts(monkeypatch)
+        g = _make()
+        g["nodes"] = [
+            {"id": "n1", "type": "tts", "x": 0, "y": 0,
+             "params": {"text": "第一段"}},
+            {"id": "n10", "type": "tts", "x": 0, "y": 100,
+             "params": {"text": "第十段"}},
+        ]
+        # 先跑 n10(n10_*.mp3 先落盘),再跑 n1——旧实现的
+        # sorted(glob("n1*"))[0] 此时会命中 'n10_deadbeef.mp3'
+        # ('0'<'_' 字典序),节点 n1 拿到 n10 的音频
+        r10 = run_node(g, "n10")
+        r1 = run_node(g, "n1")
+        v1 = r1["outputs"]["audio"]["value"]
+        v10 = r10["outputs"]["audio"]["value"]
+        assert Path(v1).read_bytes() == b"mp3-n1", v1
+        assert Path(v10).read_bytes() == b"mp3-n10", v10
+
+    def test_failure_raises_not_stale_audio(self, tmp_path, monkeypatch):
+        """合成失败 + art 目录留有上一轮旧文件 → 必须抛,不得返回旧音频
+        且节点 ok(轮31 同范式:静默失败必须显式)。"""
+        import shipin_platform.services.tts_service as ts_mod
+
+        class _FailTts(_FakeTts):
+            def synthesize_segments_sync(self, segs):
+                for s in segs:
+                    s.error = "edge-tts timeout"
+                return segs
+
+        monkeypatch.setattr(engine, "GRAPHS_DIR", tmp_path)
+        monkeypatch.setattr(ts_mod, "create_tts_service",
+                            lambda work, db: _FailTts(work, db))
+        g = _make()
+        g["nodes"] = [{"id": "n1", "type": "tts", "x": 0, "y": 0,
+                       "params": {"text": "第一段"}}]
+        art = engine._gdir(g["id"]) / "artifacts"
+        art.mkdir(parents=True)
+        (art / "n1_oldbeef.mp3").write_bytes(b"stale")  # 上一轮旧音频
+        with pytest.raises(RuntimeError) as ei:
+            run_node(g, "n1")
+        assert "tts 合成失败" in str(ei.value)
+        st = g["nodes"][0]["state"]
+        assert st["ok"] is False and "edge-tts timeout" in st["error"]
+
+
+class TestCanvasCostAndBudget:
+    """轮50(九审 P1-4):画布车道此前零记账零预算——image/video/tts
+    直连付费供应商,同 key 在 pipeline 被 422、这里无限花钱。"""
+
+    def test_spend_nodes_record_cost(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(engine, "GRAPHS_DIR", tmp_path)
+        import shipin_platform.generation.generate_assets as ga
+        monkeypatch.setattr(
+            ga, "generate_image_agnes",
+            lambda prompt, w, h, out, model="": (
+                Path(out).write_bytes(b"png"),
+                {"ok": True})[1])
+        g = _make()
+        g["nodes"] = [{"id": "img1", "type": "image_gen", "x": 0, "y": 0,
+                       "params": {"model": "agnes-image-2.1-flash",
+                                  "prompt": "x"}}]
+        r = run_node(g, "img1")
+        assert r["ok"] is True
+        from shipin_platform.services.costing import cost_file
+        fp = cost_file(f"graph-{g['id']}")
+        assert fp.is_file(), "画布花钱节点必须入账(此前零记账)"
+        rows = json.loads(fp.read_text(encoding="utf-8"))
+        assert rows and rows[-1]["kind"] == "image"
+        assert rows[-1]["usd"] >= 0.0
+
+    def test_budget_blocks_spend_node(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(engine, "GRAPHS_DIR", tmp_path)
+        import shipin_platform.generation.generate_assets as ga
+        monkeypatch.setattr(
+            ga, "generate_image_agnes",
+            lambda prompt, w, h, out, model="": (
+                Path(out).write_bytes(b"png"),
+                {"ok": True})[1])
+        g = _make()
+        g["nodes"] = [{"id": "img1", "type": "image_gen", "x": 0, "y": 0,
+                       "params": {"model": "agnes-image-2.1-flash",
+                                  "prompt": "x"}}]
+        run_node(g, "img1")  # 先花一笔入账
+        # 配一个低于已用额的预算
+        bfp = (engine.roots.data_dir() / "projects"
+               / f"graph-{g['id']}" / "budget.json")
+        bfp.parent.mkdir(parents=True, exist_ok=True)
+        bfp.write_text(json.dumps({"max_budget_usd": 0.000001}),
+                       encoding="utf-8")
+        # 改参数让缓存失效 → 再跑必须被预算熔断
+        g["nodes"][0]["params"]["prompt"] = "y"
+        with pytest.raises(RuntimeError) as ei:
+            run_node(g, "img1")
+        assert "预算熔断" in str(ei.value)
+        st = g["nodes"][0]["state"]
+        assert st.get("blocked_by_budget") is True

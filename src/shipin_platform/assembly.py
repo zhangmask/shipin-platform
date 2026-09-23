@@ -62,7 +62,15 @@ def align_narration(shots: list[dict], min_tail: float = MIN_TAIL,
     - window = max(storyboard_dur, tts + min_tail)，再 clamp 到 master 可供长度
     - tts + min_tail > master 可供 → SPILL（旁白比素材还长，必须缩句）
     - window - tts > max_gap → DEAD_AIR finding（分镜给的时间太长，缩窗）
+
+    轮49(九审 P2-5)纵深钳制:负 min_tail/max_gap/master_duration 会把
+    needed 压到 0 让 SPILL 判据失效(旁白 2s 落进 1s 窗仍判 ok)、负
+    master 甚至产出负窗口——API 模型层已拦(AlignRequest validators),
+    这里对**内部调用方**同样兜底,不让「负参数=越窗绿」在任何路径成立。
     """
+    min_tail = max(float(min_tail), 0.0)
+    max_gap = max(float(max_gap), 0.0)
+    master_duration = max(float(master_duration), 0.1)
     findings: list[dict] = []
     timeline: list[dict] = []
     t = 0.0

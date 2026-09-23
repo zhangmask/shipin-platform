@@ -87,13 +87,17 @@ def _load_rows(project_id: str) -> list[dict]:
     半路)旧代码返回 [],预算闸判定"没花钱"重新放行,历史账目无声消失
     (七审 #5:账本清零=给预算闸开后门)。现在:备份损坏文件 + 记
     ledger_corrupt 事件 + **抛 LedgerCorruptError** 让调用方显式失败。
-    进程内锁见 record_cost。"""
+    进程内锁见 record_cost。
+
+    轮49(九审 P3-9):「合法 JSON 但结构不是 list」(dict/str/num)同样
+    抛——旧代码 `rows if isinstance(rows, list) else []` 对结构损坏
+    静默返空账,与 JSONDecodeError 的处理自相矛盾(七审 #5 的设计意图
+    是任何损坏都不空账)。"""
     fp = cost_file(project_id)
     if not fp.exists():
         return []
     try:
         rows = json.loads(fp.read_text(encoding="utf-8"))
-        return rows if isinstance(rows, list) else []
     except (json.JSONDecodeError, OSError) as e:
         try:
             bak = fp.with_suffix(f".corrupt-{int(time.time())}.json")
@@ -103,6 +107,16 @@ def _load_rows(project_id: str) -> list[dict]:
         raise LedgerCorruptError(
             f"成本账本损坏已备份({bak.name}): {type(e).__name__}——"
             f"拒绝按空账继续(那会让预算闸重新放行);请人工核对后删除备份或修复")
+    if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
+        try:
+            bak = fp.with_suffix(f".corrupt-{int(time.time())}.json")
+            fp.replace(bak)
+        except OSError:
+            bak = fp
+        raise LedgerCorruptError(
+            f"成本账本结构损坏已备份({bak.name}): "
+            f"{type(rows).__name__} 非 list[dict]——拒绝按空账继续")
+    return rows
 
 
 def record_cost(project_id: str, kind: str, *,
@@ -111,16 +125,21 @@ def record_cost(project_id: str, kind: str, *,
 
     轮43(七审 #5):读-改-写全程加进程内锁(异步任务 ThreadPoolExecutor
     并发 record_cost 会丢行),写改 mkstemp+os.replace 原子写(截断式
-    write_text 在半路被杀会留下损坏 JSON→旧 _load_rows 静默清零)。"""
+    write_text 在半路被杀会留下损坏 JSON→旧 _load_rows 静默清零)。
+
+    轮49(九审 P1-3):units 钳到 [0, 1e6]——负 units 会把 total_usd 拉低,
+    `used > max` 的预算判据被反向掏空(裸端点曾可注入负 duration 持续
+    放行超预算项目,伪造账目方向)。钳制是纵深防御:调用方仍应校验入参。"""
     with _LEDGER_LOCK:
-        usd = round(unit_usd(kind) * float(units), 6)
+        units = min(max(float(units), 0.0), 1_000_000.0)
+        usd = round(unit_usd(kind) * units, 6)
         rows = _load_rows(project_id)
         row = {
             "seq": (rows[-1]["seq"] + 1) if rows else 1,
             "ts": round(time.time(), 3),
             "kind": kind,
             "model": model,
-            "units": float(units),
+            "units": units,
             "usd": usd,
             "note": note,
         }

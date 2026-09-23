@@ -877,6 +877,95 @@ def test_gate_endpoints_require_project_id(client):
     assert r.status_code == 422
 
 
+class TestInputGuards:
+    """轮49(九审):裸端点入参诚信——负 duration 负成本、align 负参数
+    越窗、reference_id 读侧穿越、账本损坏时只读端点不 500。"""
+
+    def test_agnes_video_duration_rejects_negative(self):
+        import pydantic
+        from api import GenerateAgnesVideoRequest as R
+        for bad in (-5, 0):
+            with pytest.raises(pydantic.ValidationError):
+                R(prompt="x", duration=bad, output_path="o.mp4",
+                  project_id="p")
+
+    def test_agnes_video_duration_clamped_high(self):
+        from api import GenerateAgnesVideoRequest as R
+        r = R(prompt="x", duration=500, output_path="o.mp4",
+              project_id="p")
+        assert r.duration == 60
+
+    def test_align_rejects_negative_params(self):
+        import pydantic
+        from api import AlignRequest
+        for field in ("min_tail", "max_gap", "master_duration"):
+            kw = {"shots": [], field: -1.0}
+            with pytest.raises(pydantic.ValidationError):
+                AlignRequest(**kw)
+
+    def test_align_internal_clamp_neutralizes_negative_min_tail(
+            self, tmp_path):
+        """九审 P2-5 复现形态:min_tail=-2.0 时 needed=voice_tail+min_tail
+        被压到 0,SPILL(needed>master)失效,旁白 2s 落进 1s 窗仍判 ok。
+        API 模型层已拦(AlignRequest),这里验证 align 内部的纵深钳制:
+        负参数照样中和(needed 不为负 → SPILL 恢复拦截)。"""
+        import subprocess as _sp
+        from shipin_platform.assembly import align_narration
+        wav = tmp_path / "nar.wav"
+        _sp.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                 "-i", "sine=frequency=300:duration=2", str(wav)],
+                check=True, capture_output=True)
+        r = align_narration([{"shot_id": "S1", "duration_sec": 1.0,
+                              "narration_path": str(wav)}],
+                            min_tail=-2.0, master_duration=1.5)
+        assert r["verdict"] == "fix", r
+        assert any(f["code"] == "SPILL" for f in r["findings"]), r["findings"]
+
+    def test_reference_preloaded_rejects_traversal(self):
+        from fastapi import HTTPException
+        from api import _reference_preloaded
+        with pytest.raises(HTTPException) as ei:
+            _reference_preloaded("../projects/x/storyboard")
+        assert ei.value.status_code == 422
+
+    def test_reference_preloaded_rejects_absolute_and_dots(self):
+        from fastapi import HTTPException
+        from api import _reference_preloaded
+        for bad in ("..", "a/b", "..\\x", "", "a b"):
+            with pytest.raises(HTTPException) as ei:
+                _reference_preloaded(bad)
+            assert ei.value.status_code == 422, bad
+
+    def test_reference_preloaded_missing_is_404(self):
+        from fastapi import HTTPException
+        from api import _reference_preloaded
+        with pytest.raises(HTTPException) as ei:
+            _reference_preloaded("definitely-not-exist-9f8e7d")
+        assert ei.value.status_code == 404
+
+    def test_cost_snapshot_corrupt_ledger_is_honest(self, monkeypatch,
+                                                    tmp_path):
+        """账本损坏:_cost_snapshot 返回 ledger_corrupt 快照(不 500、
+        不猜 0),preflight/report 据此诚实呈现。"""
+        import uuid as _uuid_lg
+        import api
+        from shipin_platform.services.costing import (LedgerCorruptError,
+                                                      cost_file)
+        pid = f"snap-corrupt-{_uuid_lg.uuid4().hex}"
+        fp = cost_file(pid)
+        fp.write_text("{not json", encoding="utf-8")
+        snap = api._cost_snapshot(pid)
+        assert snap["ledger_corrupt"] is True
+        assert snap["total_usd"] is None
+        assert snap["reason"]
+
+    def test_cost_snapshot_ok_ledger(self):
+        import api
+        snap = api._cost_snapshot("never-spent-project-xyz")
+        assert snap["ledger_corrupt"] is False
+        assert snap["total_usd"] == 0.0
+
+
 class TestClipSrcFallback:
     """时间轴红线与拼接共用 _clip_src 回退：旧项目 manifest 缺 clip 字段
     （或空串）时按约定命名解析，不得算成全员复用空串而误杀 REUSE 红线

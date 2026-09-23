@@ -426,6 +426,39 @@ def _resolve_font_path(font_path=None) -> str:
     raise FileNotFoundError("no CJK font found (msyh.ttc / simhei.ttf)")
 
 
+_FONT_CACHE: dict = {}
+
+
+def measure_text_px(text: str, font_size: int, font_path=None) -> Optional[int]:
+    """轮51:用 drawtext/libass 实际使用的同一字体度量文本像素宽。
+
+    为什么需要它：字幕折行曾按字符数估算（1 字 ≈ 1 em），但 CJK 字形
+    advance 实测 ≈1.04em（46px 字号 ≈48px/字）——17 字预算（按
+    0.62×1280/46 算）烧出来 816px = 63.7% 屏宽，恰好被 §10.6 验收门
+    （≤62%）打死（E2E 第 8 次实证，字幕成为 generate 全过之後唯一
+    的卡点）。用真字体度量后折行预算与渲染结果一致。
+    PIL/字体不可用 → None（调用方回退字符估算）。
+    字体对象与 Draw 单件按 (path, size) 缓存——_wrap_to_width 逐字符
+    度量,每次重新 truetype 加载 + ImageDraw 初始化会让 40 字长句的
+    折行慢一个数量级(实测 300 句 >120s → <1s)。"""
+    if not text:
+        return 0
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        fp = _resolve_font_path(font_path)
+        key = (fp, int(font_size))
+        ent = _FONT_CACHE.get(key)
+        if ent is None:
+            f = ImageFont.truetype(fp, int(font_size))
+            d = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+            ent = (f, d)
+            _FONT_CACHE[key] = ent
+        f, d = ent
+        return int(d.textlength(str(text), font=f))
+    except Exception:
+        return None
+
+
 def _ffprobe_size(video: _Path) -> tuple[int, int]:
     r = _subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
