@@ -7,6 +7,7 @@
 - run_assemble_phase 的 video_gen 闸门（未生成直接拦，不再静默混拼）
 """
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -315,6 +316,55 @@ class TestGenerateNoSilentSkip:
         # stale qc 必须被清掉,不允许 ok 离场
         m = pr._load(pid, "manifest.json")
         assert m["shots"]["S01"]["qc"] == "fix"
+
+    def test_keyframe_critical_survives_successful_generation(
+            self, monkeypatch, tmp_path):
+        """八审 P0#1:keyframe 门的 critical 必须活到 shots_review.json
+        ——旧代码 keyframe 分支另起 _load 副本保存,qc=ok 分支用循环前
+        的旧字典整体 _save 把它抹掉,happy path 下关键帧门 100% 失效。"""
+        import subprocess as _sp
+        from shipin_platform.review import hard_gates as hg
+        pid = "gen-kfover"
+        # 状态隔离:固定 pid 的项目目录跨运行残留会让 L904 的 _load 把
+        # 上一轮(修复后)的 __keyframe_* 条目带进内存,旧代码的覆盖 bug
+        # 被残留掩盖——测试专验内存字典覆盖,必须先清场(实测教训)
+        shutil.rmtree(pr._project_dir(pid), ignore_errors=True)
+        store = self._seed(pid)
+
+        def _fake_gen(prompt, duration=5, resolution="720p", work_dir=None,
+                      first_frame=None, last_frame=None, output_path=None,
+                      negative_prompt="", **kw):
+            out = output_path or str(tmp_path / "f.mp4")
+            _sp.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                     "-i", "testsrc2=duration=3:size=320x240:r=24",
+                     "-c:v", "libx264", "-pix_fmt", "yuv420p", out],
+                    check=True, capture_output=True)
+            return {"ok": True, "output": out, "master_path": ""}
+
+        monkeypatch.setattr(pr, "generate_video_agnes", _fake_gen)
+
+        def _fake_img(*a, **k):
+            out = pr._project_dir(pid) / "S01.jpg"
+            _sp.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                     "-i", "testsrc2=duration=1:size=320x240:r=24",
+                     "-frames:v", "1", str(out)],
+                    check=True, capture_output=True)
+            return {"ok": True, "output": str(out)}
+
+        monkeypatch.setattr(pr, "generate_image_agnes", _fake_img)
+        monkeypatch.setattr(hg, "check_keyframes", lambda shots: {
+            "verdict": "fix",
+            "findings": [{"severity": "critical", "code": "KEYFRAME_MISMATCH",
+                          "message": "关键帧与分镜主体不符(stub)"}]})
+        r = pr.run_generate_phase(pid, store)
+        assert r["ok"] is True, str(r.get("reason"))[:200]
+        sr = pr._load(pid, "shots_review.json") or {}
+        assert "__keyframe_S01__" in sr, sorted(sr.keys())
+        kf = sr["__keyframe_S01__"]
+        assert kf["verdict"] == "fix"
+        assert any(f["code"] == "KEYFRAME_MISMATCH" for f in kf["findings"])
+        # 单镜 VLM 条目与 keyframe 条目必须共存(不是互相覆盖)
+        assert "S01" in sr, sorted(sr.keys())
 
     def test_successful_generation_still_ok(self, monkeypatch, tmp_path):
         """轮44 反向:生成成功时流程照旧(修复不能误伤正常路径)。"""
@@ -632,6 +682,163 @@ class TestGenerateFailureDiagnosis:
         # VLM 不可用原因进 note(可解释),不进 critical
         assert all("vlm timeout" in str(a.get("vlm_note"))
                    for a in att), att
+
+
+class TestDialogueOnlyShots:
+    """轮47(八审 P2#2):纯台词镜(narration 空、dialogue 有词)是合法
+    剧本形态(模板:每镜 narration 或 dialogue 至少其一,全片至少 2 镜
+    dialogue)——旧代码只认旁白轨,台词 TTS 实际合成成功也报「TTS
+    缺失」,合法剧本永远无法出片且报错指错方向。"""
+
+    def _seed_dlg_only(self, pid: str):
+        import subprocess as _sp
+        from shipin_platform.contracts import stable_artifact_hash
+        pr._save(pid, "brief.json", {"product_info": "x", "duration_sec": 9,
+                                     "brand_name": "测试牌"})
+        pr._save(pid, "storyboard.json", {
+            "hero_shot": "S01",
+            # S01 纯台词(非末镜——末镜会被 _bind_brand 强制写品牌旁白,
+            # 那是品牌确定性通道的设计行为);S02 常规旁白镜
+            "shots": [
+                {"shot_id": "S01", "duration_sec": 3, "narration": "",
+                 "dialogue": {"role_code": "assistant_female",
+                              "text": "欢迎光临"},
+                 "beat": "hook", "scene": "门口", "subject": "杯",
+                 "motion": "steam rises slowly", "spatial": "center",
+                 "camera": "dolly in", "shot_size": "cu"},
+                {"shot_id": "S02", "duration_sec": 3, "narration": "好喝的咖啡",
+                 "dialogue": "", "beat": "value", "scene": "店内",
+                 "subject": "杯", "motion": "steam drifts", "spatial": "center",
+                 "camera": "truck left", "shot_size": "cu"}]})
+        ip = {"style_anchor": "soft light",
+              "shot_prompts": [{"shot_id": "S01", "prompt_en": "a cup"},
+                               {"shot_id": "S02", "prompt_en": "a cup"}]}
+        vp = {"shot_prompts": [{"shot_id": "S01", "prompt_text": "steam"},
+                               {"shot_id": "S02", "prompt_text": "steam"}]}
+        pr._save(pid, "image_prompt.json", ip)
+        pr._save(pid, "video_prompt.json", vp)
+        store = ProjectStageStore(":memory:")
+        store.create_project(pid)
+        store.record_confirmation(pid, "script")
+        store.record_confirmation(pid, "storyboard")
+        store.record_artifact(pid, "script", "h")
+        store.record_artifact(pid, "storyboard", "h")
+        store.record_artifact(pid, "image_prompt", stable_artifact_hash(ip))
+        store.record_artifact(pid, "video_prompt", stable_artifact_hash(vp))
+        pr._save(pid, "manifest.json", {"shots": {"S01": {}, "S02": {}}})
+        return store
+
+    def test_dialogue_only_shot_generates(self, monkeypatch, tmp_path):
+        """台词镜必须能出片:manifest 落 dlg 轨、无旁白轨、align ok。"""
+        import subprocess as _sp
+        pid = "gen-dlgonly"
+        shutil.rmtree(pr._project_dir(pid), ignore_errors=True)
+        store = self._seed_dlg_only(pid)
+
+        def _fake_gen(prompt, duration=5, resolution="720p", work_dir=None,
+                      first_frame=None, last_frame=None, output_path=None,
+                      negative_prompt="", **kw):
+            out = output_path or str(tmp_path / "f.mp4")
+            _sp.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                     "-i", "testsrc2=duration=3:size=320x240:r=24",
+                     "-c:v", "libx264", "-pix_fmt", "yuv420p", out],
+                    check=True, capture_output=True)
+            return {"ok": True, "output": out, "master_path": ""}
+
+        monkeypatch.setattr(pr, "generate_video_agnes", _fake_gen)
+
+        def _fake_img(prompt, w, h, out, *a, **k):
+            # 按调用方给的输出路径写(多镜各写各的首/末帧)
+            _sp.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                     "-i", "testsrc2=duration=1:size=320x240:r=24",
+                     "-frames:v", "1", str(out)],
+                    check=True, capture_output=True)
+            return {"ok": True, "output": str(out)}
+
+        monkeypatch.setattr(pr, "generate_image_agnes", _fake_img)
+        r = pr.run_generate_phase(pid, store)
+        assert r["ok"] is True, str(r.get("reason"))[:300]
+        mrec = pr._load(pid, "manifest.json")["shots"]["S01"]
+        assert mrec.get("dlg") and Path(mrec["dlg"]).is_file(), mrec
+        assert not mrec.get("tts"), mrec  # 台词镜不写旁白轨
+        # 指纹照记(台词文本变化仍作废旧 dlg)
+        assert mrec.get("tts_text_sha")
+
+    def test_align_dialogue_only_not_narration_missing(self, tmp_path):
+        """align 层:纯台词镜不得被判 NARRATION_MISSING(旧代码只要
+        narration_path 空就 critical,台词轨照常落位也拦)。"""
+        from shipin_platform.assembly import align_narration
+        dlg = tmp_path / "d.mp3"
+        import subprocess as _sp
+        _sp.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                 "-i", "sine=frequency=300:duration=1.2", str(dlg)],
+                check=True, capture_output=True)
+        r = align_narration([{"shot_id": "S01", "duration_sec": 3.0,
+                              "narration_path": None,
+                              "dialogue_path": str(dlg)}])
+        assert r["verdict"] == "ok", r["findings"]
+        t = r["timeline"][0]
+        assert t["dlg_sec"] >= 1.0
+        assert t["window_sec"] >= 3.0
+
+    def test_align_no_voice_at_all_still_critical(self, tmp_path):
+        """反向:旁白台词都没有(该镜彻底无声)仍 critical——修复不能
+        把「无声镜」也放行。"""
+        from shipin_platform.assembly import align_narration
+        r = align_narration([{"shot_id": "S01", "duration_sec": 3.0,
+                              "narration_path": None,
+                              "dialogue_path": None}])
+        assert r["verdict"] == "fix"
+        assert any(f["code"] == "NARRATION_MISSING" for f in r["findings"])
+
+
+class TestClipPoolSemantics:
+    """轮47(八审 P3):_clip_is_pooled 旧判据(parent != 项目目录)把
+    项目**子目录**里的 clip 也误判成池化——池化分支的新鲜度不比
+    prompt 指纹,stale qc==ok + clip_shot_sha 可把任意旧 clip 塞回
+    时间线。语义:项目目录树内 = 本地产物,树外 = 池。"""
+
+    def test_project_subdir_is_not_pooled(self, tmp_path, monkeypatch):
+        from shipin_platform.orchestration import pipeline_runner as pr
+        pid = "pool-sub"
+        monkeypatch.setattr(pr, "_project_dir", lambda p: tmp_path / p)
+        proj = tmp_path / pid
+        (proj / "work" / "parts").mkdir(parents=True)
+        mrec = {"clip": str(proj / "work" / "parts" / "S01.mp4")}
+        assert pr._clip_is_pooled(mrec, pid) is False, \
+            "项目内子目录 clip 是本地产物,必须走全输入指纹"
+
+    def test_project_root_is_not_pooled(self, tmp_path, monkeypatch):
+        from shipin_platform.orchestration import pipeline_runner as pr
+        pid = "pool-root"
+        monkeypatch.setattr(pr, "_project_dir",
+                            lambda p: tmp_path / p)
+        proj = tmp_path / pid
+        proj.mkdir(parents=True)
+        mrec = {"clip": str(proj / "S01_canvas.mp4")}
+        assert pr._clip_is_pooled(mrec, pid) is False
+
+    def test_other_project_dir_is_pooled(self, tmp_path, monkeypatch):
+        from shipin_platform.orchestration import pipeline_runner as pr
+        pid = "pool-self"
+        monkeypatch.setattr(pr, "_project_dir",
+                            lambda p: tmp_path / p)
+        (tmp_path / pid).mkdir(parents=True)
+        (tmp_path / "coffee-v7").mkdir(parents=True)
+        mrec = {"clip": str(tmp_path / "coffee-v7" / "S01_clip.mp4")}
+        assert pr._clip_is_pooled(mrec, pid) is True, \
+            "别的项目目录 = 共享素材池(变体复用基准,设计行为)"
+
+    def test_sibling_prefix_dir_is_pooled(self, tmp_path, monkeypatch):
+        """前缀相似但不同的目录(coffee-v7 vs coffee-v7x)不得误判树内。"""
+        from shipin_platform.orchestration import pipeline_runner as pr
+        pid = "pool-abc"
+        monkeypatch.setattr(pr, "_project_dir",
+                            lambda p: tmp_path / p)
+        (tmp_path / pid).mkdir(parents=True)
+        (tmp_path / (pid + "x")).mkdir(parents=True)
+        mrec = {"clip": str(tmp_path / (pid + "x") / "S01.mp4")}
+        assert pr._clip_is_pooled(mrec, pid) is True
 
 
 class TestSubtitleWrap:

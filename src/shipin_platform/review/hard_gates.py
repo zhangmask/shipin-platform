@@ -140,7 +140,17 @@ def check_timeline(timeline, duration_sec: Optional[float] = None,
         })
 
     # 3) duration coverage
-    last_edge = max(c["at"] + (c["end"] or 0) - (c["start"] or 0) for c in clips)
+    # 契约:at = 片段在时间轴上的起点(legacy 元组 [src,start,end,at] 的
+    # start/end 是 clip 内相对量、at 才是绝对位;调用方曾把 narr_at 当 at
+    # 传进来导致覆盖高估——轮47 已在调用方(pipeline)改为传窗口起点)。
+    # 这里对「end 已是绝对边界」的调用形态(pipeline 传绝对 start/end)
+    # 做兼容:end > at 时 end 即边界,否则按 at + (end-start) 估算。
+    def _edge(c: dict) -> float:
+        at, start, end = c["at"], c["start"], c["end"]
+        if end > at:
+            return end
+        return at + max(end - start, 0.0)
+    last_edge = max(_edge(c) for c in clips)
     cov = last_edge
     if total and abs(cov - total) > 0.25 and abs(cov - total) / total > 0.03:
         findings.append({
@@ -188,15 +198,24 @@ _NARR_SILENCE_DB = -45.0       # 静音判定阈值(dB)
 
 def _silence_spans(video: str, noise_db: float = _NARR_SILENCE_DB,
                    min_dur: float = 0.35) -> list[tuple[float, float]]:
-    """ffmpeg silencedetect → [(start, end)] 静音段(秒)。never raises。"""
+    """ffmpeg silencedetect → [(start, end)] 静音段(秒)。
+
+    轮47(八审 P1#1):旧实现把 subprocess 起不来/解码失败一律吞成
+    `[]`——调用方把「空静音表」读成「处处有声」,ffmpeg 缺失时所有
+    台词窗口判 ok,协议失败冒充判定。现在协议失败显式抛,由调用方
+    转成 blocked(available=False)。"""
     try:
         r = subprocess.run(
             ["ffmpeg", "-v", "info", "-i", str(video),
              "-af", f"silencedetect=noise={noise_db}dB:d={min_dur}",
              "-f", "null", "-"],
             capture_output=True, text=True)
-    except Exception:
-        return []
+    except Exception as e:
+        raise RuntimeError(f"silencedetect 无法执行(协议失败): {e}") from e
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"silencedetect rc={r.returncode}(协议失败): "
+            f"{(r.stderr or '')[:80]}")
     text = (r.stderr or "") + (r.stdout or "")
     starts = [float(m) for m in re.findall(
         r"silence_start:\s*([0-9.]+)", text)]
@@ -236,7 +255,18 @@ def check_narration_presence(video: str, shots: list[dict]) -> dict:
                               "message": "成片无音轨——旁白/氛围声全部缺失,"
                                          "音画审查不可用"}],
                 "stats": {"checked": 0}}
-    spans = _silence_spans(video)
+    # 轮47(八审 P1#1):silencedetect 协议失败(ffmpeg 缺失/解码错)
+    # 必须转 blocked——旧路径 _silence_spans 吞错返回 [],把「空静音
+    # 表」读成「处处有声」→ 全窗口判 ok,协议失败冒充判定
+    try:
+        spans = _silence_spans(video)
+    except Exception as e:
+        return {"verdict": "blocked", "available": False,
+                "findings": [{
+                    "severity": "warning", "code": "NARRATION_PROBE_FAILED",
+                    "message": (f"silencedetect 探测失败(协议失败,非判定): "
+                                f"{str(e)[:100]}——旁白存在性未审,不视为通过")}],
+                "stats": {"checked": 0}}
 
     def _sounding(a: float, b: float) -> float:
         """[a,b] 内非静音时长。"""
@@ -522,10 +552,15 @@ def check_keyframes(shots: list[dict], key: Optional[str] = None) -> dict:
     合并通道(终审统一阻断)。"""
     key = key or _vlm_credentials()
     findings: list[dict] = []
-    checked, skipped = 0, 0
+    checked, skipped, unavailable = 0, 0, 0
     if not key:
-        return {"verdict": "ok", "findings": [], "stats": {"checked": 0},
-                "reason": "AGNES_KEY 未配置，跳过关键帧审图"}
+        # 八审 P0#2:无 key 是协议失败不是判定——旧代码返回 verdict
+        # "ok",调用方把 "ok" 写进 manifest,"没审到"被记成"审过了"
+        # (与 vlm_review_final 的 "blocked" 约定也不一致)。blocked
+        # 不进 findings、不并审,但状态誠实可见
+        return {"verdict": "blocked", "findings": [],
+                "stats": {"checked": 0, "unavailable": 0},
+                "reason": "AGNES_KEY 未配置：关键帧审图未执行(协议失败,非通过)"}
     for s in shots:
         if not isinstance(s, dict):
             continue
@@ -537,6 +572,9 @@ def check_keyframes(shots: list[dict], key: Optional[str] = None) -> dict:
             continue
         r = vlm_image_matches_text(img, s, key)
         if not r.get("available"):
+            # 协议失败单镜跳过并计数:整批不可用时 verdict=blocked
+            # (不能是 ok);部分可用时 warning 提示覆盖不全
+            unavailable += 1
             continue
         checked += 1
         if not r.get("match"):
@@ -547,9 +585,19 @@ def check_keyframes(shots: list[dict], key: Optional[str] = None) -> dict:
                             f"(主体[{subj[:24]}] 场景[{scene[:16]}]): "
                             f"{r.get('reason', '')[:100]}——视频以该帧为条件"
                             f"生成必歪,应重新生成关键帧")})
-    return {"verdict": "ok" if not findings else "fix",
-            "findings": findings,
-            "stats": {"checked": checked, "skipped": skipped}}
+    if checked == 0:
+        verdict = "blocked" if unavailable > 0 else "ok"
+    else:
+        verdict = "fix" if findings else "ok"
+        if unavailable > 0:
+            findings.append({
+                "severity": "warning", "code": "KEYFRAME_UNVERIFIED",
+                "message": (f"{unavailable} 镜关键帧审图协议失败未审到"
+                            f"(VLM 不可用)——已审 {checked} 镜的结论不受"
+                            f"影响,未审部分不视为通过")})
+    return {"verdict": verdict, "findings": findings,
+            "stats": {"checked": checked, "skipped": skipped,
+                      "unavailable": unavailable}}
 
 
 # ── final-video VLM gate ───────────────────────────────────────────
@@ -608,8 +656,15 @@ def _extract_frames(video: Path, count: int) -> tuple[list[dict], str]:
         ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(video)],
         capture_output=True, text=True)
     dur = float(json.loads(probe.stdout)["format"]["duration"])
-    times = sorted({0.5} | {dur * i / count for i in range(1, count + 1)} | {max(0.0, dur - 0.5)})
-    times = times[:count]
+    # 轮47(八审 P4):旧实现候选 count+2 个点(首锚 + count 个铺点 +
+    # 尾锚)后 `times[:count]` 按排序砍掉**最大**的几个——docstring
+    # 许诺的 "start + spread + end" 里 end 锚点恒丢失(30s 片
+    # count=12 时最后 2.5s 无帧,片尾异常整个漏出)。改为钉住首/尾
+    # 锚点,中间 count-2 个铺点均分;短片首尾重叠时去重保序。
+    lo, hi = 0.5, max(0.5, dur - 0.5)
+    pts = [lo] + [lo + (hi - lo) * k / max(1, count - 1)
+                  for k in range(1, count - 1)] + [hi]
+    times = sorted({round(p, 2) for p in pts})
     tmp = tempfile.mkdtemp(prefix="vlm_gate_")
     frames = []
     for i, t in enumerate(times):
@@ -900,7 +955,7 @@ def _identity_gate(video: Path, shots: list[dict], key: str,
        头部换人,这类同一镜头内部的更换此前只能靠跨镜中帧间接撞见且
        归属错位,现在直接钉在该镜上。
     只有在 VLM 判定"不是同一人"时输出 findings。审计盲区①(A 节)的落地。"""
-    pairs, checked, findings = [], 0, []
+    pairs, checked, unavailable, findings = [], 0, 0, []
     for i in range(len(shots) - 1):
         a, b = shots[i], shots[i + 1]
         if not isinstance(a, dict) or not isinstance(b, dict):
@@ -919,18 +974,20 @@ def _identity_gate(video: Path, shots: list[dict], key: str,
         cmp = _compare_person(video, t0a + da / 2,
                               t0a + da + float(b.get("duration_sec") or 0) / 2,
                               key)
-        if not cmp["captured"]:
+        # 八审 P1#2:captured/available 失败都不计数——旧代码 checked
+        # 在 available 检查前自增,协议失败时 stats 报「比对过且通过」
+        # 而实际 0 个判定;不可用单独计数,整通道零判定时下方出 critical
+        if not cmp["captured"] or not cmp.get("available"):
+            unavailable += 1
             continue
         checked += 1
         r = cmp["result"]
-        if not cmp["available"]:
-            continue
         if not r["same"]:
             findings.append(_identity_finding(
                 str(a.get("shot_id", i + 1)),
                 str(b.get("shot_id", j + 1)), r, False, pinned_look))
     # ── 镜内首/末帧对比(轮11a) ─────────────────────────────────────
-    intra_pairs, intra_checked = [], 0
+    intra_pairs, intra_checked, intra_unavailable = [], 0, 0
     for i, s in enumerate(shots):
         if not isinstance(s, dict):
             continue
@@ -940,18 +997,27 @@ def _identity_gate(video: Path, shots: list[dict], key: str,
         t0 = sum(float(x.get("duration_sec") or 0) for x in shots[:i]
                  if isinstance(x, dict))
         cmp = _compare_person(video, t0 + dur * 0.15, t0 + dur * 0.85, key)
-        if not cmp["captured"]:
+        if not cmp["captured"] or not cmp.get("available"):
+            intra_unavailable += 1
             continue
         intra_pairs.append(i)
         intra_checked += 1
         r = cmp["result"]
-        if not cmp["available"]:
-            continue
         if not r["same"]:
             findings.append(_identity_finding(
                 str(s.get("shot_id", i + 1)), "", r, True, pinned_look))
+    # 八审 P1#2:有对比任务却零判定(整通道协议失败)= 覆盖缺口,fail-closed
+    # critical——「没审到」不能被 stats 里的 checked=1 演绎成「审过了」
+    _unavail = unavailable + intra_unavailable
+    if _unavail > 0 and checked == 0 and intra_checked == 0:
+        findings.append({
+            "severity": "critical", "code": "IDENTITY_UNVERIFIED",
+            "message": (f"人物一致性通道全部 {_unavail} 次对比协议失败"
+                        f"(VLM 不可用/抽帧失败)——人物一致性未审到,"
+                        f"不得视为通过;修复端点后重跑终审")})
     return {"pairs": pairs, "checked": checked, "findings": findings,
-            "intra_pairs": intra_pairs, "intra_checked": intra_checked}
+            "intra_pairs": intra_pairs, "intra_checked": intra_checked,
+            "unavailable": _unavail}
 
 
 def _batch_prompt(times: str, n: int, context: Optional[dict] = None,
@@ -1540,7 +1606,7 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
     # 轮11a:守卫从 len(shots)>1 放宽到 shots 非空——单镜视频同样可能
     # 镜内换人(整片一镜到底的广告),此前被直接跳过。
     identity = {"pairs": [], "checked": 0, "findings": [],
-                "intra_pairs": [], "intra_checked": 0}
+                "intra_pairs": [], "intra_checked": 0, "unavailable": 0}
     if shots and key:
         # 轮17:剧本钉了人物外观(anchor/镜主体含服装发型式样)时,跨镜
         # 换装即违反剧本 → COSTUME_SWAP 升 critical

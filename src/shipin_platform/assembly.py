@@ -73,7 +73,13 @@ def align_narration(shots: list[dict], min_tail: float = MIN_TAIL,
         dp_ = s.get("dialogue_path")
         tts = _ffprobe_duration(Path(np_)) if np_ else 0.0
         dlg = _ffprobe_duration(Path(dp_)) if dp_ else 0.0
-        if not np_ or not Path(np_).exists():
+        # 轮47(八审 P2#2):纯台词镜(narration 空、dialogue 有词)是合法
+        # 剧本形态(模板:每镜 narration 或 dialogue 至少其一,全片至少
+        # 2 镜 dialogue)——旧代码只要 narration_path 缺失/不存在就判
+        # NARRATION_MISSING,台词轨照常落位也拦。只有两条人声都没有
+        # (该镜彻底无声)才是 critical
+        if (not np_ or not Path(np_).exists()) and not (
+                dp_ and Path(dp_).exists()):
             findings.append({"severity": "critical", "code": "NARRATION_MISSING",
                              "message": f"{sid} 旁白音频不存在: {np_}"})
             tts = 0.0

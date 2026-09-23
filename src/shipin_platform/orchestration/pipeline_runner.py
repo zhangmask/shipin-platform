@@ -945,11 +945,17 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                 mrec["keyframe_review_of"] = _kf_stamp
                 mrec["keyframe_review"] = _kf.get("verdict")
                 if _kf.get("findings"):
-                    _sr = _load(project_id, "shots_review.json") or {}
-                    _sr[f"__keyframe_{sid}__"] = {
+                    # 八审 P0#1:必须写进循环内共用的 shots_review 内存
+                    # 字典并立即落盘——旧代码另起 _load 新副本保存,随后
+                    # qc=ok 分支用循环前(L904)加载的旧字典整体 _save,
+                    # 把刚写的 __keyframe_* 抹掉:happy path 下关键帧门
+                    # critical 100% 到不了终审(只有本镜三连败提前 return
+                    # 时才侥幸留在文件里)。共用字典后两条出口(qc=ok 的
+                    # L1058 保存与失败路径的显式保存)都带着它。
+                    shots_review[f"__keyframe_{sid}__"] = {
                         "verdict": _kf.get("verdict"),
                         "findings": _kf.get("findings") or []}
-                    _save(project_id, "shots_review.json", _sr)
+                    _save(project_id, "shots_review.json", shots_review)
             except Exception as e:
                 mrec["keyframe_review"] = f"error: {str(e)[:120]}"
         attempts = []
@@ -1102,14 +1108,25 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
 
     def _tts_fresh(sid: str, s: dict) -> Optional[str]:
         """轮26:复用必须过文本指纹——台词变了旧音频作废,不能旧词配
-        新字幕(声画不一致违反剧本,且无门能发现)。"""
+        新字幕(声画不一致违反剧本,且无门能发现)。
+
+        轮47(八审 P2#2):纯台词镜(narration 空)没有旁白轨是合法形态
+        (剧本模板:每镜 narration 或 dialogue 至少其一)——只要台词轨
+        在且指纹(旁白+台词文本)匹配即新鲜;旧代码此时必判「需重生」,
+        每次重跑都重新合成台词。"""
         p = _tts_of(sid)
-        if not p:
+        if p:
+            rec = manifest["shots"].get(sid) or {}
+            if str(rec.get("tts_text_sha") or "") == _tts_text_sha(s):
+                return p
             return None
-        rec = manifest["shots"].get(sid) or {}
-        if str(rec.get("tts_text_sha") or "") != _tts_text_sha(s):
-            return None
-        return p
+        dlg = s.get("dialogue")
+        if isinstance(dlg, dict) and dlg.get("text"):
+            dv = glob_tts(work, f"{sid}_dlg")
+            rec = manifest["shots"].get(sid) or {}
+            if dv and str(rec.get("tts_text_sha") or "") == _tts_text_sha(s):
+                return dv
+        return None
 
     need = [s["shot_id"] for s in shots if not _tts_fresh(s["shot_id"], s)]
     if need:
@@ -1150,14 +1167,28 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                                            for s in _failed[:3]))}
     for s in shots:
         p = _tts_of(s["shot_id"])
-        if not p:
-            return {"ok": False, "phase": "generate", "reason": f"{s['shot_id']} TTS 缺失"}
-        manifest["shots"][s["shot_id"]]["tts"] = p
+        dlg = s.get("dialogue")
+        has_dlg = isinstance(dlg, dict) and bool(dlg.get("text"))
+        dv = glob_tts(work, f"{s['shot_id']}_dlg") if has_dlg else None
+        # 轮47(八审 P2#2):纯台词镜(narration 空、dialogue 有词)合法
+        # (剧本模板:每镜 narration 或 dialogue 至少其一,全片至少 2 镜
+        # dialogue)——旧代码只认旁白轨,台词 TTS 实际合成成功也报
+        # 「S0x TTS 缺失」:合法剧本永远无法出片且报错指错方向(运营
+        # 去查 TTS 服务而非脚本形态)。台词轨就是该镜的人声,align 与
+        # assemble 声轨设计都已支持 narration 缺省 + dialogue 落位。
+        # 真正必须拦的是两条人声都没有(该镜彻底无声)。
+        if not p and not (has_dlg and dv):
+            return {"ok": False, "phase": "generate",
+                    "reason": f"{s['shot_id']} TTS 缺失(旁白与台词轨均无)"}
+        if p:
+            manifest["shots"][s["shot_id"]]["tts"] = p
+        else:
+            # 纯台词镜:摘掉可能残留的旧旁白路径(深拷贝/旧项目携带的
+            # stale tts),否则 assemble 会把旧旁白轨混进声床
+            manifest["shots"][s["shot_id"]].pop("tts", None)
         # 轮26:记下口播内容指纹——下次重跑凭它判断旧音频是否还有效
         manifest["shots"][s["shot_id"]]["tts_text_sha"] = _tts_text_sha(s)
-        dlg = s.get("dialogue")
-        if isinstance(dlg, dict) and dlg.get("text"):
-            dv = glob_tts(work, f"{s['shot_id']}_dlg")
+        if has_dlg:
             if dv:
                 manifest["shots"][s["shot_id"]]["dlg"] = dv
         elif s["shot_id"] in need:
@@ -1168,7 +1199,11 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
             manifest["shots"][s["shot_id"]].pop("dlg", None)
     align = align_narration([{"shot_id": s["shot_id"],
                               "duration_sec": float(s.get("duration_sec") or 3),
-                              "narration_path": manifest["shots"][s["shot_id"]]["tts"],
+                              # 轮47:纯台词镜 manifest 无 tts 键——用
+                              # .get;align 对 narration 缺省 + dialogue
+                              # 落位的形态已支持(台词驱动窗口)
+                              "narration_path": (manifest["shots"][s["shot_id"]]
+                                                 .get("tts")),
                               "dialogue_path": manifest["shots"][s["shot_id"]].get("dlg")}
                              for s in shots])
     if align["verdict"] != "ok":
@@ -1314,13 +1349,22 @@ def _clip_shot_sha(sid: str, dur: float, shot: dict) -> str:
 
 
 def _clip_is_pooled(mrec: dict, project_id: str) -> bool:
-    """clip 是否来自共享素材池(文件位于别的项目目录)。"""
+    """clip 是否来自共享素材池(文件位于**别的项目目录树之外**)。
+
+    轮47(八审 P3):旧判据只比 parent != 项目目录——项目**子目录**
+    里的 clip(stitch 落 part 的 work/parts/、任何项目内子路径)都被
+    误判成池化,而池化分支的新鲜度只用镜头定义指纹(shot_id+时长+
+    主体场景动作),**不比 prompt 指纹**——配合深拷贝 manifest 携带的
+    stale qc==ok + clip_shot_sha,可把任意旧 clip 塞回时间线。语义
+    应为:本项目目录树内 = 本地产物(全输入指纹),树外 = 池(定义指纹)。
+    """
     clip = str(mrec.get("clip") or "")
     if not clip:
         return False
     try:
-        return (Path(clip).resolve().parent
-                != _project_dir(project_id).resolve())
+        proj = _project_dir(project_id).resolve()
+        c = Path(clip).resolve()
+        return not c.is_relative_to(proj)
     except Exception:
         return False
 
@@ -1617,7 +1661,12 @@ def run_assemble_phase(project_id: str, store) -> dict:
                                                    check_narration_content)
     # M7(2026-09-21 审计):成片层的素材复用/时序红线在此自动挂载为硬门,
     # 不再是工厂手动 API 端点。timeline 按 align 窗口构造:每镜一条,
-    # at=该镜绝对开始时间、end=start+window,dur=window_sec。
+    # start=该镜窗口绝对起点、end=start+window,dur=window_sec。
+    # 轮47(八审 P2#1):at 必须传**窗口起点**(check_timeline 覆盖模型
+    # 的契约「at=片段起点」)——旧代码传 narr_at(台词镜里旁白在台词
+    # +0.18s 后才开口),末镜带台词时覆盖被高估 dlg+0.18:既把真实亏长
+    # 掩盖成 ok,短片(偏差>3%)又误拦。at 只驱动排序/复用判定,窗口
+    # 起点同样单调,不受影响。
     tl_entries = []
     _t_cursor = 0.0
     for s, t in zip(sids, tl):
@@ -1630,8 +1679,7 @@ def run_assemble_phase(project_id: str, store) -> dict:
             "src": _clip,
             "start": round(_t_cursor, 3),
             "end": round(_t_cursor + _dur, 3),
-            "at": round(float(t.get("narr_at") or t.get("audio_start_sec")
-                              or _t_cursor), 3)})
+            "at": round(_t_cursor, 3)})
         _t_cursor += _dur
     # 审计 C2:剧本镜号全集 vs 时间线对账——漏镜/插镜由确定性门拦截
     tchk = check_timeline(tl_entries, duration_sec=a_total(tl),

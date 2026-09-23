@@ -19,8 +19,19 @@ _FAKE_VLM = '{"breaks": [], "brand_seen": true, "frames": [], "anomaly": 0}'
 
 
 def _blank_vlm(monkeypatch):
+    """空白(全绿) VLM:批次载荷 + 身份判定合法应答。
+
+    轮47(八审 P1#2):身份提示词必须回合法 SAME_PERSON 载荷——旧 stub
+    对所有提示词返回同一批次 JSON,身份通道 0 判定被记 IDENTITY_UNVERIFIED
+    critical(协议失败≠通过),「正常放行」类用例会因此翻车。"""
     monkeypatch.setattr(hard_gates, "_vlm_credentials", lambda: "test-key")
-    monkeypatch.setattr(hard_gates, "_ask_vlm", lambda *a, **k: _FAKE_VLM)
+
+    def _ask(images, prompt, key, max_tokens=1800):
+        if "同一人" in prompt:
+            return '{"same": true, "spec": "", "reason": ""}'
+        return _FAKE_VLM
+
+    monkeypatch.setattr(hard_gates, "_ask_vlm", _ask)
 
 
 def _clip(tmp_path) -> str:

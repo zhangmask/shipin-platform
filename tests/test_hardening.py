@@ -1135,6 +1135,73 @@ class TestIdentityGate:
         assert r["identity"]["checked"] == 0
         assert r["identity"]["intra_checked"] == 0
 
+    # ── 轮47(八审 P1#2):协议失败不得虚报 checked ───────────────────
+
+    def test_identity_all_unavailable_is_critical(self, monkeypatch,
+                                                  tmp_path):
+        """身份通道整通道协议失败 → checked=0 + unavailable=N +
+        critical IDENTITY_UNVERIFIED。旧代码 checked 在 available
+        检查前自增,stats 报「比对过且通过」而实际 0 个判定。"""
+        import json as _json
+        from shipin_platform.review import hard_gates
+
+        def ask(images, prompt, key, max_tokens=1800):
+            if "同一人" in prompt:
+                raise RuntimeError("vlm 429 Too Many Requests")
+            return _json.dumps({"frames": [], "breaks": [],
+                                "brand_seen": True, "shot_issues": []},
+                               ensure_ascii=False)
+
+        monkeypatch.setattr(hard_gates, "_vlm_credentials",
+                            lambda: "fake-key")
+        monkeypatch.setattr(hard_gates, "_ask_vlm", ask)
+        clip = _make_motion_clip(tmp_path / "i_unavail.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "主角"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "主角"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4,
+                                        context=ctx)
+        ident = r["identity"]
+        assert ident["checked"] == 0, ident
+        assert ident["intra_checked"] == 0, ident
+        assert ident["unavailable"] >= 3, ident
+        assert r["verdict"] == "fix"
+        assert "IDENTITY_UNVERIFIED" in {f["code"] for f in r["findings"]}
+
+    def test_identity_partial_unavailable_not_critical(self, monkeypatch,
+                                                       tmp_path):
+        """部分失败:已审镜结论照常(checked 只计拿到判定的),
+        未审部分不冒充通过也不禁发(一次 hiccup 不能毙片)。"""
+        import json as _json
+        from shipin_platform.review import hard_gates
+        n = {"i": 0}
+
+        def ask(images, prompt, key, max_tokens=1800):
+            if "同一人" in prompt:
+                n["i"] += 1
+                if n["i"] == 1:
+                    return '{"same": true, "spec": "", "reason": ""}'
+                raise RuntimeError("vlm timeout")
+            return _json.dumps({"frames": [], "breaks": [],
+                                "brand_seen": True, "shot_issues": []},
+                               ensure_ascii=False)
+
+        monkeypatch.setattr(hard_gates, "_vlm_credentials",
+                            lambda: "fake-key")
+        monkeypatch.setattr(hard_gates, "_ask_vlm", ask)
+        clip = _make_motion_clip(tmp_path / "i_partial.mp4", 4.0)
+        ctx = {"shots": [
+            {"shot_id": "S01", "duration_sec": 2.0, "subject": "主角"},
+            {"shot_id": "S02", "duration_sec": 2.0, "subject": "主角"}]}
+        r = hard_gates.vlm_review_final(str(clip), frames_count=4,
+                                        context=ctx)
+        ident = r["identity"]
+        assert ident["checked"] == 1, ident
+        assert ident["unavailable"] >= 1, ident
+        assert "IDENTITY_UNVERIFIED" not in {f["code"]
+                                             for f in r["findings"]}
+        assert "IDENTITY_SWITCH" not in {f["code"] for f in r["findings"]}
+
     # ── 轮17:剧本钉外观时 COSTUME_SWAP 升 critical ───────────────────
     # 剧本写了服装/发型式样(anchor 或镜主体含服装词)时,跨镜换装就是
     # 违反剧本,不是风格选择;没钉外观的脚本保持 warning(导演自由)。
@@ -1316,7 +1383,12 @@ class TestIdentityGate:
                                                          tmp_path):
         """轮11a 回归:身份提问拿到不含 same 字段的载荷(协议错配/被路由到
         别的提示词/JSON 截断)→ available=False 跳过,不得冒充「不是同一人」
-        的 critical(那会让一次 VLM hiccup 直接禁止交付)。"""
+        的 critical(那会让一次 VLM hiccup 直接禁止交付)。
+
+        轮47(八审 P1#2)修正断言:协议失败也不得计入 intra_checked——
+        旧断言 `intra_checked == 1` 把「0 个判定」记成「比对过且通过」,
+        正是本轮修的虚报。整通道协议失败时改出 IDENTITY_UNVERIFIED
+        critical(没审到 ≠ 审过了)。"""
         from shipin_platform.review import hard_gates
         monkeypatch.setattr(hard_gates, "_vlm_credentials", lambda: "fake-key")
         monkeypatch.setattr(
@@ -1326,9 +1398,51 @@ class TestIdentityGate:
         ctx = {"shots": [
             {"shot_id": "S01", "duration_sec": 4.0, "subject": "主角独行"}]}
         r = hard_gates.vlm_review_final(str(clip), frames_count=4, context=ctx)
-        assert r["identity"]["intra_checked"] == 1
+        assert r["identity"]["intra_checked"] == 0
+        assert r["identity"]["unavailable"] >= 1
         assert not [f for f in r["findings"] if f.get("scope") == "intra"]
         assert "IDENTITY_SWITCH" not in {f["code"] for f in r["findings"]}
+        # 整通道没审到:覆盖缺口 fail-closed
+        assert "IDENTITY_UNVERIFIED" in {f["code"] for f in r["findings"]}
+        assert r["verdict"] == "fix"
+
+
+class TestExtractFrameAnchors:
+    """轮47(八审 P4):_extract_frames 的 times[:count] 按排序砍掉最大
+    的几个点——docstring 许诺的 "start + spread + end" 里片尾锚点
+    恒丢失(30s 片 count=12 时最后 2.5s 无帧),片尾异常整个漏出。"""
+
+    def test_end_anchor_kept(self, tmp_path):
+        from shipin_platform.review.hard_gates import _extract_frames
+        # 31s 而非 30s:整数倍时长下铺点恰好落在末尾(结尾侥幸幸存),
+        # 非整数倍才暴露 times[:count] 砍掉最大两点的问题(31s 时候选
+        # 14 个,被砍的正是 30.5/31.0,片尾 2.6s 无帧)
+        clip = _make_motion_clip(tmp_path / "anchors.mp4", 31.0)
+        frames, tmp = _extract_frames(clip, 12)
+        try:
+            ts = [f["t"] for f in frames]
+            assert len(ts) == 12, ts
+            assert ts[0] == 0.5, ts
+            assert max(ts) >= 30.0, f"片尾锚点丢失: {ts}"
+            # 均匀铺点(相邻间隔一致,±0.3s)
+            gaps = [round(b - a, 2) for a, b in zip(ts, ts[1:])]
+            assert max(gaps) - min(gaps) < 0.6, gaps
+        finally:
+            from shipin_platform.review.hard_gates import _cleanup_tmp
+            _cleanup_tmp(tmp)
+
+    def test_short_video_dedupes(self, tmp_path):
+        """短片(首尾锚点重叠)去重保序,不产生越界/重复帧。"""
+        from shipin_platform.review.hard_gates import (
+            _extract_frames, _cleanup_tmp)
+        clip = _make_motion_clip(tmp_path / "tiny.mp4", 0.6)
+        frames, tmp = _extract_frames(clip, 12)
+        try:
+            ts = [f["t"] for f in frames]
+            assert ts == sorted(set(ts)), ts
+            assert all(t <= 0.6 for t in ts), ts
+        finally:
+            _cleanup_tmp(tmp)
 
 
 class TestShotReview:
@@ -1403,6 +1517,54 @@ def _narr_clip(out: Path, dur: float = 6.0, sound_until: float = 1.0) -> Path:
 class TestNarrationPresence:
     """轮14:每镜旁白声轨存在性(确定性)——TTS 缺失/音频错位时画面照演
     但嘴上没词;「符不符合剧本」此前只核视频,这是音频侧第一道门。"""
+
+    # ── 轮47(八审 P1#1):silencedetect 协议失败不得冒充「处处有声」 ──
+
+    def test_ffmpeg_missing_blocks_not_ok(self, monkeypatch, tmp_path):
+        """ffmpeg 起不来(FileNotFoundError)→ verdict blocked +
+        available=False + warning finding——旧路径吞成 [] 让全窗口
+        判 ok,协议失败冒充判定。"""
+        from shipin_platform.review import hard_gates
+        from shipin_platform.review.hard_gates import check_narration_presence
+        clip = _narr_clip(tmp_path / "n_noff.mp4")
+
+        def _boom(*a, **k):
+            raise FileNotFoundError("ffmpeg not found")
+
+        monkeypatch.setattr(hard_gates.subprocess, "run", _boom)
+        shots = [{"shot_id": "S01", "narration": "深夜街头", "narr_at": 0.2,
+                  "duration_sec": 2.0}]
+        r = check_narration_presence(str(clip), shots)
+        assert r["verdict"] == "blocked", r
+        assert r["available"] is False
+        assert [f["code"] for f in r["findings"]] == ["NARRATION_PROBE_FAILED"]
+        assert "协议失败" in r["findings"][0]["message"]
+
+    def test_decode_failure_blocks_not_ok(self, monkeypatch, tmp_path):
+        """rc≠0(解码失败/文件损坏)同样 blocked——不能读成无静音=全有声。
+        只让 silencedetect 那次调用失败(音频探测仍正常返回)。"""
+        from shipin_platform.review import hard_gates
+        from shipin_platform.review.hard_gates import check_narration_presence
+        clip = _narr_clip(tmp_path / "n_bad.mp4")
+        _real = hard_gates.subprocess.run
+
+        def _fake(args, *a, **k):
+            if "silencedetect" in " ".join(args):
+                class _R:
+                    returncode = 1
+                    stderr = "Invalid data found"
+                    stdout = ""
+                return _R()
+            return _real(args, *a, **k)
+
+        monkeypatch.setattr(hard_gates.subprocess, "run", _fake)
+        assert _real is not None
+        shots = [{"shot_id": "S01", "narration": "深夜街头", "narr_at": 0.2,
+                  "duration_sec": 2.0}]
+        r = check_narration_presence(str(clip), shots)
+        assert r["verdict"] == "blocked", r
+        assert r["available"] is False
+        assert r["findings"][0]["code"] == "NARRATION_PROBE_FAILED"
 
     def test_silent_window_is_critical(self, tmp_path):
         from shipin_platform.review.hard_gates import check_narration_presence
@@ -1874,15 +2036,20 @@ class TestKeyframeGate:
         assert r["verdict"] == "ok", r["findings"]
         assert r["stats"]["checked"] == 1
 
-    def test_no_key_skips(self, monkeypatch, tmp_path):
+    def test_no_key_blocks_not_passes(self, monkeypatch, tmp_path):
+        """八审 P0#2:无 key 是协议失败不是判定——旧代码 verdict ok,
+        调用方把 'ok' 写进 manifest,'没审到'被记成'审过了'。现在
+        必须 blocked(与 vlm_review_final 的 blocked 约定一致)。"""
         from shipin_platform.review import hard_gates
         monkeypatch.setattr(hard_gates, "_vlm_credentials", lambda: "")
         img = self._png(tmp_path / "kf_nk.png")
         r = hard_gates.check_keyframes([{"shot_id": "S01",
                                          "first_frame": img,
                                          "subject": "主角", "scene": "街头"}])
-        assert r["verdict"] == "ok"
+        assert r["verdict"] == "blocked", r
         assert r["stats"]["checked"] == 0
+        assert r["findings"] == []
+        assert "协议失败" in r["reason"], r["reason"]
 
     def test_missing_frame_skipped(self, monkeypatch, tmp_path):
         self._kf_stub(monkeypatch, match=False)
@@ -1890,20 +2057,53 @@ class TestKeyframeGate:
         r = check_keyframes([{"shot_id": "S01",
                               "first_frame": str(tmp_path / "nope.png"),
                               "subject": "主角", "scene": "街头"}])
+        # 无帧可审是输入问题(skip),不是协议失败——ok + skipped 记账
         assert r["verdict"] == "ok"
         assert r["stats"]["skipped"] == 1
 
-    def test_unparseable_payload_not_a_verdict(self, monkeypatch, tmp_path):
-        """载荷没有 match 字段(协议错配/路由错)→ available=False 跳过,
-        不冒充『不符』的 critical(与轮11 _same_person 同一教训)。"""
+    def test_all_unavailable_blocks_not_passes(self, monkeypatch, tmp_path):
+        """整批 VLM 协议失败(载荷错配)→ blocked:不冒充 ok,也不冒充
+        『不符』的 critical(轮11 同一教训的两半都要守)。"""
         self._kf_stub(monkeypatch,
                       payload='{"frames": [], "brand_seen": true}')
         from shipin_platform.review.hard_gates import check_keyframes
         img = self._png(tmp_path / "kf_junk.png")
         r = check_keyframes([{"shot_id": "S01", "first_frame": img,
                               "subject": "主角", "scene": "街头"}])
-        assert r["verdict"] == "ok", r["findings"]
+        assert r["verdict"] == "blocked", r
         assert r["stats"]["checked"] == 0
+        assert r["stats"]["unavailable"] == 1
+        assert r["findings"] == []
+
+    def test_partial_unavailable_warns_but_keeps_verdict(
+            self, monkeypatch, tmp_path):
+        """部分镜协议失败:已审镜结论照常,未审部分 warning 提示覆盖
+        不全(不升 critical——一次 hiccup 不能禁发;也不静默)。"""
+        from shipin_platform.review import hard_gates
+        monkeypatch.setattr(hard_gates, "_vlm_credentials",
+                            lambda: "fake-key")
+        n = {"i": 0}
+
+        def ask(images, prompt, key, max_tokens=300):
+            n["i"] += 1
+            if n["i"] == 1:
+                import json as _json
+                return _json.dumps({"match": True, "reason": "一致"},
+                                   ensure_ascii=False)
+            return "not-json-at-all"  # 第二镜协议失败
+
+        monkeypatch.setattr(hard_gates, "_ask_vlm", ask)
+        from shipin_platform.review.hard_gates import check_keyframes
+        img = self._png(tmp_path / "kf_mix.png")
+        r = check_keyframes([{"shot_id": "S01", "first_frame": img,
+                              "subject": "主角", "scene": "街头"},
+                             {"shot_id": "S02", "first_frame": img,
+                              "subject": "主角", "scene": "街头"}])
+        assert r["verdict"] == "ok", r["findings"]  # 已审镜通过
+        assert r["stats"]["checked"] == 1
+        assert r["stats"]["unavailable"] == 1
+        warn = [f for f in r["findings"] if f["code"] == "KEYFRAME_UNVERIFIED"]
+        assert len(warn) == 1 and warn[0]["severity"] == "warning"
 
 
 class TestTimelineAccounting:
@@ -1934,6 +2134,38 @@ class TestTimelineAccounting:
         r = check_timeline(tl, duration_sec=4.0,
                            expected_shot_ids=["S01", "S02"])
         assert r["verdict"] == "ok", r["findings"]
+
+    # ── 轮47(八审 P2#1):覆盖按 timeline 自身 start/end 算 ──────────
+    # 旧实现 last_edge = at + (end-start):pipeline 传的 at 是 narr_at
+    # (台词镜旁白在台词+0.18s 后才开口,晚于窗_start)——末镜带台词时
+    # 覆盖被高估 dlg+0.18,既掩盖真实亏长又可能误拦短片。
+
+    def test_dialogue_last_shot_coverage_exact(self):
+        """末镜台词镜(narr_at 晚于窗_start):覆盖=窗尾 8.0,不是
+        8.0+台词偏移——偏差不超 3% 必须 ok。"""
+        from shipin_platform.review.hard_gates import check_timeline
+        tl = [{"shot_id": "S01", "src": "a.mp4", "start": 0, "end": 4.0,
+               "at": 0},
+              {"shot_id": "S02", "src": "b.mp4", "start": 4.0, "end": 8.0,
+               "at": 5.18}]  # narr_at = 窗_start + dlg(1.0) + 0.18
+        r = check_timeline(tl, duration_sec=8.0,
+                           expected_shot_ids=["S01", "S02"])
+        assert r["verdict"] == "ok", r["findings"]
+
+    def test_narr_at_overshoot_cannot_mask_shortfall(self):
+        """真实亏长(窗尾 7.0 vs 目标 8.0,亏 12.5%):旧公式被 narr_at
+        高估成 8.18 而放行(掩盖),新公式按窗尾判 critical。"""
+        from shipin_platform.review.hard_gates import check_timeline
+        tl = [{"shot_id": "S01", "src": "a.mp4", "start": 0, "end": 4.0,
+               "at": 0},
+              {"shot_id": "S02", "src": "b.mp4", "start": 4.0, "end": 7.0,
+               "at": 5.18}]
+        r = check_timeline(tl, duration_sec=8.0,
+                           expected_shot_ids=["S01", "S02"])
+        assert r["verdict"] == "fix", r["findings"]
+        assert any(f["code"] == "DURATION_MISMATCH"
+                   for f in r["findings"]), r["findings"]
+        assert r["stats"]["coverage_sec"] == 7.0, r["stats"]
 
 
 class TestBoundaryBreakGate:
