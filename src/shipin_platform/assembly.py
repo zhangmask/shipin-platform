@@ -180,6 +180,29 @@ def align_narration(shots: list[dict], min_tail: float = MIN_TAIL,
 # ── 2. 保时长 xfade 转场拼接 ──────────────────────────────────────────
 
 
+def _fit_part(src: Path, dst: Path, dur: float) -> Path:
+    """裁 src 到 dur 写入 dst；源比目标短时冻结末帧补足。
+
+    align 的窗口语义是「旁白比镜长长则该镜窗口延长」——补料首选 master
+    （真实新画面）；没有 master 时若让 part 短于窗口，音画时间线就此劈叉
+    （实测：成片 16.67s vs 旁白 20.49s，尾字幕整条溢出被 §10.6 拦下）。
+    冻结末帧是该语义的最后兜底，同时按 source=freeze 落账保持透明。
+    """
+    have = _ffprobe_duration(src)
+    if have >= dur - 0.05:
+        return _trim(src, dst, dur)
+    pad = max(dur - have, 0.05)
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-i", str(src),
+         "-vf", f"tpad=stop_mode=clone:stop_duration={pad:.3f}",
+         "-t", f"{max(dur, 0.1):.3f}", "-c:v", "libx264",
+         "-pix_fmt", "yuv420p", "-an", str(dst)],
+        capture_output=True, text=True, shell=False)
+    if r.returncode != 0:
+        raise RuntimeError(f"pad failed: {r.stderr[-300:]}")
+    return dst
+
+
 def _trim(src: Path, dst: Path, dur: float, head: bool = False) -> Path:
     """裁 src 到 dur 秒写入 dst；head=True 时从尾部回退 dur（保留结尾段）。
     参数全部走字面量列表 + shell=False（无 shell 拼接）。"""
@@ -259,7 +282,9 @@ def build_transition_stitch(clips: list[str], windows: list[float],
             if want > _ffprobe_duration(src) + 0.05 and m and m.exists():
                 src = _trim(m, tmp / f"m{i:02d}.mp4", want)
                 source = "master"
-            parts.append(_trim(src, tmp / f"p{i:02d}.mp4", want))
+            if source == "clip" and want > _ffprobe_duration(src) + 0.05:
+                source = "freeze"
+            parts.append(_fit_part(src, tmp / f"p{i:02d}.mp4", want))
             parts_meta.append({"idx": i, "source": source,
                                "src": str(m if source == "master"
                                           else Path(clips[i])),
@@ -419,7 +444,16 @@ def master_audio(narration_path: Optional[str], duration_sec: float, output: str
         if duck:
             # 闪避 sidechain 取主旁白（0 号或第一个旁白事件）
             side = "0:a" if narration else mix_inputs[0]
-            fg.append(f"[bgm0][{side}]sidechaincompress=threshold=0.02:ratio=8"
+            sc_src = side
+            if side in mix_inputs:
+                # 该标签还要进 amix——ffmpeg 的同一输出标签不能被两个输入
+                # 消费（报 "Invalid stream specifier / matches no streams"），
+                # 先 asplit 一份专供闪避，amix 用改名后的那份。
+                mix_label = side.replace(":", "_").replace("[", "").replace("]", "")
+                fg.append(f"[{side}]asplit=2[{mix_label}][{side}_sc]")
+                mix_inputs = [mix_label if x == side else x for x in mix_inputs]
+                sc_src = f"{side}_sc"
+            fg.append(f"[bgm0][{sc_src}]sidechaincompress=threshold=0.02:ratio=8"
                       f":attack=40:release=500[bgm]")
         else:
             fg.append(f"[{idx}:a]anull[bgm]")

@@ -217,15 +217,108 @@ def local_video(prompt: str, out: str, first_frame: str = "",
             "duration_sec": duration}
 
 
+def _tmp_path(path: str, tag: str) -> str:
+    # ffmpeg infers the muxer from the extension: "<f>.mp3.trim" fails with
+    # "Unable to choose an output format", so keep the original suffix.
+    import os
+    base, ext = os.path.splitext(path)
+    return f"{base}.{tag}{ext or '.flac'}"
+
+
+def _tts_duration(path: str) -> float:
+    import subprocess
+    out = subprocess.run(['ffprobe', '-v', 'error', '-show_entries',
+                          'format=duration', '-of',
+                          'default=noprint_wrappers=1:nokey=1', path],
+                         capture_output=True, text=True).stdout.strip()
+    try:
+        return float(out)
+    except Exception:
+        return 0.0
+
+
+def _trim_silence(path: str) -> str:
+    # VibeVoice pads clips with long silence; trim head/tail.
+    import os
+    import subprocess
+    tmp = _tmp_path(path, 'trim')
+    af = ('silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.05,'
+          'areverse,silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.05,'
+          'areverse')
+    r = subprocess.run(['ffmpeg', '-y', '-v', 'error', '-i', path,
+                        '-af', af, tmp], capture_output=True)
+    if r.returncode == 0:
+        os.replace(tmp, path)
+    return path
+
+
+def _atempo_fit(path: str, max_sec: float) -> str:
+    # Time-stretch (max 1.8x) so narration fits the shot budget.
+    import os
+    import subprocess
+    dur = _tts_duration(path)
+    if dur <= max_sec or dur <= 0:
+        return path
+    tempo = min(2.0, dur / max_sec)
+    tmp = _tmp_path(path, 'fit')
+    r = subprocess.run(['ffmpeg', '-y', '-v', 'error', '-i', path,
+                        '-filter:a', 'atempo=%.3f' % tempo, tmp],
+                       capture_output=True)
+    if r.returncode == 0:
+        os.replace(tmp, path)
+    return path
+
+
+def _promote_final(src: str, out: str, cands: list) -> str:
+    """终稿落回调用方期望的 out 路径,并清掉重试残留的 .aN 副本。
+
+    调用方(tts_service→glob_tts/align)只认 out 路径;最佳 take 若留在
+    `.aN` 副本上会被 glob 绕过,对齐读到的是未加工的第 0 次尝试原件。
+    """
+    import os
+    import shutil
+    if os.path.abspath(src) != os.path.abspath(out):
+        shutil.copyfile(src, out)
+    for c in cands:
+        if os.path.abspath(c) != os.path.abspath(out) and os.path.exists(c):
+            os.remove(c)
+    return out
+
+
 def local_tts(text: str, out: str, engine: str = "") -> dict:
-    """Text-to-speech via the DGX (VibeVoice / Kokoro)."""
+    # Text-to-speech via the DGX. VibeVoice pacing on short lines is
+    # stochastic: a take can come back far too long for the shot budget,
+    # so retry with fresh seeds, then time-stretch as a last resort.
+    import os
     eng = engine or os.environ.get("SHIPIN_LOCAL_TTS_ENGINE", "vibevoice")
-    job = _post("/v1/audio/tts", {"engine": eng, "text": text})
-    done = _wait_job(job["job_id"])
-    if done.get("status") != "succeeded":
-        raise LocalMediaError(f"本地配音失败: {done.get('error')}")
-    path = _download(_first_file(done), out)
-    return {"ok": True, "provider": "local", "engine": eng, "path": path}
+    max_sec = float(os.environ.get("SHIPIN_LOCAL_TTS_MAX_SEC", "9.5"))
+    seed = int(os.environ.get("SHIPIN_LOCAL_TTS_SEED", "42"))
+    best_path, best_dur, attempts_used = "", float("inf"), 0
+    cands: list = []
+    for attempt in range(6):
+        attempts_used = attempt + 1
+        job = _post("/v1/audio/tts", {"engine": eng, "text": text,
+                                     "seed": seed + attempt * 977})
+        done = _wait_job(job["job_id"])
+        if done.get("status") != "succeeded":
+            raise LocalMediaError(f"local tts failed: {done.get('error')}")
+        cand = _download(_first_file(done), out if attempt == 0
+                         else f"{out}.a{attempt}")
+        cands.append(cand)
+        _trim_silence(cand)
+        dur = _tts_duration(cand)
+        if dur <= max_sec:  # 完美命中:原速不加工
+            _promote_final(cand, out, cands)
+            return {"ok": True, "provider": "local", "engine": eng,
+                    "path": out, "attempts": attempts_used}
+        if dur < best_dur:
+            best_path, best_dur = cand, dur
+    # 6 次都没原速命中:拿最短的那条时间压缩补齐(max_sec*2.0 内可救)
+    _atempo_fit(best_path, max_sec)
+    _promote_final(best_path, out, cands)
+    return {"ok": True, "provider": "local", "engine": eng,
+            "path": out, "attempts": attempts_used, "fit": True,
+            "raw_sec": round(best_dur, 2)}
 
 
 def local_music(caption: str, out: str, lyrics: str = "",

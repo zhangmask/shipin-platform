@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import time
@@ -819,6 +820,14 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
     storyboard = _load(project_id, "storyboard.json")
     brief0 = _load(project_id, "brief.json") or {}
     storyboard = _bind_brand(storyboard, brief0)
+    # 数据形状归一:storyboard 模板(STORYBOARD_PROMPT)把 dialogue 拍成纯
+    # 字符串,而 TTS 合成/align/assemble 三处都只认 {role_code,text} dict
+    # ——不归一则台词音频永远不合成(成片只剩旁白、字幕缺台词,且无门能
+    # 发现:align 只按旁白算窗口,声音设计只混旁白床)。
+    for _s in storyboard.get("shots", []):
+        _d = _s.get("dialogue")
+        if isinstance(_d, str) and _d.strip():
+            _s["dialogue"] = {"role_code": "hero_male", "text": _d.strip()}
     # 绑后落盘：assemble/UI 读盘即得规范版，不依赖再跑 generate 时重绑
     _save(project_id, "storyboard.json", storyboard)
 
@@ -860,11 +869,20 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                             # 模板升级(2026-09-21 A/B 实测):A(中文短模板)在 2.5s
                             # 出现主体变形;英文长模板(scene+固定机位+景深+主体居中
                             # +禁止形变)verdict=pass 且运动能量 ×2。赢点固化在这里:
+                            # 2026-09-24 补丁:无主体镜头(纯风景/空镜,subject 以
+                            # 「无人物」开头)不能要求 subject stays centered——模型
+                            # 会发明一个主体(实测:海景空镜在 1.1s 后漂出咖啡杯
+                            # 特写并居中),centering 子句对空镜是负向指令。
                             "prompt_text": (f"{s['motion']}{speaking_en} "
                                             f"Scene: {s['scene']}. "
                                             f"Camera: {s['camera']}, fixed at "
                                             f"medium close-up, shallow depth of "
-                                            f"field, subject stays centered. "
+                                            f"field"
+                                            + (", subject stays centered"
+                                               if not str(s.get("subject")
+                                                          or "").startswith("无人物")
+                                               else "")
+                                            + f". "
                                             f"One single continuous take — no "
                                             f"camera cut, no scene change, no "
                                             f"morphing or shape change of the "
@@ -1000,6 +1018,25 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
         if (mrec.get("qc") == "ok" and _fresh
                 and _cached_clip.endswith(".mp4")
                 and Path(_cached_clip).is_file()):
+            # 哈希对账:manifest 只在 generate 完全成功时才落盘,中途失败的
+            # 轮次会把新 canvas 写在盘上而 manifest 仍记着旧 sha——缓存命中
+            # 不能只信记录,必须校验盘上文件;不符时从同源 clip 重新派生
+            # canvas(确定性画幅归一化)并刷新记录,否则 assemble 的 G5 素材
+            # 哈希门必以「素材被替换」硬拦,而无门能自愈这个记账劈叉。
+            _rec_sha = str(mrec.get("clip_sha256") or "")
+            import hashlib as _hl_cache
+            try:
+                _act_sha = _hl_cache.sha256(Path(_cached_clip).read_bytes()).hexdigest()
+            except OSError:
+                _act_sha = ""
+            if _rec_sha and _act_sha and _rec_sha != _act_sha:
+                _src_clip = work / f"{sid}_clip.mp4"
+                _cvp = Path(_cached_clip)
+                if _src_clip.is_file() and _src_clip != _cvp:
+                    if _normalize_canvas(_src_clip, _cvp,
+                                         canvas_w, canvas_h):
+                        _act_sha = _hl_cache.sha256(_cvp.read_bytes()).hexdigest()
+                mrec["clip_sha256"] = _act_sha
             report.append({"shot_id": sid, "qc": "ok", "cached": True,
                            "pooled": _pooled})
             continue
