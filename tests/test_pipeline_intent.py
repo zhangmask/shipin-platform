@@ -7,6 +7,7 @@
 - run_assemble_phase 的 video_gen 闸门（未生成直接拦，不再静默混拼）
 """
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -1019,11 +1020,13 @@ class TestTargetedRegeneration:
         return store
 
     @staticmethod
-    def _wire_gen(monkeypatch, pid, tmp_path, prompts):
+    def _wire_gen(monkeypatch, pid, tmp_path, prompts, seeds=None):
         def _fake_gen(prompt, duration=5, resolution="720p", work_dir=None,
                       first_frame=None, last_frame=None, output_path=None,
-                      negative_prompt="", **kw):
+                      negative_prompt="", seed=None, **kw):
             prompts.append(prompt)
+            if seeds is not None:
+                seeds.append(seed)
             out = output_path or str(tmp_path / "f.mp4")
             import subprocess as _sp
             _sp.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
@@ -1096,6 +1099,36 @@ class TestTargetedRegeneration:
         assert sr["S01"]["verdict"] == "fix"
         assert any(f.get("code") == "VLM_BREAK"
                    for f in sr["S01"]["findings"]), sr["S01"]
+
+    def test_seed_ladder_reaches_generator(self, monkeypatch, tmp_path):
+        """轮62:seed 阶梯传导——attempt 0 不换 seed(保留首轮原样),
+        attempt≥1 按 4242+attempt*7919 换采样面(prompt 已到边际的
+        finding 只有换 seed 才可能有出路)。必须断言 seed 真的传到
+        生成器入参,不只看 attempt 次数——否则换 seed 自闭环静默失效
+        (钱花了,采样面没换)。定向路径(诊断 critical)只额外重试一次,
+        attempt 1 仍 critical 即落记录交 assemble 终审(原范式)。"""
+        from shipin_platform.review import hard_gates as hg
+        import uuid as _uuid_rs
+        pid = f"retarget-seed-{_uuid_rs.uuid4().hex[:8]}"
+        store = self._seed(pid)
+        prompts, seeds = [], []
+        self._wire_gen(monkeypatch, pid, tmp_path, prompts, seeds)
+        vcalls = {"n": 0}
+
+        def _fake_review(clip, shot, frames_count=4, key=None):
+            vcalls["n"] += 1
+            if vcalls["n"] <= 2:
+                return {"verdict": "fix", "findings": [
+                    {"severity": "critical", "code": "VLM_BREAK",
+                     "message": "stub: 恒定侧面按键"}]}
+            return {"verdict": "pass", "findings": []}
+
+        monkeypatch.setattr(hg, "vlm_review_shot", _fake_review)
+        r = pr.run_generate_phase(pid, store)
+        assert r["ok"] is True, str(r.get("reason"))[:200]
+        assert seeds == [None, 4242 + 7919], seeds
+        assert prompts[1] != prompts[0]                     # 变体 prompt 同步换
+        assert "FIXED camera" in prompts[1]
 
 
 class TestSubtitleWrap:
@@ -1577,3 +1610,27 @@ class TestAssembleGate:
         r = pr.run_assemble_phase(pid, store)
         assert r["ok"] is False
         assert "确认" in r["reason"]
+
+
+class TestEnvIsolation:
+    """轮62(全套件顺序依赖污染的回归钉):test_api*/test_variants 在收集期
+    import api,api 模块导入时 load_dotenv 把 .env 的真 AGNES_KEY 灌进进程
+    环境(晚于 conftest,setdefault 类钉法救不了)——之后所有用例的
+    vlm_same_scene/vlm_morph_check 全真打网络。实测危害:VLM 可达时
+    testsrc2 假素材 vs 真实参考图必判 "different"(画面级差异)→
+    REF_VLM_MISMATCH critical → 定向重试永不触发,test_critical_review_
+    triggers_variant_regen 挂;VLM 恰好不可达时才过——单跑/文件跑/全套跑
+    三套结果,且整套回归在烧真钱。conftest autouse delenv 修复;这对测试
+    钉住污染不得跨用例存活(若 fixture 被删/削弱,第二个用例立即挂)。"""
+
+    def test_pollution_left_in_environ(self):
+        # 故意绕过 monkeypatch 直接毒化进程环境(模拟 load_dotenv 注入);
+        # 本用例内可见——清理不关本用例的事,由下一用例的 autouse fixture 剥
+        os.environ["AGNES_KEY"] = "cpk-pollution-probe"
+        assert os.environ.get("AGNES_KEY") == "cpk-pollution-probe"
+
+    def test_next_test_sees_clean_credentials(self):
+        # 过形状校验(ASCII≥16)的毒 key 也必须在这里不可见——剥不掉这个形状
+        # 的 key 等于没剥(_key_ok 会放行它,_vlm_credentials 返回真值)
+        from shipin_platform.review.hard_gates import _vlm_credentials
+        assert _vlm_credentials() == ""

@@ -245,6 +245,7 @@ def generate_video_agnes(prompt: str, model: str = "agnes-video-2.5-flash",
                           last_frame: str | None = None,
                           output_path: str | None = None,
                           negative_prompt: str = "",
+                          seed: int | None = None,
                           poll_interval: int = 5,
                           poll_attempts: int = 60) -> dict:
     """Generate video via Agnes AI, first/last-frame anchored when possible.
@@ -264,6 +265,12 @@ def generate_video_agnes(prompt: str, model: str = "agnes-video-2.5-flash",
     本地模式（SHIPIN_MEDIA_BACKEND=local 或 model 以 local:/dgx: 开头）时，
     改由同节点的 DGX 模型（MiniMax-H3 / Wan 2.2）经 h3api 生成；auto 模式
     下本地不可达则回退云端。
+
+    seed（轮62）：2.5 协议实测接受该字段（2026-09-25 探测：带 seed 提交
+    与不带均 200，无 unknown-field 拒绝）。定向重生成换 seed 是与换
+    prompt 正交的采样维度——同一 prompt/首帧下换 seed 拿不同实现，
+    用于终审 finding（如 S03 侧面按键）在 prompt 已到边际后的采样面
+    重试。v2.0 协议不接受则忽略（不留痕）。
     """
     if _local_backend(model):
         from shipin_platform.generation import local_media
@@ -292,6 +299,9 @@ def generate_video_agnes(prompt: str, model: str = "agnes-video-2.5-flash",
         body["resolution"] = resolution
     if negative_prompt and not is_v25:
         body["negative_prompt"] = negative_prompt
+    if seed is not None and is_v25:
+        # 轮62：2.5 协议实测接受；v2.0 不加（协议不认）
+        body["seed"] = int(seed)
     warnings: list[str] = []
     anchored = False
     anchor_imgs = [p for p in (first_frame, last_frame) if p]

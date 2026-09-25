@@ -252,6 +252,8 @@ class TestVariantApi:
 # ── 端到端成片(真实 ffmpeg) ──────────────────────────────────────
 
 @pytest.mark.skipif(FFMPEG is None, reason="ffmpeg 不可用")
+@pytest.mark.real_network  # 轮62:真链路 opt-in——保留真 AGNES key
+#(conftest 逐例 delenv),标准非 E2E 回归用 -m "not real_network" 排除
 class TestVariantE2E:
     def _prime_text(self, vid: str, store: ProjectStageStore) -> None:
         """文本阶段前置状态(真实流程由 text 阶段落在同一 store)。"""

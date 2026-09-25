@@ -33,3 +33,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "real_network: 真链路用例(opt-in 真 AGNES key,见 conftest autouse 隔离);标准回归用 -m 'not real_network' 排除",
+]

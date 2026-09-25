@@ -1202,6 +1202,14 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                 prompt = (f"ONE single uninterrupted take, FIXED camera, no camera "
                           f"movement. The subject moves minimally: {s['motion']}"
                           + _hard)
+            # 轮62:seed 阶梯——与 prompt 变体正交的采样维度。定向重试
+            # (单镜诊断 critical)与 QC 重试都走同一阶梯:attempt 1/2 分别
+            # 换 seed(2.5 协议实测接受;AGNES 不认时服务端忽略)。同一
+            # prompt+首帧下换 seed 拿不同实现——prompt 已到边际的 finding
+            # (S03 侧面按键)只有换采样面才可能有出路。
+            _seed = None
+            if attempt >= 1 and str(vid_map.get(sid) or "") != "":
+                _seed = 4242 + attempt * 7919
             net_retries = 0
             r = None
             while True:
@@ -1211,7 +1219,8 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                         duration=int(max(dur, 2)), resolution="720p",
                         first_frame=mrec["first_frame"], last_frame=mrec["last_frame"],
                         output_path=str(clip),
-                        negative_prompt=NEG)
+                        negative_prompt=NEG,
+                        seed=_seed)
                     break
                 except Exception as e:
                     net_retries += 1
@@ -1305,8 +1314,10 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                                      "vlm_review": "critical→定向重生成",
                                      "codes": [f.get("code") for f in _sr_crit]})
                     mrec["qc"] = "fix"
-                    # 轮61:换 prompt 变体 ⇒ 输入指纹跟着换(见 _ci 处注释)
-                    _ci = _ci + "-retarget1"
+                    # 轮61/62:换 prompt 变体+seed ⇒ 输入指纹跟着换(见
+                    # _ci 处注释):attempt 1 起 seed 阶梯 4242+attempt*7919,
+                    # 指纹后缀同步,下次重跑判 stale 强制重生
+                    _ci = _ci + f"-retarget1-s{4242 + (attempt + 1) * 7919}"
                     continue
                 _save(project_id, "shots_review.json", shots_review)
                 _save(project_id, "manifest.json", manifest)

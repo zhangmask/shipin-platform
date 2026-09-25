@@ -433,8 +433,11 @@ class TestApiGates:
             raise RuntimeError("host '127.0.0.1' 被安全网关拒绝")
 
         monkeypatch.setattr(_api, "generate_image_agnes", _boom)
+        # 轮62:mode=agnes 无条件走生成器路径(旧版靠 auto+泄漏真 key 才
+        # 路由到生成器——conftest 逐例剥键后 auto 落 PIL 占位,mock 永不
+        # 被调用,502 断言挂;本测试意图就是错误映射,与 key 是否存在无关)
         r = client.post("/api/generate/image", json={
-            "prompt": "x", "width": 320, "height": 320,
+            "prompt": "x", "width": 320, "height": 320, "mode": "agnes",
             "output_path": str(tmp_path / "imgerr58.jpg"),
             "project_id": pid})
         assert r.status_code == 502, r.text
@@ -455,7 +458,7 @@ class TestApiGates:
 
         monkeypatch.setattr(_api, "generate_image_agnes", _boom)
         r = client.post("/api/generate/image", json={
-            "prompt": "x", "width": 320, "height": 320,
+            "prompt": "x", "width": 320, "height": 320, "mode": "agnes",
             "output_path": str(tmp_path / "imgval58.jpg"),
             "project_id": pid})
         assert r.status_code == 400, r.text
