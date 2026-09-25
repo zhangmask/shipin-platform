@@ -1,6 +1,7 @@
 """Tests for the multi-round review engine and mechanical auto-fixes."""
 import pytest
 
+from shipin_platform.config import PlatformConfig
 from shipin_platform.review.engine import (
     Decision,
     FailureClassifier,
@@ -8,6 +9,7 @@ from shipin_platform.review.engine import (
     RevisionEngine,
     Severity,
 )
+from shipin_platform.workflows.pipeline import Pipeline
 
 
 # ── FailureClassifier ────────────────────────────────────────────
@@ -45,6 +47,56 @@ class TestFailureClassifier:
 # ── Stage reviewers ──────────────────────────────────────────────
 
 class TestReviewers:
+    # ── 轮59(一句话驱动实测):brief 补默认值 + prompt 字数机械修复 ────
+    # 断点1:用户一句话只带核心维度,BRIEF_DIMENSIONS 里两个「可为空」
+    # 维度(reference_materials/special_requirements)key 不在即 critical
+    # → text 阶段第一轮 STOP(修在 api.pipeline_text 入口补默认值)。
+    # 断点2:LLM 模板生成的 video_prompt 系统性超 380 字(实测 406/386/
+    # 388),WORD_COUNT_EXCEEDED 无机械修复器 → 每轮交回 LLM 又超 →
+    # 3 轮 stall,generate 在文本阶段卡死。
+
+    def test_brief_empty_ok_dims_only_need_key(self):
+        """『可为空』维度 key 存在即算完整——与 BRIEF_DIMENSIONS 文档
+        一致(空串不判缺失)。"""
+        report = ReviewEngine().run_review("brief", {
+            "content_type": "tvc", "product_info": "x",
+            "target_platform": "douyin", "duration_sec": 15,
+            "target_audience": "白领", "tone": "温暖",
+            "creative_direction": "清晨咖啡仪式感",
+            "reference_materials": "", "special_requirements": ""})
+        assert report.decision in (Decision.PASS, Decision.PASS_WITH_WARNINGS), \
+            [str(f.issue) for f in report.findings]
+
+    def test_prompt_over_limit_has_mechanical_fix_and_converges(self):
+        """video_prompt 超 380 字:fix() 必须机械裁剪并在复审收敛
+        (真实形态:tvc-07431 的 406/386/388 → PASS)。"""
+        long_tail = (" The camera slowly pushes in as morning light falls "
+                     "across the ceramic cup, steam rising gently, warm "
+                     "golden particles floating in the air, soft bokeh "
+                     "background with wooden table texture visible, "
+                     "cinematic film grain, no text overlay, subject stays "
+                     "centered in frame, no morphing, no cuts, single "
+                     "continuous take, stable exposure, rich warm color "
+                     "grading, gentle depth of field, dust particles "
+                     "drifting through the sunbeams, cozy cafe interior "
+                     "ambient mood throughout the entire sequence.")
+        vp = {"style_anchor": "warm light",
+              "shot_prompts": [
+                  {"shot_id": "S01", "prompt_en": "cup",
+                   "prompt_text": "Steam rises from the cup." + long_tail},
+                  {"shot_id": "S02", "prompt_en": "door",
+                   "prompt_text": "Door opens." + long_tail}]}
+        p = Pipeline(PlatformConfig())
+        rep = p.run_stage("video_prompt", vp)
+        hist = list((p.state.revision_history or {}).values())
+        assert any("WORD_COUNT_EXCEEDED" in v.get("applied", [])
+                   for v in hist), hist
+        assert rep.decision in (Decision.PASS, Decision.PASS_WITH_WARNINGS)
+        final = (p.state.stage_outputs.get("video_prompt") or {}).get(
+            "shot_prompts") or []
+        assert final and all(len(x["prompt_text"]) <= 380 for x in final), \
+            [len(x["prompt_text"]) for x in final]
+
     def test_brief_missing_dimensions(self):
         report = ReviewEngine().run_review("brief", {"content_type": "ad"})
         assert report.decision is Decision.REVISE

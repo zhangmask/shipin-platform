@@ -2293,6 +2293,16 @@ def pipeline_text(req: PipelineTextRequest, request: Request):
             if not brief.get(k):
                 brief[k] = v
         brief.setdefault("_reference_id", req.reference_id)
+    # 轮59(一句话驱动实测):用户/agent 直接拼 brief 常只带核心维度,
+    # 而 _review_brief 对 BRIEF_DIMENSIONS 里「可为空」的两个维度
+    # (reference_materials/special_requirements)是「key 不在即 critical」
+    # ——一句话驱动的第一轮 review 就因两个没人会提的可空维度 STOP。
+    # 入口按文档语义补默认值(BRIEF_DIMENSIONS/agent-guide 明示可为空),
+    # 让 review 只审真正该审的维度;duration_sec 等数值给安全兜底。
+    brief.setdefault("reference_materials", "")
+    brief.setdefault("special_requirements", "")
+    if not brief.get("duration_sec"):
+        brief["duration_sec"] = 15
     store = _stage_store()
     try:
         store.create_project(req.project_id)

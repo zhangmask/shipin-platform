@@ -1740,7 +1740,26 @@ def run_assemble_phase(project_id: str, store) -> dict:
     # 4) 字幕(服务端按 align 时间轴生成;轮44d 按字号/画幅算折行预算,
     # §10.6 宽度红线治本——720p@46px 下 10 字行 63.7% 会被验收门打死)
     _fs = int(comp_sub.get("font_size", 46) or 46)
-    _cw = int(manifest.get("canvas_w") or 0) or 1280
+    # 轮59(一句话驱动实测断点4):折行宽度必须取**实际成片画幅**的宽。
+    # 旧代码 manifest 无 canvas_w 时回退横屏 1280——竖版 720x1280 项目
+    # 的可用宽度只有 720*0.62=446px,却按 793px 折行,12 字 slogan 行
+    # (实测墨迹 598px)必被 §10.6 打死,assemble 到字幕 100% 卡死。
+    # 优先级:manifest 显式值 > 实际 media 探测 > 1280 兜底。
+    _cw = int(manifest.get("canvas_w") or 0)
+    if not _cw:
+        try:
+            from shipin_platform.assembly import _ffprobe_duration as _fpd
+            import subprocess as _sp
+            _pr = _sp.run(["ffprobe", "-v", "error", "-select_streams",
+                           "v:0", "-show_entries", "stream=width,height",
+                           "-of", "csv=p=0", str(graded)],
+                          capture_output=True, text=True)
+            _dims = (_pr.stdout or "").strip().split(",")
+            if len(_dims) == 2 and _dims[0].strip().isdigit():
+                _cw = int(_dims[0])
+        except Exception:
+            _cw = 0
+    _cw = _cw or 1280
     # 轮51:折行预算改真字体度量(0.62×屏宽的像素数)——字符预算
     # (1字=1em)对 CJK 低估 ~4.3%,17 字=816px=63.7% 被 §10.6 验收
     # 打死(E2E 第 8 次:generate 全过后唯一卡点)。max_line_chars 保留

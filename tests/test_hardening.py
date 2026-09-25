@@ -1844,6 +1844,53 @@ class TestNarrationContent:
     def _tr(segs):
         return lambda video: segs
 
+    # ── 轮59(一句话驱动真链路实测) ────────────────────────────────
+    # (a) ASR 段归属按中点:旧逻辑「起止与窗有任意重叠即整段计入」
+    #     把落版词混进前邻窗(S04 [11.87,13.91] 抓到 14-17s 落版词,
+    #     sim 0.09 误报);
+    # (b) 短句(≤8 字金句)whisper base 固有误差达 0.2,长句阈值 0.45
+    #     必误报 → 短句专用阈值 0.12。
+
+    def test_asr_segment_attribution_by_midpoint(self, tmp_path):
+        """邻镜/落版词的 ASR 段不得混入本窗(中点在外即不属本镜)。"""
+        from shipin_platform.review.hard_gates import (
+            check_narration_content)
+        segs = [
+            {"start": 12.0, "end": 14.0, "text": "本镜旁白"},
+            {"start": 14.0, "end": 17.0, "text": "落版品牌词整句"},
+        ]
+        shots = [{"shot_id": "S04", "narration": "本镜旁白",
+                  "narr_at": 11.87, "tts_sec": 2.04}]
+        r = check_narration_content("x", shots,
+                                    transcriber=lambda v: segs)
+        # 落版词(中点 15.5)不在 [11.62,14.16] 内 → 不计入
+        assert r["verdict"] == "ok", r["findings"]
+
+    def test_short_phrase_asr_error_not_false_critical(self, tmp_path):
+        """4 字金句的真实 ASR 误识别(按键心意达→按鍵新一打,sim 0.4)
+        不得判 critical——短句阈值 0.12。"""
+        from shipin_platform.review.hard_gates import (
+            check_narration_content)
+        segs = [{"start": 6.0, "end": 8.0, "text": "按鍵新一打"}]
+        shots = [{"shot_id": "S03", "narration": "按键心意达",
+                  "narr_at": 6.0, "tts_sec": 2.0}]
+        r = check_narration_content("x", shots,
+                                    transcriber=lambda v: segs)
+        assert r["verdict"] == "ok", r["findings"]
+        st = r["stats"]["shots"][0]
+        assert st["short"] is True and st["crit_threshold"] == 0.12
+
+    def test_short_phrase_real_mismatch_still_critical(self, tmp_path):
+        """反向:短句真的被换成另一句仍须 critical(阈值只放到 0.12)。"""
+        from shipin_platform.review.hard_gates import (
+            check_narration_content)
+        segs = [{"start": 6.0, "end": 8.0, "text": "今天天气真好"}]
+        shots = [{"shot_id": "S03", "narration": "按键心意达",
+                  "narr_at": 6.0, "tts_sec": 2.0}]
+        r = check_narration_content("x", shots,
+                                    transcriber=lambda v: segs)
+        assert r["verdict"] == "fix", r
+
     def test_matching_content_passes(self, tmp_path):
         from shipin_platform.review.hard_gates import check_narration_content
         r = check_narration_content(
@@ -1869,12 +1916,15 @@ class TestNarrationContent:
     def test_partial_drift_warns_not_fixes(self, tmp_path):
         from shipin_platform.review.hard_gates import check_narration_content
         # 同句中段被换(相似度 0.57,落在 WARN~CRIT 之间):吞尾半是前缀
-        # 匹配 SequenceMatcher 会高估(0.77),必须用中段改写才能测出漂移
+        # 匹配 SequenceMatcher 会高估(0.77),必须用中段改写才能测出漂移。
+        # 轮59:例句必须 >8 字走长句阈值——短句金句阈值单独测
+        # (whisper base 对 4-8 字固有误差达 0.2,见短句档测试);
+        # 中段改写保 0.5 落在长句 WARN~CRIT 之间
         r = check_narration_content(
             str(tmp_path / "x.mp4"),
-            self._shots(narration="夜晚的星空很亮"),
+            self._shots(narration="加班的深夜总有咖啡陪伴着"),
             transcriber=self._tr([{"start": 0.0, "end": 2.0,
-                                   "text": "夜晚的炉火很暖"}]))
+                                   "text": "周末的早晨总有阳光陪伴着"}]))
         assert r["verdict"] == "ok", r["findings"]
         codes = {f["code"] for f in r["findings"]}
         assert "NARRATION_DRIFT" in codes, codes

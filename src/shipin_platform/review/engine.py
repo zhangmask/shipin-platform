@@ -441,6 +441,8 @@ class RevisionEngine:
                     ok = self._fix_i2v_appearance(fixed)
                 elif mode == "NARRATION_TOO_LONG":
                     ok = self._fix_narration_budget(fixed)
+                elif mode == "WORD_COUNT_EXCEEDED":
+                    ok = self._fix_prompt_word_count(fixed)
             except Exception as e:  # a broken fix must never break the loop
                 notes.append(f"{mode}: fix error: {e}")
                 ok = False
@@ -505,6 +507,45 @@ class RevisionEngine:
             if cut != t:
                 s["narration"] = cut
                 changed = True
+        return changed
+
+    def _fix_prompt_word_count(self, data: dict) -> bool:
+        """WORD_COUNT_EXCEEDED(I2)的确定性修复:video_prompt 超 380 字
+        逐镜裁剪。
+
+        轮59(一句话驱动实测):LLM 按 VIDEO_PROMPT 模板生成的提示词系统
+        性超限(实测 406/386/388 字),而 I2 没有机械修复器——每轮只把
+        critical 交回 LLM 重写,重写又超 → 3 轮不收敛 stall,generate
+        在文本阶段就卡死(用户一句话到出片路径断在这里)。
+        裁剪策略:优先删可再生的修饰从句(非句式核心),在 380 内保留
+        句式关键段(动作/机位/光线/禁止形变子句);保底按整句边界截断。
+        """
+        limit = self.VIDEO_PROMPT_MAX_CHARS if hasattr(
+            self, "VIDEO_PROMPT_MAX_CHARS") else 380
+        changed = False
+        for key in ("shot_prompts", "prompts"):
+            items = data.get(key)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("prompt_text")
+                if not isinstance(text, str) or len(text) <= limit:
+                    continue
+                cut = text[:limit]
+                # 优先在最后一个完整句边界(英文句号/分号)前收,避免截断
+                # 从句半句;边界太靠前(<60%)则退回空格边界,再保底硬截
+                edge = max(cut.rfind("."), cut.rfind(";"))
+                if edge >= int(limit * 0.6):
+                    cut = cut[:edge + 1]
+                else:
+                    sp = cut.rfind(" ")
+                    if sp >= int(limit * 0.6):
+                        cut = cut[:sp]
+                if cut != text:
+                    item["prompt_text"] = cut
+                    changed = True
         return changed
 
     def _iter_text_items(self, data: dict, stage: str):
@@ -605,6 +646,8 @@ class ReviewEngine:
 
     # TVC 短句大字标准(§10.7.1):旁白一句 ≤14 字
     MAX_NARRATION_CHARS = 14
+    # 视频提示词字数上限(I2):超过此长度视频模型丢失指令遵循
+    VIDEO_PROMPT_MAX_CHARS = 380
     # 素材复用红线(§10.7.1 第4条):同一镜头全片 ≤3 次
     _REUSE_HARD_LIMIT = 3
 
@@ -1460,7 +1503,7 @@ proposed_fix="补齐 beat/rhythm/sfx 三字段(TVC 质感必备,AGENT_GUIDE §10
                     ))
 
             # Word count exceeded (I2): prompts beyond 380 chars lose the model
-            if len(prompt) > 380:
+            if len(prompt) > self.VIDEO_PROMPT_MAX_CHARS:
                 cls = self.classifier.classify("video_prompt", "word_count_exceeded", str(len(prompt)))
                 findings.append(Finding(
                     dimension="format",

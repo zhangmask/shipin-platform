@@ -27,6 +27,10 @@ _IMG_HOSTS = frozenset({"cos-platform-outputs.agnes-ai.cn",
     "images.unsplash.com", "cdn.openai.com", "edge.mediastack.ai",
     "platform-outputs.agnes-ai.space",
     "platform-outputs.agnes-ai.cn",
+    # 轮59(一句话驱动实测):API 主机自身——/v1/images 返回的产物 URL
+    # 就落在 apihub.agnes-ai.com 上,白名单漏它 = 云端生图 100% 断
+    # (换本地后端修好的镜像病:云端路径反而从没跑通过)
+    "apihub.agnes-ai.com",
 })
 
 

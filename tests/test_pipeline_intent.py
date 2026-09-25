@@ -1059,6 +1059,42 @@ class TestSubtitleWidthWrap:
 
     BUDGET = int(1280 * 0.62)  # 793px
 
+    # ── 轮59 断点4:折行宽度必须按实际画幅 ─────────────────────────
+    # 竖版 720x1280 项目 manifest 无 canvas_w 时旧代码回退横屏 1280,
+    # 可用宽 446px 却按 793px 折行,12 字 slogan(598px)必被 §10.6
+    # 打死,assemble 到字幕 100% 卡死(一句话驱动真链路实测)。
+
+    def test_vertical_canvas_wraps_within_its_own_width(self):
+        """竖版 720 宽:slogan 12 字必须折行且每行 ≤62%×720。"""
+        from shipin_platform.tools.subtitle_renderer import measure_text_px
+        sb = {"shots": [{"shot_id": "S06",
+                         "narration": "晨光咖啡，每一杯都是新开始",
+                         "dialogue": ""}]}
+        tl = [{"shot_id": "S06", "window_sec": 4.0, "tts_sec": 3.0,
+               "dlg_sec": 0.0}]
+        srt = pr._build_srt(sb, tl, None, max_line_px=int(720 * 0.62),
+                            font_size=46, max_line_chars=11)
+        lines = [ln for b in srt.split("\n\n") if b.strip()
+                 for ln in b.splitlines()[2:] if ln.strip()]
+        assert lines, srt
+        for ln in lines:
+            px = measure_text_px(ln, 46) or 0
+            assert px <= int(720 * 0.62), (ln, px)
+
+    def test_horizontal_budget_would_overflow_vertical(self):
+        """反向:按横屏 793px 折的行在竖版必超——证明修的是画幅混淆。"""
+        from shipin_platform.tools.subtitle_renderer import measure_text_px
+        long_line = "晨光咖啡，每一杯都是新开始"
+        assert (measure_text_px(long_line, 46) or 0) > int(720 * 0.62)
+        # 横屏预算下这行原样放过(正是旧 bug 的形态)
+        srt = pr._build_srt({"shots": [{"shot_id": "S06",
+                                        "narration": long_line,
+                                        "dialogue": ""}]},
+                            [{"shot_id": "S06", "window_sec": 4.0}], None,
+                            max_line_px=int(1280 * 0.62), font_size=46,
+                            max_line_chars=17)
+        assert long_line in srt, srt
+
     def _pct(self, line: str) -> float:
         from shipin_platform.tools.subtitle_renderer import measure_text_px
         px = measure_text_px(line, 46)

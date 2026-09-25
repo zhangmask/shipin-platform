@@ -348,6 +348,12 @@ def check_narration_presence(video: str, shots: list[dict]) -> dict:
 _NARR_CONTENT_CRIT = 0.45   # 相似度低于此:说的不是这个词(critical)
 _NARR_CONTENT_WARN = 0.65   # 相似度低于此:内容漂移(warning)
 _NARR_CONTENT_PAD = 0.25    # 窗口外扩:ASR 段边界不必与窗口严丝合缝
+# 轮59(真 ASR 实测):whisper base 对 ≤8 字短句误差达 0.2(「醇香散
+# 疲惫」→「純鄉散皮背」0.20、「按键心意达」→「按鍵新一打」0.40)——
+# 4 字广告金句按长句阈值 0.45 必误报。短句专用阈值:
+_NARR_SHORT_CHARS = 8
+_NARR_SHORT_CRIT = 0.12     # 短句:低于此才是真换词
+_NARR_SHORT_WARN = 0.35     # 短句:低于此提示漂移
 
 
 def _norm_text(t: str) -> str:
@@ -455,10 +461,16 @@ def check_narration_content(video: str, shots: list[dict],
         win = tts if tts > 0.2 else (float(s.get("duration_sec") or 0) or 3.0)
         a, b = max(at, 0.0), max(at, 0.0) + min(win, 12.0)
         lo, hi = a - _NARR_CONTENT_PAD, b + _NARR_CONTENT_PAD
+        # 轮59(一句话驱动真链路实测):ASR 段归属按**段中点**是否落在
+        # 窗口内判定,不再「起止与窗有任意重叠即整段计入」——后者会把
+        # 邻镜/落版词混进来:实测 S04 窗口 [11.87,13.91],ASR 段
+        # 12.0~14.0(中点 13.0 在内,应计)与 14.0~17.0(中点 15.5 在外,
+        # 旧逻辑因起点 14.0<14.16 也计入)混入 → 「醇香散疲惫」的相似度
+        # 被落版词稀释到 0.09,误报 NARRATION_MISMATCH。
         heard = _norm_text("".join(
             str(g.get("text") or "") for g in segments
-            if float(g.get("end") or 0) >= lo
-            and float(g.get("start") or 0) <= hi))
+            if lo <= (float(g.get("start") or 0)
+                     + float(g.get("end") or 0)) / 2 <= hi))
         exp = _norm_text(text)
         if not exp:
             continue
@@ -468,19 +480,26 @@ def check_narration_content(video: str, shots: list[dict],
             continue
         checked += 1
         sim = difflib.SequenceMatcher(None, exp, heard).ratio()
-        sims.append({"shot_id": s.get("shot_id", "?"), "sim": round(sim, 3)})
+        # 轮59:短句(≤8 字金句)ASR 固有误差大,用短句阈值;阈值随
+        # sims 落账,运营可复核当时用的是哪档
+        _short = len(exp) <= _NARR_SHORT_CHARS
+        _crit_t = _NARR_SHORT_CRIT if _short else _NARR_CONTENT_CRIT
+        _warn_t = _NARR_SHORT_WARN if _short else _NARR_CONTENT_WARN
+        sims.append({"shot_id": s.get("shot_id", "?"), "sim": round(sim, 3),
+                     "crit_threshold": _crit_t, "short": _short})
         sid = s.get("shot_id", "?")
-        if sim < _NARR_CONTENT_CRIT:
+        if sim < _crit_t:
             findings.append({
                 "severity": "critical", "code": "NARRATION_MISMATCH",
                 "message": (f"镜头{sid} {kind}内容不符:ASR 听到「{heard[:36]}」"
                             f"」≠ 剧本「{exp[:36]}」(相似度 {sim:.2f} < "
-                            f"{_NARR_CONTENT_CRIT})——说的不是这句词")})
-        elif sim < _NARR_CONTENT_WARN:
+                            f"{_crit_t}{'·短句档' if _short else ''})"
+                            f"——说的不是这句词")})
+        elif sim < _warn_t:
             findings.append({
                 "severity": "warning", "code": "NARRATION_DRIFT",
                 "message": (f"镜头{sid} {kind}内容漂移:相似度 {sim:.2f} "
-                            f"< {_NARR_CONTENT_WARN}(ASR「{heard[:24]}」"
+                            f"< {_warn_t}(ASR「{heard[:24]}」"
                             f" vs 剧本「{exp[:24]}」)——可能吞字/串句/ASR 误差")})
     verdict = ("fix" if any(f["severity"] == "critical" for f in findings)
                else "ok")
