@@ -991,6 +991,113 @@ class TestFinalPromotion:
         assert not (work / "final.mp4").exists()
 
 
+class TestTargetedRegeneration:
+    """轮61(生成策略转向):单镜 VLM 诊断 critical 不再直接交 assemble
+    拦——generate 内用变体 prompt 定向重生成(attempt 阶梯天然分档:
+    0=原 prompt / 1=固定机位 / 2=固定机位+极简运动)。定向重试仍
+    critical 才落记录,由 assemble 终审统一阻断(原范式不变)。"""
+
+    def _seed(self, pid, scene="店内，主角手部按下按键"):
+        shutil.rmtree(pr._project_dir(pid), ignore_errors=True)
+        pr._save(pid, "brief.json", {"product_info": "x", "duration_sec": 9,
+                                     "brand_name": "晨光咖啡"})
+        pr._save(pid, "storyboard.json", {"hero_shot": "S01", "shots": [
+            {"shot_id": "S01", "duration_sec": 3, "narration": "n",
+             "dialogue": "", "beat": "hook", "scene": scene,
+             "subject": "主角", "motion": "presses the brew button",
+             "spatial": "close-up", "camera": "static",
+             "shot_size": "cu"}]})
+        pr._save(pid, "image_prompt.json", {"style_anchor": "s",
+            "shot_prompts": [{"shot_id": "S01", "prompt_en": "cup"}]})
+        pr._save(pid, "video_prompt.json", {"shot_prompts": [
+            {"shot_id": "S01", "prompt_text": "close-up pressing button"}]})
+        store = ProjectStageStore(":memory:")
+        store.create_project(pid)
+        for g in ("script", "storyboard"):
+            store.record_artifact(pid, g, "h")
+            store.record_confirmation(pid, g)
+        return store
+
+    @staticmethod
+    def _wire_gen(monkeypatch, pid, tmp_path, prompts):
+        def _fake_gen(prompt, duration=5, resolution="720p", work_dir=None,
+                      first_frame=None, last_frame=None, output_path=None,
+                      negative_prompt="", **kw):
+            prompts.append(prompt)
+            out = output_path or str(tmp_path / "f.mp4")
+            import subprocess as _sp
+            _sp.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                     "-i", "testsrc2=duration=3:size=320x240:r=24",
+                     "-c:v", "libx264", "-pix_fmt", "yuv420p", out],
+                    check=True, capture_output=True)
+            return {"ok": True, "output": out, "master_path": ""}
+
+        def _fake_img(*a, **k):
+            out = pr._project_dir(pid) / "S01.jpg"
+            import subprocess as _sp
+            _sp.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                     "-i", "testsrc2=duration=1:size=320x240:r=24",
+                     "-frames:v", "1", str(out)],
+                    check=True, capture_output=True)
+            return {"ok": True, "output": str(out)}
+
+        monkeypatch.setattr(pr, "generate_video_agnes", _fake_gen)
+        monkeypatch.setattr(pr, "generate_image_agnes", _fake_img)
+
+    def test_critical_review_triggers_variant_regen(self, monkeypatch,
+                                                    tmp_path):
+        """诊断 critical → 换固定机位变体重生成 → 通过后落账;
+        attempts 必须留痕(codes + vlm_review 标记)。"""
+        from shipin_platform.review import hard_gates as hg
+        import uuid as _uuid_rt
+        pid = f"retarget-ok-{_uuid_rt.uuid4().hex[:8]}"
+        store = self._seed(pid)
+        prompts = []
+        self._wire_gen(monkeypatch, pid, tmp_path, prompts)
+        vcalls = {"n": 0}
+
+        def _fake_review(clip, shot, frames_count=4, key=None):
+            vcalls["n"] += 1
+            if vcalls["n"] == 1:
+                return {"verdict": "fix", "findings": [
+                    {"severity": "critical", "code": "VLM_BREAK",
+                     "message": "stub: 侧面按键"}]}
+            return {"verdict": "pass", "findings": []}
+
+        monkeypatch.setattr(hg, "vlm_review_shot", _fake_review)
+        r = pr.run_generate_phase(pid, store)
+        assert r["ok"] is True, str(r.get("reason"))[:200]
+        assert len(prompts) == 2, prompts
+        assert "FIXED camera" in prompts[1], prompts[1]   # attempt 1 变体
+        att = r["report"][-1]["attempts"]
+        codes = [a.get("codes") for a in att if a.get("vlm_review")]
+        assert ["VLM_BREAK"] in codes, att
+
+    def test_persistent_critical_still_records_for_assemble(
+            self, monkeypatch, tmp_path):
+        """定向重试后仍 critical:不得 silently 放行——落
+        shots_review 记录交 assemble 终审阻断(原范式保持)。"""
+        from shipin_platform.review import hard_gates as hg
+        import uuid as _uuid_rp
+        pid = f"retarget-persist-{_uuid_rp.uuid4().hex[:8]}"
+        store = self._seed(pid)
+        prompts = []
+        self._wire_gen(monkeypatch, pid, tmp_path, prompts)
+        monkeypatch.setattr(hg, "vlm_review_shot",
+                            lambda clip, shot, frames_count=4, key=None: {
+                                "verdict": "fix", "findings": [
+                                    {"severity": "critical",
+                                     "code": "VLM_BREAK",
+                                     "message": "stub: 恒定侧面按键"}]})
+        r = pr.run_generate_phase(pid, store)
+        assert r["ok"] is True, str(r.get("reason"))[:200]  # generate 成功
+        assert len(prompts) == 2, prompts                   # 定向重试发生过
+        sr = pr._load(pid, "shots_review.json") or {}
+        assert sr["S01"]["verdict"] == "fix"
+        assert any(f.get("code") == "VLM_BREAK"
+                   for f in sr["S01"]["findings"]), sr["S01"]
+
+
 class TestSubtitleWrap:
     """轮44d:§10.6 宽度红线治本——720p@46px 下 10 字旁白烧出来
     63.7%,验收门(轮27)直接打死整条 assemble(E2E 实证)。中文排版惯例

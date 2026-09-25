@@ -906,7 +906,27 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
         img_prompts.append({"shot_id": s["shot_id"], "prompt_en":
                             f"{s['subject']}. {_motion_txt}{speaking_en} "
                             f"Scene: {s['scene']}. "
-                            f"{s['spatial']}. {s['camera']}. {style}, no text"})
+                            f"{s['spatial']}. {s['camera']}. {style}, no text"
+                            # 轮61(生成策略转向):prompt 层对「按键位置」
+                            # 已到边际(三重约束仍侧面键)——改从**首帧
+                            # 锚定图**锚死构图:AGNES 2.5 以首帧为条件
+                            # 生成,图里键位对了视频里键位就对了。按键类
+                            # scene 的图像 prompt 显式写出 brew button
+                            # 在正面面板、Logo 正旁的特写构图。
+                            + (f" Frame composition: tight close-up of the "
+                               f"finger pressing the brew button on the "
+                               f"machine's FRONT panel, with the "
+                               f"'{brand_name0}' logo printed directly "
+                               f"beside the button — the button is "
+                               f"front-facing and centered, clearly NOT "
+                               f"a side-panel control, shallow depth of "
+                               f"field."
+                               if brand_name0 and re.search(
+                                   r"按下|按键|出水键|按钮",
+                                   _scene_txt) and str(
+                                   s.get("shot_size") or "").lower() in
+                               ("ecu", "cu", "mcu")
+                               else "")})
         vid_prompts.append({"shot_id": s["shot_id"],
                             # 模板升级(2026-09-21 A/B 实测):A(中文短模板)在 2.5s
                             # 出现主体变形;英文长模板(scene+固定机位+景深+主体居中
@@ -1074,12 +1094,17 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
             continue
         dur = float(s.get("duration_sec") or 3)
         # 轮42/44:clip 缓存必须过新鲜度判据——本地 clip 比全输入指纹
-        # (prompt/首末帧/时长);池化 clip(变体复用基准素材,设计行为)
+        # (prompt/首末帧+时长);池化 clip(变体复用基准素材,设计行为)
         # 比镜头定义指纹(shot_id+时长+主体/场景/动作),变体改
         # style_anchor 不误杀池复用,/rewrite 改镜头定义仍强制重生。
         _ci = _clip_input_sha(vid_map.get(sid) or s.get("motion") or "",
                               str(mrec.get("first_frame") or ""),
                               str(mrec.get("last_frame") or ""), dur)
+        # 轮61:定向重试(单镜诊断 critical→attempt 1)会把 prompt 换成
+        # 固定机位变体重生成——落账指纹必须跟着换,否则下次重跑判
+        # fresh 复用旧 clip,定向重生成自闭环失效(钱花了内容没换)。
+        # 做法:定向重试分支里就地改 _ci(拼变体标记),attempt 1/2 的
+        # 成功落账自然带上新指纹。
         _sci = _clip_shot_sha(sid, dur, s)
         _pooled = _clip_is_pooled(mrec, project_id)
         _cached_clip = str(mrec.get("clip") or "")
@@ -1154,14 +1179,29 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                                    f"{project_id}/budget 调整上限后重跑")}
             # 重试阶梯(v6 实证):1) 原提示词 2) 固定机位+原运动
             # 3) 固定机位+主体极简运动。机位运动+主体运动叠加是切镜主诱因。
+            # 轮61:阶梯 prompt 也带 shot_size/品牌/按键硬约束——旧阶梯
+            # 直接用裸 motion,定向重试(单镜诊断 critical→attempt 1)会
+            # 丢掉轮60 强化的全部约束,重生成必然再犯同一 finding。
+            _hard = ""
+            if brand_name0:
+                _hard = (f" {_SIZE_TERMS.get(str(s.get('shot_size') or '').lower(), 'medium close-up')}"
+                         f" framing. The only visible brand is "
+                         f"'{brand_name0}', no other logos or invented "
+                         f"text.")
+                if re.search(r"按下|按键|出水键|按钮", _scene_txt):
+                    _hard += (f" The brew button is on the machine's FRONT "
+                              f"panel with the '{brand_name0}' logo "
+                              f"printed directly beside it — not a side "
+                              f"button, not a generic control.")
             if attempt == 0:
-                prompt = vid_map.get(sid, s["motion"])
+                prompt = vid_map.get(sid, s["motion"]) + _hard
             elif attempt == 1:
                 prompt = (f"ONE single uninterrupted take, FIXED camera, no camera "
-                          f"movement at all. {s['motion']}")
+                          f"movement at all. {s['motion']}" + _hard)
             else:
                 prompt = (f"ONE single uninterrupted take, FIXED camera, no camera "
-                          f"movement. The subject moves minimally: {s['motion']}")
+                          f"movement. The subject moves minimally: {s['motion']}"
+                          + _hard)
             net_retries = 0
             r = None
             while True:
@@ -1253,6 +1293,21 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                 except Exception as e:
                     shots_review[sid] = {"verdict": "error", "findings": [],
                                          "error": str(e)[:160]}
+                # 轮61(生成策略):单镜诊断 critical 不再直接 break 交
+                # assemble 拦——在 generate 内用变体 prompt **定向重生**
+                # 该镜(终审 S03「侧面按键」两轮实证:同一 prompt 重生成
+                # 结果同构,必须换生成策略才有出路)。定向重试仍 critical
+                # 才落记录放行,由 assemble 终审统一阻断(原范式不变)。
+                _sr_crit = [f for f in shots_review.get(sid, {}).get("findings", [])
+                            if f.get("severity") == "critical"]
+                if _sr_crit and attempt < 1:
+                    attempts.append({"attempt": attempt + 1, "qc": "ok",
+                                     "vlm_review": "critical→定向重生成",
+                                     "codes": [f.get("code") for f in _sr_crit]})
+                    mrec["qc"] = "fix"
+                    # 轮61:换 prompt 变体 ⇒ 输入指纹跟着换(见 _ci 处注释)
+                    _ci = _ci + "-retarget1"
+                    continue
                 _save(project_id, "shots_review.json", shots_review)
                 _save(project_id, "manifest.json", manifest)
                 break
