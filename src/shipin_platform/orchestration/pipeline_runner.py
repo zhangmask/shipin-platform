@@ -844,10 +844,52 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                   f"product label or cup, readable, softly lit." if brand_name0 else "")
     img_prompts, vid_prompts = [], []
     _n_shots = len(storyboard["shots"])
+    # 轮60(终审 finding 实证):shot_size 景别词表——分镜表有 shot_size
+    # (ecu/cu/mcu/cs/ms/ws/ows)但旧模板景别硬编码 "medium close-up",
+    # S03(分镜 cu 特写手部)被生成成中景站姿,S01(ws)光线词在 scene 中段
+    # 被稀释。景别词前移为强约束(否定式),模型先看到"必须是特写"。
+    _SIZE_TERMS = {
+        "ecu": "extreme close-up (eyes/hands only, tightly framed)",
+        "cu": "close-up (hands and object fill the frame, tightly framed)",
+        "mcu": "medium close-up (chest up, subject prominent)",
+        "cs": "close shot (waist up)",
+        "ms": "medium shot (full subject, head to knees)",
+        "ws": "wide shot (whole scene and surroundings visible)",
+        "ows": "extreme wide shot (subject small in vast scene)",
+    }
     for _i, s in enumerate(storyboard["shots"]):
         # 品牌入画只放首/尾镜(广告惯例:开场亮牌、结尾收牌);中段镜头
         # 不加,否则品牌文字在每镜都出现显假。
+        # 轮60:但分镜 scene 明确写了 Logo/品牌吊牌等落点的中段镜(S03
+        # 出水键 Logo、S04 杯身 Logo)必须带品牌指令——终审判「未出现
+        # 品牌 Logo」两条 SHOT_STORY_MISMATCH 正是这种:场景要求了,
+        # prompt 没给。按 scene 关键词命中补充。
+        _scene_txt = str(s.get("scene") or "")
         _brand = brand_shot if (_i == 0 or _i == _n_shots - 1) else ""
+        if not _brand and re.search(r"品牌|logo|Logo|LOGO|吊牌", _scene_txt):
+            _brand = brand_shot
+        # 轮60 二轮(终审实证):品牌**专有否定式**——模型会发明竞品
+        # Logo(S04 实测杯身出星巴克标),prompt 必须显式排除他牌;
+        # 屏显指定(S05 实测屏幕显示 '25th year' 而非品牌名)。
+        if brand_name0:
+            _brand += (f" The only visible brand anywhere is "
+                       f"'{brand_name0}'. No other logos, no Starbucks "
+                       f"or any third-party brand marks, no invented "
+                       f"text or English words on screens, cups, walls "
+                       f"or clothing.")
+            if re.search(r"屏幕", _scene_txt):
+                _brand += (f" If a screen is visible it displays exactly "
+                           f"'{brand_name0}', nothing else.")
+        # 光线-动作一致性:scene 写明室内/冷色黎明而 motion 却是阳光
+        # 移动(S01 实测死结:模型要么无阳光→finding『无阳光移动』,
+        # 要么加暖光→finding『光线色温不符」)。此时代入可拍的等效
+        # 运动(灯光/蒸汽),不把物理上矛盾的指令发给模型。
+        _motion_txt = str(s.get("motion") or "")
+        if re.search(r"室内|店内|屋|舱", _scene_txt) and \
+                re.search(r"sunlight|阳光|日光|sun beam", _motion_txt,
+                          re.IGNORECASE):
+            _motion_txt = ("soft interior light drifting slowly across "
+                           "the scene")
         dlg = s.get("dialogue")
         spk = (str(s.get("speaking") or "").strip()
                if isinstance(dlg, dict) and dlg.get("text") else "")
@@ -862,7 +904,7 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                 f"storyboard 镜头 {s['shot_id']} 缺少模板字段 {_miss}"
                 "——分镜表不完整,先经 review/iterate 补全再 generate")
         img_prompts.append({"shot_id": s["shot_id"], "prompt_en":
-                            f"{s['subject']}. {s['motion']}{speaking_en} "
+                            f"{s['subject']}. {_motion_txt}{speaking_en} "
                             f"Scene: {s['scene']}. "
                             f"{s['spatial']}. {s['camera']}. {style}, no text"})
         vid_prompts.append({"shot_id": s["shot_id"],
@@ -873,11 +915,20 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                             # 「无人物」开头)不能要求 subject stays centered——模型
                             # 会发明一个主体(实测:海景空镜在 1.1s 后漂出咖啡杯
                             # 特写并居中),centering 子句对空镜是负向指令。
-                            "prompt_text": (f"{s['motion']}{speaking_en} "
+                            # 轮60(终审 finding 实证):景别前移为抬头强约束+
+                            # 否定式(分镜 cu=S03 被判「中景站姿」;旧模板把景别
+                            # 硬编码在 Camera 子句中段,被 scene/动作稀释);
+                            # 光线词否定式前置(分镜『冷色黎明』被判「暖金
+                            # 阳光」——负向指令比正向更难被违反)。
+                            "prompt_text": (f"{_SIZE_TERMS.get(str(s.get('shot_size') or '').lower(), 'medium close-up')} of "
+                                            f"{s['subject']}. "
+                                            f"{_motion_txt}{speaking_en} "
                                             f"Scene: {s['scene']}. "
-                                            f"Camera: {s['camera']}, fixed at "
-                                            f"medium close-up, shallow depth of "
-                                            f"field"
+                                            f"{s['spatial']}. "
+                                            f"Camera: {s['camera']}, locked "
+                                            f"framing, no wide establishing "
+                                            f"shot, no camera pull-back, "
+                                            f"shallow depth of field"
                                             + (", subject stays centered"
                                                if not str(s.get("subject")
                                                           or "").startswith("无人物")
@@ -888,7 +939,26 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                                             f"morphing or shape change of the "
                                             f"subject, natural stable motion, "
                                             f"smooth ending."
-                                            f"{_brand}")})
+                                            f"{_brand}"
+                                            # 轮60 三轮(终审实证):交互位点专有约束
+                                            # ——S03 分镜写「按下带品牌 Logo 的
+                                            # 出水键」,模型两轮都生成「侧面通用
+                                            # 按键」(终审两条 finding)。命中
+                                            # 按键类 scene 时把按钮位置/标识
+                                            # 写成英文硬约束:正面面板、Logo
+                                            # 正旁,禁侧面/禁通用键。
+                                            + (f" The pressed control is the "
+                                               f"brew button on the machine's "
+                                               f"front panel with the "
+                                               f"'{brand_name0}' logo printed "
+                                               f"directly beside it — not a "
+                                               f"side button, not a generic "
+                                               f"control."
+                                               if brand_name0 and re.search(
+                                                   r"按下|按键|出水键|按钮",
+                                                   _scene_txt)
+                                               else "")
+                                            )})
     for stage, data in (("image_prompt", {"style_anchor": style, "shot_prompts": img_prompts}),
                         ("video_prompt", {"shot_prompts": vid_prompts})):
         row = store.get_stage(project_id, stage)

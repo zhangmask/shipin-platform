@@ -271,6 +271,13 @@ _SUBJECTIVE_ROOTS = (
 class RevisionEngine:
     """Applies revision strategies based on failure modes."""
 
+    # 轮60:字数上限常量的**单一数据源**放在修复器侧——旧实现定义在
+    # ReviewEngine 上,RevisionEngine 的修复器引用即 AttributeError,
+    # 被 fix() 的 except 吞掉落 manual → 每轮交给 LLM → stall(轮59
+    # 收敛是常量恰好还在同一类;轮60 加属性后暴露)。ReviewEngine 侧
+    # 以引用方式共用(见其类内 VIDEO_PROMPT_MAX_CHARS = RevisionEngine...)。
+    VIDEO_PROMPT_MAX_CHARS = 380
+
     # Strategy implementations for common cases
     STRATEGY_TEMPLATES = {
         "A1": {  # Add missing subject features
@@ -517,11 +524,12 @@ class RevisionEngine:
         性超限(实测 406/386/388 字),而 I2 没有机械修复器——每轮只把
         critical 交回 LLM 重写,重写又超 → 3 轮不收敛 stall,generate
         在文本阶段就卡死(用户一句话到出片路径断在这里)。
-        裁剪策略:优先删可再生的修饰从句(非句式核心),在 380 内保留
-        句式关键段(动作/机位/光线/禁止形变子句);保底按整句边界截断。
+        轮60(景别强化后):模板把 shot_size 景别词前移为抬头强约束,
+        总长涨到 ~450 字——裁剪必须**保护头部景别子句**(第一句,
+        含景别词与主体),否则裁掉的是刚强化的指令,S01/S03 的景别
+        finding 会回归。策略:首句锁定,从第二句起按 段→空格边界 裁。
         """
-        limit = self.VIDEO_PROMPT_MAX_CHARS if hasattr(
-            self, "VIDEO_PROMPT_MAX_CHARS") else 380
+        limit = self.VIDEO_PROMPT_MAX_CHARS
         changed = False
         for key in ("shot_prompts", "prompts"):
             items = data.get(key)
@@ -533,18 +541,35 @@ class RevisionEngine:
                 text = item.get("prompt_text")
                 if not isinstance(text, str) or len(text) <= limit:
                     continue
-                cut = text[:limit]
-                # 优先在最后一个完整句边界(英文句号/分号)前收,避免截断
-                # 从句半句;边界太靠前(<60%)则退回空格边界,再保底硬截
+                # 头部景别子句 = 第一句(到第一个 '. ' 或句点+空格);
+                # 无句读则保前 90 字(景别词+主体锚定的最小完整单元)
+                head_end = text.find(". ")
+                head = text[:head_end + 1] if head_end > 0 else text[:90]
+                body = text[len(head):]
+                # 轮60 二轮:品牌否定式(The only visible brand... /
+                # screens/cups/walls...)是防竞品与防发明文字的硬约束,
+                # 位置在尾部会被普通裁剪砍掉 → 提升为第二保护段:
+                # 从 body 中摘出品牌子句插到 head 之后,再裁其余。
+                _prot = ""
+                for _marker in (" The only visible brand", " If a screen"):
+                    _k = body.find(_marker)
+                    if _k >= 0:
+                        _e = body.find(".", _k)
+                        _e = _e + 1 if _e >= 0 else len(body)
+                        _prot += body[_k:_e]
+                        body = body[:_k] + body[_e:]
+                room = max(limit - len(head) - len(_prot), 40)
+                cut = body[:room]
                 edge = max(cut.rfind("."), cut.rfind(";"))
-                if edge >= int(limit * 0.6):
+                if edge >= int(room * 0.6):
                     cut = cut[:edge + 1]
                 else:
                     sp = cut.rfind(" ")
-                    if sp >= int(limit * 0.6):
+                    if sp >= int(room * 0.6):
                         cut = cut[:sp]
-                if cut != text:
-                    item["prompt_text"] = cut
+                new_text = head + _prot + cut
+                if new_text != text:
+                    item["prompt_text"] = new_text
                     changed = True
         return changed
 
@@ -646,8 +671,10 @@ class ReviewEngine:
 
     # TVC 短句大字标准(§10.7.1):旁白一句 ≤14 字
     MAX_NARRATION_CHARS = 14
-    # 视频提示词字数上限(I2):超过此长度视频模型丢失指令遵循
-    VIDEO_PROMPT_MAX_CHARS = 380
+    # 视频提示词字数上限(I2):超过此长度视频模型丢失指令遵循。
+    # 轮60:单一数据源在 RevisionEngine(修复器侧),此处引用共用——
+    # 两侧各自定义曾因 AttributeError 被 except 吞掉致 stall
+    VIDEO_PROMPT_MAX_CHARS = RevisionEngine.VIDEO_PROMPT_MAX_CHARS
     # 素材复用红线(§10.7.1 第4条):同一镜头全片 ≤3 次
     _REUSE_HARD_LIMIT = 3
 
