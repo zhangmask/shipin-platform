@@ -131,6 +131,40 @@ def _get(path: str, timeout: int = 30) -> dict:
         raise LocalMediaError(f"h3api {path} 查询失败: {e}")
 
 
+# 轮73:ASR sidecar 调用——与 _post 同一 SSRF 守卫范式(_assert_local_url
+# 行内),目标是第一方 TTS sidecar(默认 127.0.0.1:8201)。WhisperService
+# 经此走 faster-whisper,不在本模块外构造任何 URL。
+_ASR_URL = os.environ.get("SHIPIN_TTS_SIDECAR_URL",
+                          "http://127.0.0.1:8201/asr").rstrip("/")
+
+
+def sidecar_asr(audio_path: str, language: str = "zh",
+                initial_prompt: str = "") -> list[dict]:
+    """调 TTS sidecar /asr,返回 whisper 同构 segments [{start,end,text}]。
+
+    initial_prompt(轮73):预期文本解码偏置,压掉短句 ASR 噪声。
+    失败向上抛(LocalMediaError/网络/协议)——调用方负责 skip 语义,
+    本层绝不吞(静默 skip 冒充审过正是轮45 修掉的病)。
+    """
+    _assert_local_url(_ASR_URL)  # 轮58/73:守卫行内,紧贴请求
+    req = urllib.request.Request(
+        _ASR_URL,
+        data=_json_dumps({"path": str(audio_path),
+                          "language": language,
+                          "initial_prompt": initial_prompt}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST")
+    try:
+        with _OPENER.open(req, timeout=600) as r:
+            data = _json_loads(r.read().decode("utf-8"))
+    except Exception as e:
+        raise LocalMediaError(f"sidecar asr 不可达: {e}")
+    segs = data.get("segments")
+    if not isinstance(segs, list):
+        raise LocalMediaError("sidecar asr 返回无 segments")
+    return segs
+
+
 def _download(url_path: str, out: str, timeout: int = 300) -> str:
     sep = "&" if "?" in url_path else "?"
     if _TOKEN and "token=" not in url_path:
@@ -191,8 +225,20 @@ def local_image(prompt: str, width: int, height: int, out: str,
 
 def local_video(prompt: str, out: str, first_frame: str = "",
                 last_frame: str = "", duration: int = 5,
-                engine: str = "", steps: int = 0) -> dict:
-    """Image/text-to-video via the DGX (MiniMax-H3 / Wan 2.2)."""
+                engine: str = "", steps: int = 0,
+                width: int = 0, height: int = 0,
+                ref_images: Optional[list[str]] = None) -> dict:
+    """Image/text-to-video via the DGX (MiniMax-H3 / Wan 2.2).
+
+    width/height 必须由调用方按项目画布传入——h3api 默认 1344x768 横屏，
+    竖屏项目(720x1280)不传就会得到横屏素材,之后被 _normalize_canvas 加
+    黑边缩成小横条(有效画面只剩约三分之一),成片比例观感前后不一。
+
+    ref_images(2026-09-26 一致性升级):非空时走 H3 Ref2VA 参考模式——
+    业界「金参考」做法的原生对应(Seedance Omni-Reference 同型):把角色
+    金参考(及本镜首帧)作为参考图喂进去,让跨镜主体身份不再只靠首帧
+    锚定。ref2va 与 i2v 是两套权重,首尾帧字段不再适用。
+    """
     eng = engine or os.environ.get("SHIPIN_LOCAL_VIDEO_ENGINE", "h3")
     body = {"prompt": prompt, "duration_s": duration}
     if first_frame:
@@ -201,11 +247,48 @@ def local_video(prompt: str, out: str, first_frame: str = "",
         body["last_frame"] = _upload(last_frame)
     if steps:
         body["steps"] = steps
+    if width and height:
+        body["width"] = int(width)
+        body["height"] = int(height)
     if eng == "wan22":
+        # 轮67:wan22 I2V(双 expert 14B + lightx2v 4 步)作人物运动镜的
+        # 第二引擎——H3 对连续人物位移属上限区(轮60/61/63 实证)。
+        # width/height 必须透传:server 端 wan22 分支的默认画幅不是项目
+        # 画布,竖屏项目不传就得到横屏,后续 normalize 又要裁剪重编码。
         if not first_frame:
             raise LocalMediaError("wan22 引擎需要首帧图")
         body = {"mode": "wan22", "image": _upload(first_frame),
-                "prompt": prompt, "duration_s": duration, "length": 81}
+                "prompt": prompt, "duration_s": duration, "length": 81,
+                "negative": os.environ.get("SHIPIN_LOCAL_VIDEO_NEGATIVE", "")}
+        if steps:
+            body["steps"] = steps
+        if width and height:
+            body["width"] = int(width)
+            body["height"] = int(height)
+    elif eng == "wan21-flf2v":
+        # 轮67:Wan2.1-FLF2V 首尾帧生视频——端点(start+end image)在
+        # VAE 编码后进 latent 采样,模型只做「两点间的受限插值」。
+        # 专治两类已实证病根:H3 fl2v 的锚点-运动错拍/场景断裂、wan22
+        # i2v 4 步 81 帧尾部运动死亡(静止重复)。首尾帧二者缺一不可。
+        if not (first_frame and last_frame):
+            raise LocalMediaError("wan21-flf2v 引擎需要首帧和尾帧图")
+        body = {"mode": "flf2v",
+                "first_frame": _upload(first_frame),
+                "last_frame": _upload(last_frame),
+                "prompt": prompt, "duration_s": duration, "length": 81,
+                "negative": os.environ.get("SHIPIN_LOCAL_VIDEO_NEGATIVE", "")}
+        if steps:
+            body["steps"] = steps
+        if width and height:
+            body["width"] = int(width)
+            body["height"] = int(height)
+    elif ref_images:
+        # Ref2VA:参考图模式(权重/协议与 i2v 不同,不带 first/last_frame)
+        refs = [_upload(p) for p in ref_images]
+        body.pop("first_frame", None)
+        body.pop("last_frame", None)
+        body["mode"] = "ref2v"
+        body["ref_images"] = refs
     else:
         body["mode"] = "i2v" if first_frame else "t2v"
     job = _post("/v1/videos/generations", body)
@@ -214,15 +297,76 @@ def local_video(prompt: str, out: str, first_frame: str = "",
         raise LocalMediaError(f"本地视频失败: {done.get('error')}")
     path = _download(_first_file(done), out)
     return {"ok": True, "provider": "local", "engine": eng, "path": path,
-            "duration_sec": duration}
+            "duration_sec": duration,
+            "mode": body.get("mode"),
+            "width": body.get("width"), "height": body.get("height")}
+
+
+def local_dub(frame_path: str, audio_path: str, out: str,
+              duration: float = 0.0, engine: str = "",
+              width: int = 0, height: int = 0,
+              prompt: str = "", steps: int = 6) -> dict:
+    """音频驱动配音(照帧重说):InfiniteTalk(Wan2.1-I2V 基座)拿一张静态帧
+    + 一条音频重新生成嘴型/表情/头部动作,音频决定嘴怎么动。
+
+    轮73 音视频分离架构的生成侧:本地视频画面不够用或音频换掉时,不再整
+    镜重生,而是只重生"照着音频演"的这条画面轨,音频轨由平台 TTS/混音
+    管线另行管理(模型输出不带音频,分轨在平台侧合)。24G 显存档位下这是
+    必选项:480p 档(最大边 ≤832)+ fp8 基座 + 6 步蒸馏。
+
+    frame_path: 首帧(人物近照,决定长相/姿态);audio_path: 驱动音频;
+    duration: 音频秒数(0=ffprobe 自读);width/height: 输出画幅(按调用方
+    项目画布传,超过 832 的边等比压回 480p 档)。
+    """
+    eng = engine or os.environ.get("SHIPIN_LOCAL_DUB_ENGINE", "infinitetalk")
+    if eng != "infinitetalk":
+        raise LocalMediaError(f"未知配音引擎 {eng!r}(仅 infinitetalk)")
+    if not frame_path or not Path(frame_path).is_file():
+        raise LocalMediaError(f"配音首帧不存在: {frame_path}")
+    if not audio_path or not Path(audio_path).is_file():
+        raise LocalMediaError(f"配音音频不存在: {audio_path}")
+    sec = duration or _tts_duration(audio_path)
+    if sec <= 0.2:
+        raise LocalMediaError(f"配音音频时长异常: {sec}s({audio_path})")
+    fps = 25
+    length = int(sec * fps) - 1
+    length = ((length - 1) // 4) * 4 + 1  # Wan latent 需 4n+1
+    w, h = int(width or 0), int(height or 0)
+    if w and h and max(w, h) > 832:
+        k = 832.0 / max(w, h)
+        w, h = int(w * k) // 16 * 16, int(h * k) // 16 * 16  # 16 对齐
+    body = {"mode": "dub", "image": _upload(frame_path),
+            "audio": _upload(audio_path), "length": length, "fps": fps,
+            "steps": steps, "cfg": 1.0,
+            "prompt": prompt or (
+                "A person is talking to the camera, natural lip movements "
+                "synchronized with the speech, stable face, static camera, "
+                "smooth motion"),
+            "negative": os.environ.get("SHIPIN_LOCAL_VIDEO_NEGATIVE", "")}
+    if w and h:
+        body["width"], body["height"] = w, h
+    job = _post("/v1/videos/generations", body)
+    done = _wait_job(job["job_id"], max_wait=7200.0)
+    if done.get("status") != "succeeded":
+        raise LocalMediaError(f"配音失败: {done.get('error')}")
+    path = _download(_first_file(done), out)
+    return {"ok": True, "provider": "local", "engine": eng, "path": path,
+            "duration_sec": round(length / fps, 2),
+            "mode": "dub", "width": w or None, "height": h or None}
 
 
 def _tmp_path(path: str, tag: str) -> str:
     # ffmpeg infers the muxer from the extension: "<f>.mp3.trim" fails with
     # "Unable to choose an output format", so keep the original suffix.
+    # 轮63c:候选路径是 "<out>.aN"(非媒体扩展名)——原样保留会让 ffmpeg
+    # 无法推断输出封装,trim/atempo 全部静默失败(rc≠0 无异常),坏种
+    # 未经加工原样晋升(2026-09-26 两次事故的根因)。非媒体后缀一律
+    # 回落 .mp3(libmp3lame 可用)。
     import os
     base, ext = os.path.splitext(path)
-    return f"{base}.{tag}{ext or '.flac'}"
+    if ext.lower() not in ('.mp3', '.flac', '.wav', '.m4a', '.ogg', '.aac'):
+        ext = '.mp3'
+    return f"{base}.{tag}{ext or '.mp3'}"
 
 
 def _tts_duration(path: str) -> float:
@@ -252,11 +396,15 @@ def _trim_silence(path: str) -> str:
     return path
 
 
-def _atempo_fit(path: str, max_sec: float) -> str:
-    # Time-stretch (max 1.8x) so narration fits the shot budget.
-    import os
+def _atempo_fit(path: str, dur: float, max_sec: float) -> str:
+    """把已知时长 dur 的音频时间压缩到 max_sec 内(≤2.0x)。
+
+    dur 由调用方显式传入:不要在这里重新探测——候选项路径带 .aN
+    后缀(内容 mp3/flac、扩展名怪异),ffprobe 偶发探测失败返回 0.0,
+    旧代码 `dur <= 0` 直接跳过压缩,坏种原样晋升、一路无人发现
+    (2026-09-26 实测:9.07s 坏种被当终选,对齐门才拦下)。
+    """
     import subprocess
-    dur = _tts_duration(path)
     if dur <= max_sec or dur <= 0:
         return path
     tempo = min(2.0, dur / max_sec)
@@ -285,20 +433,34 @@ def _promote_final(src: str, out: str, cands: list) -> str:
     return out
 
 
-def local_tts(text: str, out: str, engine: str = "") -> dict:
+def local_tts(text: str, out: str, engine: str = "", voice: str = "") -> dict:
     # Text-to-speech via the DGX. VibeVoice pacing on short lines is
     # stochastic: a take can come back far too long for the shot budget,
     # so retry with fresh seeds, then time-stretch as a last resort.
     import os
+    import time
     eng = engine or os.environ.get("SHIPIN_LOCAL_TTS_ENGINE", "vibevoice")
-    max_sec = float(os.environ.get("SHIPIN_LOCAL_TTS_MAX_SEC", "9.5"))
+    # 轮63b:单句预算按字数线性放宽。固定 2.9s 硬顶对 8-10 字合法长句
+    # 是物理不可能(实测 vibevoice 最慢 ~0.41s/字,10 字 ≈ 3.7s)——合法
+    # 长句连抽 8 次全部「超预算」后显式失败,而它们根本不是坏种。
+    # 环境值降为下限,实际上限 = 字数*0.45+0.3(观测最慢速率+ slack),
+    # 硬顶 7s;真正压不进的坏种(如 9s 级)仍会在下方显式失败。
+    _floor = float(os.environ.get("SHIPIN_LOCAL_TTS_MAX_SEC", "9.5"))
+    max_sec = min(7.0, max(_floor, len(text.strip()) * 0.45 + 0.3))
     seed = int(os.environ.get("SHIPIN_LOCAL_TTS_SEED", "42"))
+    # 轮63:种子基线按调用时刻加盐——固定基线下同一条坏句每次重跑抽
+    # 同一批坏种(seed+attempt*977 恒定),「重跑一次就好了」不成立。
+    seed += int(time.time() * 7) % 100000
     best_path, best_dur, attempts_used = "", float("inf"), 0
     cands: list = []
-    for attempt in range(6):
+    for attempt in range(8):
         attempts_used = attempt + 1
-        job = _post("/v1/audio/tts", {"engine": eng, "text": text,
-                                     "seed": seed + attempt * 977})
+        # 轮65:voice(role_code)只对 voxcpm 有意义(克隆参考选择);
+        # vibevoice 忽略该字段
+        _body = {"engine": eng, "text": text, "seed": seed + attempt * 977}
+        if voice:
+            _body["voice"] = voice
+        job = _post("/v1/audio/tts", _body)
         done = _wait_job(job["job_id"])
         if done.get("status") != "succeeded":
             raise LocalMediaError(f"local tts failed: {done.get('error')}")
@@ -313,8 +475,18 @@ def local_tts(text: str, out: str, engine: str = "") -> dict:
                     "path": out, "attempts": attempts_used}
         if dur < best_dur:
             best_path, best_dur = cand, dur
-    # 6 次都没原速命中:拿最短的那条时间压缩补齐(max_sec*2.0 内可救)
-    _atempo_fit(best_path, max_sec)
+    # 8 次都没原速命中:拿最短的那条时间压缩补齐(max 2.0x 内可救)
+    _atempo_fit(best_path, best_dur, max_sec)
+    final_dur = _tts_duration(best_path)
+    if final_dur > max_sec + 0.15:
+        # 压不进预算必须显式失败——旧代码无条件 promote 坏种并返回
+        # ok=True,超长旁白无声流入 assemble,直到对齐门才炸且报错指错
+        # 方向(2026-09-26 实测 9.07s 坏种晋升事故)。残留 .aN 副本不在此
+        # 删:下次成功 promote 时 _promote_final 统一清理,且按 mtime 排
+        # 在终选之后不会被误取。
+        raise LocalMediaError(
+            f"local tts 8 次抽样+压缩后仍超预算: 最短 {best_dur:.2f}s / "
+            f"压后 {final_dur:.2f}s > 上限 {max_sec}s——请缩短该句文案")
     _promote_final(best_path, out, cands)
     return {"ok": True, "provider": "local", "engine": eng,
             "path": out, "attempts": attempts_used, "fit": True,

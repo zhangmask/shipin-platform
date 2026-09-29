@@ -45,6 +45,24 @@ def _ffprobe_duration(path: Path) -> float:
         return 0.0
 
 
+def _ffprobe_size(path: Path) -> Optional[tuple[int, int]]:
+    """(width, height)；探测失败/文件不可读返回 None。
+
+    stitch 尺寸预检用——入镜尺寸不一致时 xfade 直接炸且报错不可读
+    （C 实证：定向重试循环变量污染使 raw 1280×720 覆盖 canvas 后，
+    assemble 炸在 "Could not open encoder before EOF"）。
+    """
+    r = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, shell=False)
+    try:
+        w, h = (int(x) for x in r.stdout.strip().split(",")[:2])
+        return (w, h)
+    except ValueError:
+        return None
+
+
 def _probe_voice_duration(path: Path) -> Optional[float]:
     """轮52(九审 P3-6):人声轨时长探测(align 专用)——坏音频(截断/
     损坏 mp3)旧代码经 _ffprobe_duration 返回 0.0 → 存在性检查与
@@ -160,7 +178,12 @@ def align_narration(shots: list[dict], min_tail: float = MIN_TAIL,
             "tts_sec": round(tts, 2),
             "dlg_sec": round(dlg, 2),
             "audio_start_sec": round(narr_at, 2),
-            "dlg_start_sec": round(audio_dlg_at, 2) if audio_dlg_at else None,
+            # audio_dlg_at 可能恰为 0.0（首镜台词从窗口起点出）——`if x`
+            # 会把 0.0 判假成 None，下游 assemble 拿不到 start 就把台词与
+            # 旁白同点齐播（A 审计实证：manifest dlg_sec=2.47 但
+            # dlg_start_sec=null）。必须 `is not None`。
+            "dlg_start_sec": (round(audio_dlg_at, 2)
+                              if audio_dlg_at is not None else None),
             "extended": bool(dlg or (tts and window > sb_dur + 0.01)),
         })
         t += window
@@ -178,6 +201,22 @@ def align_narration(shots: list[dict], min_tail: float = MIN_TAIL,
 
 
 # ── 2. 保时长 xfade 转场拼接 ──────────────────────────────────────────
+
+
+def _prepend_freeze_head(src: Path, dst: Path, dur: float) -> Path:
+    """在片段头部前冻结尾帧 dur 秒——dissolve 边界无 master 时的借位。
+
+    xfade 的重叠区要求入镜有 td 的头帧余量；本地后端没有 master 长素材，
+    用入镜自己的首帧冻结补这份余量，叠化作「叠入一瞬静止再启动」的软过渡。
+    """
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-i", str(src),
+         "-vf", f"tpad=start_mode=clone:start_duration={max(dur, 0.05):.3f}",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an", str(dst)],
+        capture_output=True, text=True, shell=False)
+    if r.returncode != 0:
+        raise RuntimeError(f"freeze-head failed: {r.stderr[-300:]}")
+    return dst
 
 
 def _fit_part(src: Path, dst: Path, dur: float) -> Path:
@@ -229,15 +268,30 @@ def build_transition_stitch(clips: list[str], windows: list[float],
                             transition_duration: float = DEFAULT_TD,
                             fps: int = 24,
                             masters: Optional[list[str]] = None,
-                            boundary_transitions: Optional[list[str]] = None) -> dict:
+                            boundary_transitions: Optional[list[str]] = None,
+                            card_last: bool = False) -> dict:
     """保时长拼接，支持逐边界转场选型（coffee-v6 教训的机制化）：
 
-    - 链式首尾帧边界（上一镜尾帧=下一镜首帧，动作直接连续）→ **硬切**：
-      动作无缝接力，叠化反而制造重影与运动停滞感；
-    - 跳变边界（换景/换机位，只能自末帧收尾）→ **dissolve** 软过渡。
-    boundary_transitions: 长度 n-1，每项 "cut" 或 xfade 名称；缺省全用 transition。
-    混合图：连续 xfade 边界分组链式（组内 offset 用实测长度迭代推进），
-    组间 concat。总长恒 == sum(windows)。
+    - "cut"：硬切（同场景动作接力）；
+    - "softcut"：3 帧软切（xfade fade 0.12s）——同场景换景别用，
+      藏掉硬边但不放慢动作；
+    - "dissolve" 等 xfade：换场景短叠化。
+
+    重叠区取材优先级（2026-09-27 用户实测「切换生硬」的修复）：
+    旧实现一律把 td 的头帧余量加在**入镜**上，本地后端无 master 时
+    冻结入镜自己的首帧——新镜头以约 10 帧静止再突然启动，每个 boundary
+    都有一次顿挫，这是「生硬」的直接来源。现在重叠区改由**出镜**尾部
+    真实素材供给（出镜裁料时多带 td，把真实收尾动作叠进下一镜）；
+    出镜本身短于窗口（TTS 拉长窗）时出镜冻结尾帧兜底——上一镜
+    「收势让位」比新镜「静止启动」观感自然。softcut 仅 3 帧，即便
+    冻结尾尾也完全不可见。
+
+    例外：末镜是 kenburns 落版卡（自带 td 头部余量，card_last=True），
+    入侧借帧维持旧行为，落版卡的完整展示时长不被吃掉。
+
+    boundary_transitions: 长度 n-1，每项 "cut"/"softcut"/xfade 名称；
+    缺省全用 transition。混合图：连续 xfade 边界分组链式（组内 offset
+    用实测长度迭代推进），组间 concat。总长恒 == sum(windows)。
     """
     n = len(clips)
     if n == 0 or len(windows) != n:
@@ -246,23 +300,95 @@ def build_transition_stitch(clips: list[str], windows: list[float],
         return {"ok": False, "error": "boundary_transitions 长度必须为 n-1"}
     bts = list(boundary_transitions) if boundary_transitions else \
         [transition] * (n - 1)
+    # softcut:3 帧软切——极短 fade 既抹掉硬切边缘,又不构成一次
+    # 可感知的「过渡表演」。
+    SOFT_TD = max(round(0.12 * fps) / fps, 1.0 / fps)
+    td = max(0.1, float(transition_duration))  # dissolve 类边界的统一 td
     for k, bt in enumerate(bts):
-        if bt != "cut" and bt not in XFADE_TRANSITIONS:
+        if bt != "cut" and bt != "softcut" and bt not in XFADE_TRANSITIONS:
             return {"ok": False, "error": f"boundary {k}: unknown transition '{bt}'"}
     warnings: list[str] = []
-    td = round(max(0.1, float(transition_duration)) * fps) / fps
+    # 逐边界真实 td 与 xfade 名
+    td_of: list[Optional[float]] = []
+    xf_of: list[Optional[str]] = []
+    for bt in bts:
+        if bt == "cut":
+            td_of.append(None)
+            xf_of.append(None)
+        elif bt == "softcut":
+            td_of.append(SOFT_TD)
+            xf_of.append("fade")
+        else:
+            td_of.append(max(0.1, float(transition_duration)))
+            xf_of.append(bt)
 
-    # 降级判定：xfade 边界的入镜必须能从 master 借出 td 头帧，否则该边界硬切
-    for k in range(n - 1):
-        if bts[k] == "cut":
+    # 降级判定（2026-09-27 修订）：重叠区改由出镜侧供给（见 docstring），
+    # 入镜不再需要头部余量——只有入镜文件本身缺失/不可读才降级硬切。
+    # 出镜侧无真实余量（clip 已被窗口吃满）时冻结尾帧兜底：上一镜
+    # 「收势让位」的观感远好于旧实现的入镜首帧冻结（新镜静止再启动）。
+    for k, td_k in enumerate(td_of):
+        if td_k is None:
             continue
-        m = Path(masters[k + 1]) if masters and k + 1 < len(masters) and masters[k + 1] else None
-        need = windows[k + 1] + td
+        if card_last and k + 1 == n - 1:
+            side, idx = "入镜(落版卡)", k + 1
+        else:
+            side, idx = "出镜", k
+        have_c = _ffprobe_duration(Path(clips[idx]))
+        m = Path(masters[idx]) if masters and idx < len(masters) and masters[idx] else None
         have_m = _ffprobe_duration(m) if m and m.exists() else 0.0
-        if have_m < need - 0.05:
-            warnings.append(f"boundary {k}: 入镜 {Path(clips[k+1]).name} 无 master "
-                            f"或不足 {need:.2f}s，该边界降级硬切")
+        if have_c <= 0 and have_m <= 0:
+            warnings.append(f"boundary {k}: {side} {Path(clips[idx]).name} "
+                            f"不可读，该边界降级硬切")
             bts[k] = "cut"
+            td_of[k] = None
+            xf_of[k] = None
+        elif have_c < windows[idx] + td_k - 0.05 and have_m <= 0:
+            warnings.append(
+                f"boundary {k}: {side} 无真实余量，冻结尾帧借位 "
+                f"{td_k:.2f}s 维持 {bts[k]}（本地后端常态）")
+
+    # 每个 part 需要比窗口多出的时长(由出镜侧或入镜侧边界分担)。
+    # 必须在降级判定之后算——被降级硬切的边界不再要求借帧。
+    extra = [0.0] * n
+    for k, td_k in enumerate(td_of):
+        if td_k is None:
+            continue
+        if card_last and k + 1 == n - 1:
+            extra[k + 1] += td_k   # 入落版卡:卡自带余量,旧行为
+        else:
+            extra[k] += td_k       # 出镜侧供给重叠区(修复默认)
+
+    # 素材可读性前置检查:任何 part 既无 clip 也无 master = fail-fast
+    # (带文件名)。旧实现只在 xfade 降级路径上顺带查入镜,入镜不可读时
+    # _fit_part 照样去 fit 不存在的文件,抛一句无信息的 "pad failed"。
+    for i, cp in enumerate(clips):
+        have_c = _ffprobe_duration(Path(cp))
+        m = Path(masters[i]) if masters and i < len(masters) and masters[i] else None
+        have_m = _ffprobe_duration(m) if m and m.exists() else 0.0
+        if have_c <= 0 and have_m <= 0:
+            return {"ok": False,
+                    "error": (f"part {i} 素材不可读: {Path(cp).name}"
+                              f"（既无 clip 也无 master）")}
+
+    # 降级判定（2026-09-27 修订）：重叠区改由出镜侧供给（见 docstring），
+    # 入镜不再需要头部余量。出镜侧无真实余量（clip 已被窗口吃满）时冻结
+    # 结尾帧兜底：上一镜「收势让位」的观感远好于旧实现的入镜首帧冻结
+    # （新镜静止再启动）。素材不可读已在前置检查 fail-fast，不再有
+    # 「降级硬切」路径。
+    for k, td_k in enumerate(td_of):
+        if td_k is None:
+            continue
+        if card_last and k + 1 == n - 1:
+            side, idx = "入镜(落版卡)", k + 1
+        else:
+            side, idx = "出镜", k
+        have_c = _ffprobe_duration(Path(clips[idx]))
+        m = Path(masters[idx]) if masters and idx < len(masters) and masters[idx] else None
+        have_m = _ffprobe_duration(m) if m and m.exists() else 0.0
+        if have_c < windows[idx] + td_k - 0.05 and have_m <= 0:
+            warnings.append(
+                f"boundary {k}: {side} 无真实余量，冻结尾帧借位 "
+                f"{td_k:.2f}s 维持 {bts[k]}（本地后端常态）")
 
     tmp = Path(tempfile.mkdtemp(prefix="stitch2_"))
     # 轮13:part 来源透明化——align 窗口 > clip 时长时从 master 裁料补足,
@@ -273,23 +399,72 @@ def build_transition_stitch(clips: list[str], windows: list[float],
     parts_meta: list[dict] = []
     try:
         parts: list[Path] = []
+        # 每个 part 的 pad 归属哪一侧:True=入侧(落版卡自带余量,冻首帧),
+        # False=出侧(真实尾帧/冻结尾帧)。出侧是修复默认。
+        head_pad = [False] * n
+        for k, td_k in enumerate(td_of):
+            if td_k is None:
+                continue
+            if card_last and k + 1 == n - 1:
+                head_pad[k + 1] = True
         for i in range(n):
             src = Path(clips[i])
-            pad = td if (i > 0 and bts[i - 1] != "cut") else 0.0
+            pad = extra[i]
             want = windows[i] + pad
             m = Path(masters[i]) if masters and i < len(masters) and masters[i] else None
             source = "clip"
             if want > _ffprobe_duration(src) + 0.05 and m and m.exists():
                 src = _trim(m, tmp / f"m{i:02d}.mp4", want)
                 source = "master"
+            elif (source == "clip" and pad > 0 and head_pad[i]
+                  and want > _ffprobe_duration(src) + 0.05):
+                # 入侧借帧仅剩落版卡一种(卡自带 td 余量,通常刚好够,不走这条);
+                # 真不够时冻结节帧补,记 freeze-head 与 master/freeze 同规格透明。
+                src = _prepend_freeze_head(src, tmp / f"h{i:02d}.mp4", pad)
+                source = "freeze-head"
+            # 出侧借帧:_fit_part 优先裁真实尾部(clip 够长即零冻结),不够才
+            # 冻结尾帧兜底——冻的是上一镜的收势,不是新镜的启动(修复核心)。
             if source == "clip" and want > _ffprobe_duration(src) + 0.05:
                 source = "freeze"
+            if source == "master":
+                # master 也可能短于 want(云端固定 5.167s < align 窗口):
+                # _fit_part 会冻结尾帧补足,这段内容从未过审——必须如实标注,
+                # 否则冻结被记成 master,B 实测 100% 隐藏(parts 帧差 mean≈0.0005)
+                if _ffprobe_duration(src) < want - 0.05:
+                    source = "master+freeze"
             parts.append(_fit_part(src, tmp / f"p{i:02d}.mp4", want))
             parts_meta.append({"idx": i, "source": source,
                                "src": str(m if source == "master"
                                           else Path(clips[i])),
                                "want_sec": round(want, 3)})
         parts_dir.mkdir(parents=True, exist_ok=True)
+        # 尺寸预检(A 审计问题 #6):xfade 要求全部入镜尺寸一致,但 clip 的
+        # 画布归一化(720x1280)是按 shot 做的——重试轮/缓存轮可能漏掉某镜
+        # (实测 drama S03_canvas 768x1344 混入 720x1280 队列,xfade 直接
+        # 炸且报错不可读)。这里统一以第一镜尺寸为基准,不符的就地归一化,
+        # 不再把尺寸问题留到 ffmpeg 里 late-fail。
+        # 2026-09-26 用户反馈「比例必须一刀切」:与 _normalize_canvas 同一
+        # 策略——increase+crop 裁剪填充,绝不用 decrease+pad 信箱(横屏进竖屏
+        # 会留 58% 黑边,同片内比例观感劈叉)。
+        ref_size = _ffprobe_size(parts[0]) if parts else None
+        if ref_size:
+            for i, p in enumerate(parts):
+                if _ffprobe_size(p) != ref_size:
+                    rw, rh = ref_size
+                    fixed = p.with_name(p.stem + "_fix.mp4")
+                    r = subprocess.run(
+                        ["ffmpeg", "-y", "-i", str(p),
+                         "-vf", f"scale={rw}:{rh}:force_original_aspect_ratio=increase,"
+                                f"crop={rw}:{rh},setsar=1",
+                         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an", str(fixed)],
+                        capture_output=True, text=True, shell=False)
+                    if r.returncode == 0:
+                        parts[i] = fixed
+                        warnings.append(
+                            f"part {i}: 入镜尺寸 {(_ffprobe_size(p) or ('?','?'))[0]}x"
+                            f"{(_ffprobe_size(p) or ('?','?'))[1]} 与基准 {rw}x{rh} "
+                            f"不符，已裁剪填充（比例一刀切，禁止信箱/拉伸）")
+                        parts_meta[i]["source"] = str(parts_meta[i].get("source")) + "+cropfill"
         for i, p in enumerate(parts):
             dst = parts_dir / f"p{i:02d}.mp4"
             shutil.copyfile(p, dst)
@@ -320,10 +495,11 @@ def build_transition_stitch(clips: list[str], windows: list[float],
             chain_len = _ffprobe_duration(parts[grp[0]])
             for j, idx in enumerate(grp[1:], start=1):
                 k = grp[j] - 1  # 入镜 idx 的入边界
-                offset = max(chain_len - td, 0.0)
+                td_k = td_of[k] if td_of[k] is not None else 0.1
+                offset = max(chain_len - td_k, 0.0)
                 label = f"x{gi}_{j}"
-                fg.append(f"[{prev}][{consumed + j}:v]xfade=transition={bts[k]}"
-                          f":duration={td:.3f}:offset={offset:.3f}[{label}]")
+                fg.append(f"[{prev}][{consumed + j}:v]xfade=transition={xf_of[k]}"
+                          f":duration={td_k:.3f}:offset={offset:.3f}[{label}]")
                 prev = label
                 chain_len = offset + _ffprobe_duration(parts[grp[j]])
             group_labels.append(f"[{prev}]")
@@ -345,6 +521,7 @@ def build_transition_stitch(clips: list[str], windows: list[float],
         out = {"ok": True, "output": str(output), "duration": round(dur, 2),
                "expected_sec": round(sum(windows), 2),
                "transitions": bts, "transition_duration": td,
+               "transitions_dur": [round(t, 3) if t else None for t in td_of],
                "parts": parts_meta,
                "boundary_preserved": abs(dur - sum(windows)) <= 0.25}
         if warnings:

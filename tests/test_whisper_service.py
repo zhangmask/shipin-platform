@@ -54,7 +54,8 @@ class TestTranscribeValidatesBeforeWork:
     def test_valid_call_writes_only_inside_output_dir(self, tmp_path, monkeypatch):
         audio = tmp_path / "voice.mp3"
         audio.write_bytes(b"not really audio")
-        ws = WhisperService()
+        # 轮73:显式 openai 后端——本测试验路径围栏,不碰 sidecar
+        ws = WhisperService(backend="openai")
 
         class FakeModel:
             def transcribe(self, *a, **k):

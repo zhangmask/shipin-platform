@@ -40,6 +40,10 @@ class NodeCreate(BaseModel):
     y: float = 0.0
     title: str | None = None
     params: dict = {}
+    # 轮71:AI 编排通道——created_by 让前端给 AI 建节点打角标;
+    # connect_to 让 AI 建 video_gen 等节点时即连上游(端口不悬空)。
+    created_by: str = ""
+    connect_to: dict | None = None
 
 
 class NodePatch(BaseModel):
@@ -64,6 +68,34 @@ def graph_list():
 def graph_create(req: GraphCreate):
     g = engine.new_graph(req.name)
     return {"id": g["id"], "name": g["name"]}
+
+
+@router.post("/from-project/{project_id}")
+def graph_from_project(project_id: str, aspect: str = "portrait"):
+    """轮68:把管线项目摊成画布——每镜一句话/景别/运动/转场全部可改。
+
+    前置:项目已有 script/storyboard(管线跑过 text 阶段)。
+    已有首帧/clip 以 reuse 参数挂载(零成本复用),用户只改一句话时
+    重跑 tts+assemble 即可,不重生视频。
+    """
+    from shipin_platform.graph.from_project import graph_from_project as _gfp
+    try:
+        data = _gfp(project_id, aspect=aspect)
+    except (FileNotFoundError, ValueError) as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    g = engine.new_graph(data["name"])
+    g.update({"nodes": data["nodes"], "edges": data["edges"]})
+    errs = engine.validate_graph(g)
+    if errs:
+        raise HTTPException(status_code=422,
+                            detail={"code": "INVALID_GRAPH",
+                                    "message": "导出图不合法",
+                                    "errors": errs[:5]})
+    engine.save_graph(g)
+    events.publish(g["id"], {"type": "changed", "op": "from-project",
+                             "project": project_id})
+    return {"id": g["id"], "name": g["name"],
+            "nodes": len(data["nodes"]), "edges": len(data["edges"])}
 
 
 @router.get("/{gid}")
@@ -140,12 +172,18 @@ def graph_run_all(gid: str, req: RunRequest):
 
 @router.post("/{gid}/nodes")
 def graph_add_node(gid: str, req: NodeCreate):
-    """新增一个节点（AI 可用它逐步搭流程）。"""
+    """新增一个节点（AI 可用它逐步搭流程）。
+
+    轮71:x/y 不传则由服务端自动排布(旧行为默认 0,0,AI 批量建节点
+    全叠左上角);created_by/connect_to 支撑 AI 编排的显示与连线。
+    """
     with engine.graph_write(gid):  # 轮55:RMW 事务锁防并发丢节点
         g = _load_or_404(gid)
         try:
             node = engine.add_node(g, req.type, req.x, req.y,
-                                   req.params, req.title)
+                                   req.params, req.title,
+                                   created_by=req.created_by,
+                                   connect_to=req.connect_to)
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e))
         except KeyError as e:

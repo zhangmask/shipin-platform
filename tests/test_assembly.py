@@ -112,7 +112,9 @@ class TestTransitionStitch:
         assert r["boundary_preserved"] is True
         assert abs(r["duration"] - sum(windows)) <= 0.2
 
-    def test_degrades_to_cut_without_masters(self, tmp_path):
+    def test_freeze_tail_not_head_without_masters(self, tmp_path):
+        """轮64:无 master 时不再降级硬切,也不冻结入镜首帧——重叠区由
+        出镜侧冻结尾帧供给(上一镜「收势让位」),边界保持叠化意图。"""
         clips = [str(_color_clip(tmp_path / f"c{i}.mp4", c, 2.0))
                  for i, c in enumerate(("red", "blue", "green"))]
         r = build_transition_stitch(clips, [2.0, 2.0, 2.0],
@@ -121,9 +123,48 @@ class TestTransitionStitch:
                                     transition_duration=0.4,
                                     masters=[None, None, None])
         assert r["ok"]
-        assert r["transitions"] == ["cut", "cut"]
+        assert r["transitions"] == ["dissolve", "dissolve"]
         assert r["boundary_preserved"] is True
-        assert r.get("warnings")
+        # 借位全部落在出镜侧:part0(边界0出镜)/part1(边界1出镜)各 +0.4,
+        # 末镜 part2 无出镜边界,零借位。
+        assert r["parts"][0]["want_sec"] == pytest.approx(2.4, abs=0.01)
+        assert r["parts"][1]["want_sec"] == pytest.approx(2.4, abs=0.01)
+        assert r["parts"][2]["want_sec"] == pytest.approx(2.0, abs=0.01)
+        # 出镜侧不足 → 冻结尾帧兜底(记 freeze,透明可审);末镜无借位,
+        # clip 刚好够 → 真实素材。
+        assert r["parts"][0]["source"] == "freeze"
+        assert r["parts"][1]["source"] == "freeze"
+        assert r["parts"][2]["source"] == "clip"
+        assert any("冻结尾帧借位" in w for w in r.get("warnings") or [])
+
+    def test_unreadable_clip_fails_fast(self, tmp_path):
+        """素材不可读=明确 fail-fast(带文件名),不是降级后 _fit_part
+        抛一句无信息的 "pad failed"(2026-09-27 修复的洞)。"""
+        good = str(_color_clip(tmp_path / "c0.mp4", "red", 2.0))
+        missing = str(tmp_path / "nope.mp4")
+        r = build_transition_stitch([good, missing], [2.0, 2.0],
+                                    str(tmp_path / "out3.mp4"),
+                                    transition="dissolve",
+                                    transition_duration=0.4,
+                                    masters=[None, None])
+        assert r["ok"] is False
+        assert "不可读" in r["error"] and "nope.mp4" in r["error"]
+
+    def test_softcut_boundary(self, tmp_path):
+        """softcut=3 帧 soft fade:同场景换景别,不构成可感知的过渡表演。"""
+        clips = [str(_color_clip(tmp_path / f"s{i}.mp4", c, 5.0))
+                 for i, c in enumerate(("red", "blue", "green"))]
+        r = build_transition_stitch(clips, [2.0, 2.0, 2.0],
+                                    str(tmp_path / "out4.mp4"),
+                                    boundary_transitions=["softcut", "dissolve"],
+                                    transition_duration=0.4)
+        assert r["ok"], r.get("error")
+        assert r["transitions"] == ["softcut", "dissolve"]
+        # softcut 3 帧≈0.125s@24fps,dissolve 0.4s;clip 5s 有余量,零冻结
+        assert r["transitions_dur"][0] <= 0.13
+        assert r["transitions_dur"][1] == 0.4
+        assert all(p["source"] == "clip" for p in r["parts"]), r["parts"]
+        assert r["boundary_preserved"] is True
 
     def test_cut_exact(self, tmp_path):
         clips = [str(_color_clip(tmp_path / f"c{i}.mp4", c, 2.0))
@@ -148,8 +189,13 @@ class TestTransitionStitch:
         assert r["ok"], r.get("error")
         parts = r["parts"]
         assert len(parts) == 2
-        assert all(p["source"] == "master" for p in parts), parts
-        assert parts[0]["src"] == masters[0] and parts[0]["want_sec"] == 3.25
+        # 轮64:转场时长由出镜侧吸收——part0 want = 3.25+0.4(出镜),
+        # part1 want = 2.0(入镜零借位,clip 刚好够,不再吃 master)。
+        assert parts[0]["source"] == "master"
+        assert parts[0]["src"] == masters[0]
+        assert parts[0]["want_sec"] == pytest.approx(3.65, abs=0.01)
+        assert parts[1]["source"] == "clip"
+        assert parts[1]["want_sec"] == pytest.approx(2.0, abs=0.01)
         for p in parts:
             assert Path(p["part_path"]).is_file()
             assert Path(p["part_path"]).parent.name == "parts"

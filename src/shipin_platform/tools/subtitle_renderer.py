@@ -476,6 +476,42 @@ def _ffprobe_size(video: _Path) -> tuple[int, int]:
     return int(w), int(h)
 
 
+def _render_cue_png(cue: dict, font: str, font_size: int, margin_v: int,
+                    w: int, h: int, out_png: _Path) -> bool:
+    """把一条 cue 用 PIL 渲成整幅 RGBA PNG(字幕在底部居中,黑描边)。
+
+    2026-09-29:节点的 ffmpeg drawtext 对中文渲染成「起⏸」(textfile 也
+    救不了),libass 又是 glyphs-absent——两条烧录路在节点上都出不了正确
+    中文。PIL 在节点上能量到字形(与 measure_text_px 同一个字体),于是用
+    PIL 出 PNG、ffmpeg overlay 合成:绕开 ffmpeg 全部文字渲染路径。度量
+    与渲染同一个字体,量到什么就画什么,不会出现豆腐块。"""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:
+        return False
+    try:
+        fnt = ImageFont.truetype(font, int(font_size))
+    except Exception:
+        return False
+    lines = [str(x) for x in (cue.get("lines") or []) if str(x).strip()]
+    if not lines:
+        return False
+    line_h = int(font_size * 1.2)
+    img = Image.new("RGBA", (int(w), int(h)), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    total_h = line_h * len(lines)
+    y0 = h - margin_v - total_h
+    for j, ln in enumerate(lines):
+        bb = d.textbbox((0, 0), ln, font=fnt, stroke_width=4)
+        tw = bb[2] - bb[0]
+        d.text(((w - tw) // 2, y0 + j * line_h), ln, font=fnt,
+               fill=(255, 255, 255, 255), stroke_width=4,
+               stroke_fill=(0, 0, 0, 255))
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_png)
+    return True
+
+
 def _build_drawtext_chain(cues, font: str, font_size: int, margin_v: int,
                           w: int, h: int, cue_dir: _Path) -> tuple[str, int]:
     """Per-line drawtext nodes using the layout verified in gen_sub_filter.py:
@@ -628,7 +664,10 @@ def render_subtitles_best(video_path, srt_path, output_path,
     font = _resolve_font_path(font_path)
     w, h = _ffprobe_size(video)
     probe = probe_libass()
-    strategy = "drawtext"
+    # 2026-09-29:PIL PNG overlay 是默认首选——drawtext 在节点上渲染中文成
+    # 豆腐块(「起⏸」),libass 在节点/本机都 glyphs-absent;PIL 与度量同字体,
+    # 量到什么画什么。libass 可用时才回到原生 subtitle 路(karaoke 才真需要)。
+    strategy = "png_overlay"
     karaoke_ass: _Path | None = None
     if mode == "karaoke":
         karaoke_ass = _build_karaoke_ass(word_anchors_path, out,
@@ -693,6 +732,48 @@ def render_subtitles_best(video_path, srt_path, output_path,
         if r.returncode != 0:
             raise RuntimeError(r.stderr[-500:])
 
+    def _run_png_overlay_pass():
+        """2026-09-29:PIL 出全幅 RGBA PNG + ffmpeg overlay(enable 窗口显隐)。
+
+        节点上 ffmpeg drawtext 渲染中文成「起⏸」、libass glyphs-absent,
+        两条原生烧录路都出不了正确中文;PIL 用同一字体量形(measure_text_px)
+        与出图,overlay 默认 eof_action=repeat 保持 PNG 末帧,enable 控制
+        窗口——不用 -loop 1(那条路会让编码 runaway)。"""
+        png_dir = out.parent / f"._cues_{out.stem}"
+        png_dir.mkdir(parents=True, exist_ok=True)
+        pngs = []
+        for i, cue in enumerate(cues, 1):
+            p = png_dir / f"cue_{i:03d}.png"
+            if not _render_cue_png(cue, font, font_size, margin_v, w, h, p):
+                raise RuntimeError(f"PIL 渲染 cue {i} 失败")
+            pngs.append(p)
+        inputs = ["-i", str(video)]
+        for p in pngs:
+            inputs += ["-i", str(p)]
+        parts = []
+        for i, p in enumerate(pngs, 1):
+            parts.append(f"[{i}:v]format=rgba[p{i}]")
+        cur = "[0:v]"
+        for i, cue in enumerate(cues, 1):
+            nxt = f"[v{i}]"
+            parts.append(
+                f"{cur}[p{i}]overlay=0:0:"
+                f"enable='between(t\\,{cue['start']:.3f}\\,{cue['end']:.3f})'"
+                f"{nxt}")
+            cur = nxt
+        parts.append(f"{cur}format=yuv420p[vout]")
+        script = out.parent / f"._subfilter_{out.stem}"
+        script.write_text(";".join(parts), encoding="utf-8")
+        r = _subprocess.run(
+            ["ffmpeg", "-y", *inputs, "-filter_complex_script", str(script),
+             "-map", "[vout]", "-map", "0:a?",
+             "-c:v", "libx264", "-crf", "20", "-preset", "veryfast",
+             "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart",
+             str(out)],
+            capture_output=True, text=True, shell=False)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr[-500:])
+
     def _measure():
         if not verify:
             return []
@@ -702,13 +783,15 @@ def render_subtitles_best(video_path, srt_path, output_path,
     # pass 1: chosen strategy
     if strategy == "subtitle":
         _run_subtitle_pass()
+    elif strategy == "png_overlay":
+        _run_png_overlay_pass()
     else:
         _run_drawtext_pass()
     stats = _measure()
     ink = sum(1 for c in stats if c.get("found"))
     # pass 2: if the strategy produced zero painted glyphs, fall back to the
     # other implementation instead of shipping a silent no-subtitle video
-    if ink == 0 and strategy == "subtitle" and mode != "subtitle":
+    if ink == 0 and strategy in ("subtitle", "png_overlay") and mode != "subtitle":
         strategy = "drawtext"
         _run_drawtext_pass()
         stats = _measure()

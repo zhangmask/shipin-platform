@@ -10,7 +10,7 @@
 //  - SSE 事件流：外部 AI 调平台 API 时节点状态实时推送
 // 后端图协议不变（{id,type,x,y,params,state} + edges{from,from_port,to,to_port,order}），
 // React Flow 仅是渲染层封装。
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   ReactFlow,
@@ -21,6 +21,7 @@ import {
   MiniMap,
   Handle,
   Position,
+  SelectionMode,
   useNodesState,
   useEdgesState,
   useReactFlow,
@@ -88,14 +89,32 @@ function toProtoGraph(rfNodes, rfEdges, base) {
 // 自定义节点 GBoxNode（保留原版头部/端口/参数/产物视觉）
 // ---------------------------------------------------------------------------
 function GBoxNode({ id, data, selected }) {
-  const { node, def, gid, live, busy, editing, cb } = data;
+  // 轮68:live/busy/editing/cb 从 NodeUICtx 取(见 context 定义处的
+  // 存量 bug 说明);data 上若显式携带则以 data 为准。
+  const ctx = useContext(NodeUICtx);
+  const { node, def, gid } = data;
+  const live = data.live || ctx.live || {};
+  const busy = data.busy !== undefined ? data.busy : ctx.busy;
+  const editing = data.editing !== undefined ? data.editing : ctx.editing;
+  const cb = data.cb || ctx.cb || {};
   const isRun = busy === node.id || live[node.id];
+  // 轮69:ComfyUI 式折叠——双击节点头部/点chevron 折叠成只剩标题栏,
+  // 33 节点大图的 declutter 利器;折叠态端口保留(连线不断)。
+  const collapsed = !!(ctx.collapsed && ctx.collapsed.has(node.id));
+  // 轮71:AI 新节点高亮(SSE node/add 后闪 2.6s)
+  const flashOn = !!(ctx.flash && ctx.flash[node.id]);
   const ins = def.inputs || [];
   const outs = def.outputs || [];
   const d = def;
 
   return (
-    <div className={"gv-node" + (selected ? " sel" : "") + (isRun ? " run" : "")}>
+    <div className={"gv-node" + (selected ? " sel" : "") + (isRun ? " run" : "")
+                    + (collapsed ? " collapsed" : "") + (flashOn ? " flash" : "")}
+         data-nodeid={node.id}>
+      {/* 轮71:AI 生成节点角标——用户一眼区分「AI 自动搭的」与「手改的」 */}
+      {node.created_by === "ai" && (
+        <span className="gv-ai-badge" title="该节点由 AI/管线自动生成">✨AI</span>
+      )}
       {/* 输入端口（左缘） */}
       {ins.map((p, pi) => (
         <Handle key={`in_${p.name}`} type="target" position={Position.Left}
@@ -119,7 +138,12 @@ function GBoxNode({ id, data, selected }) {
         </Handle>
       ))}
 
-      <div className="gv-node-head" style={{ background: d.color }}>
+      <div className="gv-node-head" style={{ background: d.color }}
+           onDoubleClick={(e) => { e.stopPropagation(); cb.toggleCollapse && cb.toggleCollapse(node.id); }}
+           title="双击标题栏折叠/展开（ComfyUI 同款）">
+        <span className="gv-fold"
+              onClick={(e) => { e.stopPropagation(); cb.toggleCollapse && cb.toggleCollapse(node.id); }}
+              title="折叠/展开">{collapsed ? "▸" : "▾"}</span>
         {editing === node.id ? (
           <input className="gv-title-edit" defaultValue={node.title || d.label}
                  autoFocus onFocus={(e) => e.target.select()}
@@ -145,19 +169,84 @@ function GBoxNode({ id, data, selected }) {
         </span>
       </div>
 
-<div className="gv-params">
-        {(d.params || []).map((p) => (
-          <ParamRow key={p.key} p={p}
-                    value={node.params?.[p.key]}
-                    onChange={(v) => cb.param(node.id, p.key, v)} />
-        ))}
-      </div>
-      <NodeOut node={node} gid={g} def={def} />
+      {!collapsed && (
+        <>
+          <div className="gv-params">
+            {(d.params || []).map((p) => (
+              <ParamRow key={p.key} p={p}
+                        value={node.params?.[p.key]}
+                        onChange={(v) => cb.param(node.id, p.key, v)} />
+            ))}
+          </div>
+          <NodeOut node={node} gid={gid} def={def} />
+        </>
+      )}
     </div>
   );
 }
 
 const nodeTypes = { gbox: GBoxNode };
+
+// 轮72:镜头聚合卡(ComfyUI Group 同款 declutter)——5 镜各聚成一张卡,
+// 画布只剩 N 张卡不再互相遮挡;点卡展开该组,卡上三个层按钮(关键帧/
+// 视频/音频)下钻到具体层。纯视图层:不改 nodes/edges 后端数据。
+const SHOT_RE = /^(S\d+[a-z]?)/i;
+
+function GGroupNode({ id, data, selected }) {
+  const ctx = useContext(NodeUICtx);
+  const g = data.group || {};
+  const open = !!data.open;
+  const focus = data.focus || null;
+  const layers = g.layers || {};
+  const nState = g.states || {};
+  const anyRun = Object.values(nState).some((s) => s === "run");
+  return (
+    <div className={"gv-group" + (selected ? " sel" : "") + (anyRun ? " run" : "")}
+         data-nodeid={id}
+         onClick={() => ctx.cb.toggleGroup && ctx.cb.toggleGroup(g.id)}
+         title="点击展开/收起该镜头">
+      {g.createdBy === "ai" && <span className="gv-ai-badge">✨AI</span>}
+      <div className="gv-group-head" style={{ background: g.color || "#3b82f6" }}>
+        <span className="gv-group-fold"
+              onClick={(e) => { e.stopPropagation(); ctx.cb.toggleGroup && ctx.cb.toggleGroup(g.id); }}>
+          {open ? "▾" : "▸"}
+        </span>
+        <b>{g.title || g.id}</b>
+        <span className="gv-group-count">{g.count || 0} 节点</span>
+      </div>
+      <div className="gv-group-body">
+        {g.thumb && <img className="gv-group-thumb" src={g.thumb} alt="首帧" />}
+        <div className="gv-group-layers">
+          {[
+            ["image", "🖼 关键帧", layers.image],
+            ["video", "🎬 视频", layers.video],
+            ["audio", "🔊 音频", layers.audio],
+          ].map(([key, label, n]) => (
+            <button key={key}
+                    className={"gv-layer-btn" + (focus === key ? " on" : "")}
+                    disabled={!n}
+                    title={n ? `只看${label}层（${n} 个节点）` : "该层无节点"}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      ctx.cb.focusLayer && ctx.cb.focusLayer(g.id, key);
+                    }}>
+              {label}{n ? `×${n}` : ""}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+nodeTypes.ggroup = GGroupNode;
+
+// 轮68:节点 UI 上下文——live/busy/editing/cb 由 Board 提供。
+// 旧实现里这些从未进入 toRfNode 的 data(存量 bug:任何图渲染出节点即
+// TypeError 白屏,节点按钮/改参/重命名也全是死交互)。Context 单一
+// 数据源,toRfNode 保持 {node,def} 不变。
+const NodeUICtx = createContext({ live: {}, busy: null, editing: null, cb: {},
+                                  collapsed: new Set(), flash: {},
+                                  openGroups: new Set(), layerFocus: {} });
 
 // ---------------------------------------------------------------------------
 // 画布主体
@@ -176,13 +265,25 @@ function Board() {
   const [palQ, setPalQ] = useState("");
   const [palIdx, setPalIdx] = useState(0);
   const [editing, setEditing] = useState(null); // 正在重命名的节点 id
+  const [collapsed, setCollapsed] = useState(() => new Set()); // 轮69:折叠节点集(ComfyUI 同款)
   const [clip, setClip] = useState(null);       // 复制剪贴板 {nodes, edges}
+  const [saved, setSaved] = useState(false);    // 轮70:Ctrl+S 保存反馈
+  const [libsOpen, setLibsOpen] = useState(false); // 轮70:小屏组件库抽屉
+  const [flash, setFlash] = useState({});       // 轮71:AI 新节点高亮 {node_id: true}
+  // 轮72:镜头聚合视图——grouped=按镜头聚合成卡;openGroups=已展开的组;
+  // layerFocus={gid: 'image'|'video'|'audio'}=组内层下钻(只看该层)
+  const [viewMode, setViewMode] = useState("grouped");
+  const [openGroups, setOpenGroups] = useState(() => new Set());
+  const [layerFocus, setLayerFocus] = useState({});
+  const importRef = useRef(null);               // 轮70:导入 JSON 的隐藏 file input
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+  useEffect(() => { nodesRef.current = nodes; }, [nodes]);
   const { screenToFlowPosition, fitView } = useReactFlow();
   const saveTimer = useRef(null);
   const reloadTimer = useRef(null);
   const palInput = useRef(null);
+  const nodesRef = useRef([]);   // 轮72:rebuild 同步读当前选中态(不走 updater)
   const histRef = useRef([]);   // undo 栈（{nodes, edges} 快照）
   const histIdx = useRef(-1);
   const selRef = useRef(null);  // 最近一次单选节点 id（供 R 重命名）
@@ -224,24 +325,107 @@ function Board() {
     }, 300);
   }, []);
 
+  // 轮70:立即保存(Ctrl+S / ComfyUI Save Workflow 同款语义)——绕过防抖,
+  // 写盘完成再反馈,失败必须上屏。
+  const flashSaved = useCallback(() => {
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1600);
+  }, []);
+  const saveNow = useCallback(async () => {
+    if (!cur) return;
+    clearTimeout(saveTimer.current);
+    try {
+      const r = await api(`/api/graphs/${cur.id}`, {
+        method: "PUT",
+        body: JSON.stringify({ name: cur.name, nodes: cur.nodes, edges: cur.edges }),
+      });
+      if (r && r.errors && r.errors.length) setErr(`保存失败：${r.errors.join("; ")}`);
+      else { setErr(null); flashSaved(); }
+    } catch (e) { setErr(`保存失败：${e.message}`); }
+  }, [cur]);
+
   // 从后端图重建 RF 状态（图切换 / SSE 重载；保留选择态）
+  // 轮72:grouped 模式下,同镜头节点聚合成一张卡;openGroups 内的组展开
+  // 为真实节点;layerFocus 非空的组只显示该层节点。
+  // 注意(轮72 自修):nodes 必须同步算好再 setNodes——此前在 setNodes
+  // 的 updater 里填 visible 集合给 setEdges 用,React 18 的 updater 是
+  // 渲染期执行,edges 过滤会读到空集、聚合态的组内连线全丢。
   const rebuild = useCallback((g) => {
     if (!g) { setNodes([]); setEdges([]); return; }
-    setNodes((prev) => {
-      const keep = new Map(prev.map((n) => [n.id, n]));
-      return g.nodes
-        .filter((n) => defs && defs[n.type])
-        .map((n) => {
-          const old = keep.get(n.id);
-          return { ...toRfNode(n, defs[n.type]),
-                   selected: !!(old && old.selected) };
+    const grouped = viewMode === "grouped";
+    const keep = new Set((nodesRef.current || [])
+      .filter((n) => n.selected).map((n) => n.id));
+    const real = (g.nodes || [])
+      .filter((n) => defs && defs[n.type])
+      .map((n) => ({ ...toRfNode(n, defs[n.type]), selected: keep.has(n.id) }));
+    let nextNodes = real;
+    const visible = new Set(real.map((r) => r.id));
+    if (grouped) {
+      // 聚合:按 title/id 里的镜头号分组(无机头号的归入 MISC)
+      const groups = {};
+      for (const rn of real) {
+        const t = String((rn.data.node.title) || rn.id || "");
+        const m = t.match(SHOT_RE);
+        const gid = m ? m[1].toUpperCase() : "MISC";
+        (groups[gid] = groups[gid] || []).push(rn);
+      }
+      const out = [];
+      visible.clear();
+      for (const gid of Object.keys(groups).sort()) {
+        const members = groups[gid];
+        const open = openGroups.has(gid);
+        const layers = { image: 0, video: 0, audio: 0 };
+        for (const m of members) {
+          const t = m.data.def.key;
+          if (t === "image_gen") layers.image++;
+          else if (t === "video_gen" || t === "dub") layers.video++;
+          else if (t === "tts") layers.audio++;
+        }
+        const states = {};
+        for (const m of members) if (live[m.id]) states[m.id] = "run";
+        const imgNode = members.find((m) => m.data.def.key === "image_gen");
+        const thumb = imgNode
+          ? ((imgNode.data.node.state || {}).outputs || {}).image
+          : null;
+        const focus = layerFocus[gid] || null;
+        out.push({
+          id: "grp_" + gid, type: "ggroup", position: members[0].position,
+          data: { group: { id: gid, title: members[0].data.node.title
+                             ? gid + " " + String(members[0].data.node.title)
+                                        .replace(SHOT_RE, "").trim()
+                             : gid,
+                           count: members.length, color: members[0].data.def.color,
+                           layers, states, thumb: thumb && thumb.value ? thumb.value : null,
+                           createdBy: members[0].data.node.created_by },
+                   open, focus },
         });
-    });
-    setEdges(g.edges.map(toRfEdge));
-  }, [defs, setNodes, setEdges]);
+        if (open) {
+          for (const m of members) {
+            if (focus && ((focus === "image" && m.data.def.key !== "image_gen")
+                          || (focus === "video" && m.data.def.key !== "video_gen"
+                              && m.data.def.key !== "dub"
+                              && m.data.def.key !== "qc")
+                          || (focus === "audio" && m.data.def.key !== "tts"
+                              && m.data.def.key !== "text"))) continue;
+            visible.add(m.id);
+            out.push(m);
+          }
+        }
+      }
+      nextNodes = out;
+    }
+    setNodes(nextNodes);
+    // 聚合态只画「可见节点之间」的边——展开的组内连线保留,
+    // 跨组边收起(ComfyUI 折叠组同样不显示跨组连线)
+    setEdges((g.edges || []).map(toRfEdge)
+      .filter((e) => grouped ? (visible.has(e.source) && visible.has(e.target)) : true));
+  }, [defs, setNodes, setEdges, viewMode, openGroups, layerFocus, live]);
   // 仅图 id 变化时重建（拖动位置同步不触发，避免拖拽抖动）
   useEffect(() => { rebuild(cur); }, [cur && cur.id]);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  // 轮72:视图模式/展开/层聚焦变化也要重算(纯视图变换)
+  useEffect(() => { if (cur) rebuild(cur); },
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      [viewMode, openGroups, layerFocus, live]);
 
   // ---- 变更核心：改 cur（真值）+ 防抖保存 + 记录历史 ----
   /** 注意：节点的 params/title/state 存储在 cur；坐标/连线以 RF 为准，
@@ -311,7 +495,21 @@ function Board() {
         if (ev.node_id) setLive((p) => ({ ...p, [ev.node_id]: true }));
         return;
       }
-      if (ev.type === "node" && ev.op) setTimeout(() => { if (cur) loadGraph(cur.id); }, 200);
+      if (ev.type === "node" && ev.op) {
+        // 轮71:AI 经 API 建/改节点——不再整体 reload 刷新了事:
+        // reload 后新节点高亮闪现 + 视图居中到它,用户立刻看见 AI 干了什么
+        if (cur) loadGraph(cur.id);
+        if (ev.op === "add" && ev.node && ev.node.id) {
+          const nid = ev.node.id;
+          setFlash((p) => ({ ...p, [nid]: true }));
+          setTimeout(() => setFlash((p) => { const q = { ...p }; delete q[nid]; return q; }), 2600);
+          setTimeout(() => {
+            try {
+              fitView({ nodes: [{ id: nid }], duration: 400, padding: 0.6, maxZoom: 1.2 });
+            } catch (_) { /* 节点尚未进 RF 状态时忽略,高亮已足够 */ }
+          }, 350);
+        }
+      }
       if (ev.type === "changed") setTimeout(() => { if (cur) loadGraph(cur.id); }, 200);
     };
     return () => es.close();
@@ -335,6 +533,7 @@ function Board() {
         return;
       }
       if (mod && k === "y") { e.preventDefault(); redo(); return; }
+      if (mod && k === "s") { e.preventDefault(); saveNow(); return; }
       if (mod && k === "a") {
         if (cur) {
           e.preventDefault();
@@ -598,7 +797,27 @@ function Board() {
   const closeMenu = () => setMenu(null);
   const nodeMenu = (e) => { e.preventDefault(); setMenu({ x: e.clientX, y: e.clientY, nodeId: e.node ? e.node.id : null }); };
   const edgeMenu = (e) => { e.preventDefault(); setMenu({ x: e.clientX, y: e.clientY, edgeId: e.edge ? e.edge.id : null }); };
-  const paneMenu = (e) => { e.preventDefault(); setMenu({ x: e.clientX, y: e.clientY }); };
+  const paneMenu = (e) => {
+    e.preventDefault();
+    // 轮69:ComfyUI 式——右键空白 = 在此处搜索加节点
+    setMenu(null);
+    setPalQ(""); setPalIdx(0);
+    setPalette({ x: e.clientX, y: e.clientY });
+  };
+
+  // ---- 触屏长按 = 右键菜单(移动端无右键;ComfyUI 跨平台同款思路) ----
+  const touchTimer = useRef(null);
+  const onNodeTouchStart = (e, node) => {
+    if (!(e.touches && e.touches.length)) return;
+    const cx = e.touches[0].clientX, cy = e.touches[0].clientY;
+    touchTimer.current = setTimeout(() => {
+      setMenu({ x: cx, y: cy, nodeId: node.id });
+    }, 480);
+  };
+  const onNodeTouchMove = () => {
+    if (touchTimer.current) { clearTimeout(touchTimer.current); touchTimer.current = null; }
+  };
+  const onNodeTouchEnd = onNodeTouchMove;
 
   // ---- 搜索面板 ----
   const palList = defs ? Object.keys(defs).filter((k) => {
@@ -624,6 +843,40 @@ function Board() {
   };
 
   // ---- 新建/删除图 ----
+  // 轮70:工作流导入/导出(ComfyUI Save/Load Workflow 同款;浏览器原生
+  // 文件选择器=跨平台,手机/平板/桌面一致)
+  const exportGraph = () => {
+    if (!cur) return;
+    const blob = new Blob([JSON.stringify({
+      name: cur.name, nodes: cur.nodes, edges: cur.edges,
+    }, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${(cur.name || "workflow").replace(/[^\w\u4e00-\u9fa5-]+/g, "_")}.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  };
+  const importGraph = (e) => {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!f || !cur) return;
+    const rd = new FileReader();
+    rd.onload = async () => {
+      try {
+        const g = JSON.parse(String(rd.result));
+        const nodes = g.nodes || [], edges = g.edges || [];
+        if (!Array.isArray(nodes)) throw new Error("nodes 不是数组");
+        await api(`/api/graphs/${cur.id}`, {
+          method: "PUT",
+          body: JSON.stringify({ name: g.name || cur.name, nodes, edges }),
+        });
+        await loadGraph(cur.id);
+        flashSaved();
+      } catch (err) { setErr(`导入失败：${err.message}`); }
+    };
+    rd.readAsText(f);
+  };
+
   const newGraph = async () => {
     const name = prompt("画布名称", `画布 ${graphs.length + 1}`);
     if (!name) return;
@@ -639,13 +892,56 @@ function Board() {
   };
 
   // GBoxNode 高频 callback（组件级共享，避免每节点重建）
+  const toggleCollapse = useCallback((nid) => {
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(nid)) next.delete(nid); else next.add(nid);
+      return next;
+    });
+  }, []);
+  // 轮72:聚合卡展开/收起 + 层下钻(聚合态才用到)
+  const toggleGroup = useCallback((gid) => {
+    setOpenGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(gid)) { next.delete(gid); }
+      else { next.add(gid); setLayerFocus((lf) => { const q = { ...lf }; delete q[gid]; return q; }); }
+      return next;
+    });
+  }, []);
+  const focusLayer = useCallback((gid, layer) => {
+    setOpenGroups((prev) => (prev.has(gid) ? prev : new Set(prev).add(gid)));
+    setLayerFocus((prev) => {
+      const q = { ...prev };
+      if (q[gid] === layer) delete q[gid]; else q[gid] = layer;
+      return q;
+    });
+  }, []);
+  const cloneNode = useCallback((nid) => {
+    if (!cur) return;
+    mutate((g) => {
+      const src = g.nodes.find((n) => n.id === nid);
+      if (!src) return;
+      const used = new Set(g.nodes.map((n) => n.id));
+      let i = 1;
+      while (used.has(`n{i}`)) i++;
+      const nid2 = `n${i}`;
+      g.nodes.push({ ...JSON.parse(JSON.stringify(src)), id: nid2,
+                     x: (src.x || 0) + 60, y: (src.y || 0) + 90,
+                     title: (src.title || "") + " 副本" });
+    });
+  }, [cur, mutate]);
   const cb = useMemo(() => ({
     run: runNode, remove: removeNode, rename: renameNode,
     commitRename, cancelRename, param: updateParam,
-  }), [runNode, removeNode, renameNode, updateParam, commitRename, cancelRename]);
+    toggleCollapse, clone: cloneNode,
+    toggleGroup, focusLayer,
+  }), [runNode, removeNode, renameNode, updateParam, commitRename,
+      cancelRename, toggleCollapse, cloneNode, toggleGroup, focusLayer]);
 
   // ---- 渲染 ----
   return (
+    <NodeUICtx.Provider value={{ live, busy, editing, cb, collapsed, flash,
+                                 openGroups, layerFocus }}>
     <div className="gv-root" onMouseDown={menu ? closeMenu : undefined}>
       <div className="gv-topbar">
         <b>节点画布</b>
@@ -654,11 +950,33 @@ function Board() {
           <option value="">选择画布…</option>
           {graphs.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
         </select>
+        <span className="gv-sep" />
         <button onClick={newGraph}>＋ 新建画布</button>
         <button onClick={deleteGraph} disabled={!cur}>删除画布</button>
+        <span className="gv-sep" />
+        <button onClick={exportGraph} disabled={!cur} title="下载工作流 JSON（换电脑/换设备可再导入）">⭳ 导出</button>
+        <button onClick={() => importRef.current && importRef.current.click()}
+                disabled={!cur} title="从 JSON 文件导入工作流">⭱ 导入</button>
+        <input ref={importRef} type="file" accept="application/json,.json"
+               style={{ display: "none" }} onChange={importGraph} />
+        <button onClick={saveNow} disabled={!cur}
+                title="立即保存到服务端（Ctrl+S）">{saved ? "✓ 已保存" : "💾 保存"}</button>
+        <span className="gv-sep" />
         <button onClick={() => setPalette({ x: 420, y: 120 })} disabled={!cur}>⊕ 添加节点</button>
+        <button className="gv-libs-toggle" onClick={() => setLibsOpen((v) => !v)}
+                title="组件库（小屏抽屉）">☰ 组件库</button>
+        <button onClick={() => {
+          const next = viewMode === "grouped" ? "flat" : "grouped";
+          setViewMode(next);
+          if (next === "grouped") { setOpenGroups(new Set()); setLayerFocus({}); }
+          setTimeout(() => fitView({ padding: 0.12, duration: 250 }), 120);
+        }} disabled={!cur}
+                title="按镜头聚合成卡片（默认）／展开全部节点">
+          {viewMode === "grouped" ? "⊞ 聚合视图" : "⬚ 平铺视图"}
+        </button>
         <button onClick={() => nav("/ref")} title="从 B站/抖音/YouTube 找参考视频，反推剧本分镜提示词，一键灌入画布"
                 style={{ background: "#3f5bdb" }}>🎬 参考复刻</button>
+        <span className="gv-sep" />
         <button onClick={runAll} disabled={!cur || !!busy}
                 title="拓扑序运行全部节点（审核/质检门照常生效）">▶ 运行全部</button>
         <button onClick={() => fitView({ padding: 0.15, duration: 200 })} disabled={!cur}
@@ -666,13 +984,13 @@ function Board() {
         <button onClick={undo} disabled={histIdx.current <= 0}>↶ 撤销</button>
         <button onClick={redo} disabled={histIdx.current >= histRef.current.length - 1}>↷ 重做</button>
         <span className="gv-tip">
-          拖组件库入画布 · 拖空白平移 · Ctrl+拖框选 · F 适配 · Ctrl+Z/Y 撤销 · Ctrl+A 全选 · Delete 删除 · R 改名
+          默认按镜头聚合成卡 · 点卡展开 · 卡上按钮下钻关键帧/视频/音频层 · 左键拖空白框选 · Shift 加选 · 中键平移 · 滚轮缩放 · 右键空白加节点 · 双击标题栏折叠 · Ctrl+S 保存 · Ctrl+C/V 复制粘贴 · Ctrl+Z/Y 撤销 · F 适配 · Delete 删除 · R 改名
         </span>
         {err && <span className="gv-err">{err}</span>}
       </div>
 
       <div className="gv-main">
-        <aside className="gv-libs">
+        <aside className={"gv-libs" + (libsOpen ? " open" : "")}>
           <div className="gv-libs-title">组件库（拖到画布）</div>
           {defs && Object.keys(defs).map((k) => {
             const d = defs[k];
@@ -705,24 +1023,30 @@ function Board() {
             onNodeContextMenu={nodeMenu}
             onEdgeContextMenu={edgeMenu}
             onPaneContextMenu={paneMenu}
+            onNodeTouchStart={onNodeTouchStart}
+            onNodeTouchMove={onNodeTouchMove}
+            onNodeTouchEnd={onNodeTouchEnd}
+            onPaneClick={() => { if (libsOpen) setLibsOpen(false); }}
             onDrop={onDrop}
             onDragOver={onDragOver}
             onPaneDoubleClick={openPaletteAt}
             nodeTypes={nodeTypes}
             deleteKeyCode={null}
             selectionKeyCode={["ShiftLeft", "ShiftRight"]}
-            multiSelectionKeyCode={["ControlLeft", "ControlRight"]}
-            selectionOnDrag={false}
-            panOnDrag={[0, 1]}
+            multiSelectionKeyCode={["ShiftLeft", "ShiftRight"]}
+            selectionOnDrag
+            panOnDrag={[1]}
             panOnScroll={false}
             zoomOnScroll
+            zoomOnPinch
+            selectionMode={SelectionMode.Partial}
             minZoom={0.1}
             maxZoom={3}
             fitView
             fitViewOptions={{ padding: 0.2 }}
             defaultEdgeOptions={{
               type: "smoothstep",
-              style: { stroke: "#5b6b9e", strokeWidth: 2.5 },
+              style: { stroke: "#8a8a8a", strokeWidth: 2 },
             }}
             proOptions={{ hideAttribution: true }}
           >
@@ -784,6 +1108,9 @@ function Board() {
                   </div>
                   <button onClick={() => { runNode(menu.nodeId); closeMenu(); }}>▶ 运行（先跑上游）</button>
                   <button onClick={() => { renameNode(menu.nodeId); closeMenu(); }}>✎ 重命名（R）</button>
+                  <button onClick={() => { toggleCollapse(menu.nodeId); closeMenu(); }}>
+                    {collapsed.has(menu.nodeId) ? "▸ 展开节点" : "▾ 折叠节点"}
+                  </button>
                   <button onClick={() => {
                     const id = menu.nodeId;
                     const copy = cur.nodes.find((n) => n.id === id);
@@ -829,6 +1156,7 @@ function Board() {
         </div>
       </div>
     </div>
+    </NodeUICtx.Provider>
   );
 }
 

@@ -18,6 +18,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -407,6 +409,14 @@ def _exec_image_gen(graph: dict, node: dict, nodemap: dict[str, dict]) -> dict:
     from shipin_platform.generation.generate_assets import (
         generate_image_agnes, generate_image_pil)
     p = node.get("params") or {}
+    # 轮68:reuse_image——管线项目导出的画布挂载已有首帧,零成本复用
+    # (校验在 prompt 之前:复用节点可能没有上游连线提供的 prompt)
+    reuse = str(p.get("reuse_image") or "")
+    if reuse and Path(reuse).is_file():
+        out = str(_artifact_path(graph["id"], node["id"], "png"))
+        shutil.copyfile(reuse, out)
+        return {"kind": "image", "value": out,
+                "meta": {"reused": reuse, "model": "reuse"}}
     prompt = resolved_input(graph, node, "prompt", nodemap)
     if not prompt:
         raise ValueError("image_gen 需要提示词")
@@ -435,23 +445,70 @@ def _exec_video_gen(graph: dict, node: dict, nodemap: dict[str, dict]) -> dict:
         raise ValueError("video_gen 需要首帧连线（image_gen 输出即可）")
     if not prompt:
         raise ValueError("video_gen 需要提示词")
-    model = str(p.get("model", "agnes-video-2.5-flash"))
+    # 轮68:景别抬头 + 运动子句(画布上手选=实时改分镜景别/运镜)
+    _SIZE = {"ecu": "extreme close-up", "cu": "close-up",
+             "mcu": "medium close-up", "ms": "medium shot",
+             "ls": "long shot"}
+    motion = str(p.get("motion") or "").strip()
+    full_prompt = (f"{_SIZE.get(str(p.get('shot_size') or ''), 'medium close-up')}. "
+                   + (motion + " " if motion else "")
+                   + str(prompt)).strip()
+    engine = str(p.get("engine") or "agnes-cloud")
     dur = max(1, int(p.get("duration", 5) or 5))
     out = str(_artifact_path(graph["id"], node["id"], "mp4"))
-    r = generate_video_agnes(
-        prompt=prompt, model=model, duration=dur,
-        first_frame=str(first),
-        last_frame=str(last) if last else None,
-        output_path=out, work_dir=str(_gdir(graph["id"]) / "artifacts"))
-    if not r.get("ok"):
-        raise RuntimeError(f"video_gen 失败: {r.get('error', r)}")
+    # 轮68:reuse_clip——管线项目已有验收 clip 时零成本复用(用户只改
+    # 一句话/转场时不必重生视频);cleared 后该参数仍在,重跑即重生。
+    reuse_clip = str(p.get("reuse_clip") or "")
+    if reuse_clip and Path(reuse_clip).is_file() \
+            and not str(p.get("force_regen") or "").lower() in ("1", "true"):
+        shutil.copyfile(reuse_clip, out)
+        _record_graph_cost(graph, "video", model="reuse", units=0.0,
+                           note=node["id"])
+        return {"kind": "video", "value": out,
+                "meta": {"model": "reuse", "anchored": True,
+                         "warnings": [], "reused": reuse_clip,
+                         "transition": str(p.get("transition") or "softcut"),
+                         "transition_duration": float(
+                             p.get("transition_duration", 0.4) or 0.4)}}
+    if engine in ("h3", "wan22", "wan21-flf2v"):
+        # 本地引擎(DGX):H3 快;FLF2V 首尾帧锚定——与管线同底座,
+        # 画布上换引擎即换生成质量策略(轮67 AB 定档)
+        from shipin_platform.generation.local_media import local_video
+        aspect = str(p.get("aspect") or "portrait")
+        w, h = (720, 1280) if aspect == "portrait" else (1280, 720)
+        # 轮68:32 倍数吸附——H3 拒收非 32 倍数(720x1280 直接 400,
+        # 管线车道靠 _gen_dims_for_canvas 吸附官方预设,画布车道同样要)。
+        # 上取整到 32(720→736);混合尺寸由 assemble 尺寸预检裁剪填充
+        # 归一到首镜尺寸,「比例一刀切」不受影响。
+        w = int((w + 31) // 32 * 32)
+        h = int((h + 31) // 32 * 32)
+        r = local_video(prompt=full_prompt, out=out,
+                        first_frame=str(first),
+                        last_frame=str(last) if last else "",
+                        duration=dur, engine=engine, width=w, height=h)
+        if not r.get("ok"):
+            raise RuntimeError(f"本地 video_gen 失败({engine}): {r.get('error', r)}")
+        model = engine
+    else:
+        model = str(p.get("model", "agnes-video-2.5-flash"))
+        r = generate_video_agnes(
+            prompt=full_prompt, model=model, duration=dur,
+            first_frame=str(first),
+            last_frame=str(last) if last else None,
+            output_path=out, work_dir=str(_gdir(graph["id"]) / "artifacts"))
+        if not r.get("ok"):
+            raise RuntimeError(f"video_gen 失败: {r.get('error', r)}")
     # 轮50(九审 P1-4):视频按秒入账(与 costing 的 video 计价单位一致)
     _record_graph_cost(graph, "video", model=model, units=float(dur),
                        note=node["id"])
     return {"kind": "video", "value": out,
             "meta": {"model": r.get("model"),
                      "anchored": bool(r.get("anchored")),
-                     "warnings": r.get("warnings", [])}}
+                     "warnings": r.get("warnings", []),
+                     # 轮68:转场参数随节点落账,assemble 据此逐边界选型
+                     "transition": str(p.get("transition") or "softcut"),
+                     "transition_duration": float(
+                         p.get("transition_duration", 0.4) or 0.4)}}
 
 
 def _exec_tts(graph: dict, node: dict, nodemap: dict[str, dict]) -> dict:
@@ -481,6 +538,19 @@ def _exec_tts(graph: dict, node: dict, nodemap: dict[str, dict]) -> dict:
     err = str(getattr(res, "error", "") or "")
     if err or not out or not Path(out).is_file():
         raise RuntimeError(f"tts 合成失败: {err or '无输出文件'}")
+    # 轮68:语速倍率(画布手滑)——VoxCPM 原生节奏偏快(实测~6字/s),
+    # speed<1 用 atempo 后处理压档,>1 加速;1.0 原样。
+    speed = float(p.get("speed", 1.0) or 1.0)
+    if abs(speed - 1.0) > 0.01:
+        from shipin_platform.generation import local_media as _lm
+        fixed = str(Path(out).with_suffix("")) + f"_sp{speed}.mp3"
+        r2 = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", out,
+             "-filter:a", f"atempo={speed:.3f}",
+             "-c:a", "libmp3lame", fixed],
+            capture_output=True, text=True)
+        if r2.returncode == 0 and Path(fixed).is_file():
+            out = fixed
     _record_graph_cost(graph, "tts", model="tts-v1", units=1.0,
                        note=node["id"])
     return {"kind": "audio", "value": out}
@@ -518,37 +588,92 @@ def _exec_assemble(graph: dict, node: dict, nodemap: dict[str, dict]) -> dict:
     from shipin_platform.assembly import build_transition_stitch
     p = node.get("params") or {}
     clips: list[tuple[int, Path]] = []
+    clip_srcs: list[dict] = []   # 轮68:每镜的源节点(取其转场参数)
+    audios: list[tuple[int, Path]] = []  # 轮68:配音轨(一句话的载体)
     for e in graph.get("edges", []):
         src = nodemap.get(e.get("from"))
-        if e.get("to") == node["id"] and e.get("to_port") == "clips" and src:
-            v = ((src.get("state") or {}).get("outputs") or {}) \
-                .get(e.get("from_port"), {}).get("value")
-            if v:
-                clips.append((int(e.get("order", len(clips))),
-                              _owned_artifact(graph["id"], v)))
+        if e.get("to") != node["id"] or not src:
+            continue
+        outs = ((src.get("state") or {}).get("outputs") or {})
+        v = outs.get(e.get("from_port"), {}).get("value")
+        if not v:
+            continue
+        if e.get("to_port") == "clips":
+            clips.append((int(e.get("order", len(clips))),
+                          _owned_artifact(graph["id"], v)))
+            clip_srcs.append(src)
+        elif e.get("to_port") == "audio":
+            audios.append((int(e.get("order", len(audios))),
+                           _owned_artifact(graph["id"], v)))
     if not clips:
         raise ValueError("assemble 至少需要连入一个镜头视频")
-    clips.sort(key=lambda x: x[0])
+    order = sorted(range(len(clips)), key=lambda i: clips[i][0])
+    clips = [clips[i] for i in order]
+    clip_srcs = [clip_srcs[i] for i in order]
+    audios = [a for _, a in sorted(audios, key=lambda x: x[0])]
     n = len(clips)
     paths = [str(c) for _, c in clips]
     windows = []
     for _, pth in clips:
         from shipin_platform.assembly import _ffprobe_duration  # noqa: PLC0415
         windows.append(round(_ffprobe_duration(pth), 2))
+    # 轮68:逐边界转场——入镜节点的 transition 参数(画布上手选)优先,
+    # 缺失回退 assemble.default_transition,再兜底硬切。
+    default_bt = str(p.get("default_transition") or "cut")
+    # 轮68:边界数 = 镜头数-1(第 i 个入镜的转场),勿按镜头全长收集
+    bts = []
+    for src in clip_srcs[1:]:
+        sp = (src.get("params") or {})
+        st = ((src.get("state") or {}).get("outputs") or {}) \
+            .get("video", {}).get("meta") or {}
+        bt = str(sp.get("transition") or st.get("transition")
+                 or default_bt)
+        bts.append(bt if bt == "cut" else bt)
+    td = float(p.get("transition_duration", 0.4) or 0.4)
     fps = int(p.get("fps", 24) or 24)
     out = str(_artifact_path(graph["id"], node["id"], "mp4"))
     r = build_transition_stitch(clips=paths, windows=windows, output=out,
                                 fps=fps,
-                                boundary_transitions=["cut"] * (n - 1) if n > 1
-                                else None,
+                                transition_duration=td,
+                                boundary_transitions=bts if n > 1 else None,
                                 masters=None)
     if not r.get("ok"):
         raise RuntimeError(f"拼接失败: {r.get('error')}")
     print(f"[graph-engine] stitch ok dur={r.get('duration')} "
-          f"expected={r.get('expected_sec')} bts={r.get('boundary_transitions')}",
+          f"expected={r.get('expected_sec')} bts={r.get('transitions')}",
           flush=True)
     result = {"kind": "video", "value": out,
-              "meta": {"shots": n, "warnings": r.get("warnings", [])}}
+              "meta": {"shots": n, "warnings": r.get("warnings", []),
+                       "transitions": r.get("transitions")}}
+    # 轮68:配音轨混音(burn_audio)——「一句话」在这里真正进入成片。
+    # 复用管线的 master_audio(narration_events 逐镜 adelay,平台已验证
+    # 不崩的通道,agent 不自混),无 BGM。
+    if p.get("burn_audio") and audios:
+        from shipin_platform.assembly import master_audio
+        total = float(r.get("duration") or sum(windows))
+        events, t = [], 0.0
+        for (_, pth), a in zip(clips, audios):
+            events.append({"path": str(a), "time": round(t, 3)})
+            t += windows[len(events) - 1] if len(events) <= len(windows) else 0
+        mixed = str(_artifact_path(graph["id"], node["id"], "mix.wav"))
+        ma = master_audio(None, total, mixed,
+                          narration_events=events)
+        if ma.get("ok") and Path(mixed).is_file():
+            final = str(_artifact_path(graph["id"], node["id"], "final.mp4"))
+            rr = subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-i", out, "-i", mixed,
+                 "-map", "0:v", "-map", "1:a", "-c:v", "copy",
+                 "-c:a", "aac", "-shortest", final],
+                capture_output=True, text=True)
+            if rr.returncode == 0 and Path(final).is_file():
+                result["value"] = final
+                result["meta"]["audio_mixed"] = len(audios)
+    if p.get("color_grade"):
+        from shipin_platform.assembly import color_grade_warm
+        graded = str(_artifact_path(graph["id"], node["id"], "grade.mp4"))
+        color_grade_warm(result["value"], graded)
+        result["value"] = graded
+    return result
     if p.get("color_grade"):
         from shipin_platform.assembly import color_grade_warm
         graded = str(_artifact_path(graph["id"], node["id"], "grade.mp4"))
@@ -731,13 +856,50 @@ def _exec_card(graph: dict, node: dict, nodemap: dict[str, dict]) -> dict:
     return {"kind": "card", "value": str(rep), "meta": card}
 
 
+def _exec_dub(graph: dict, node: dict, nodemap: dict[str, dict]) -> dict:
+    """轮73:配音驱动口型(InfiniteTalk 照帧重说)。
+
+    输入首帧(人物近照)+驱动音频,输出嘴型跟着音频走的视频轨——音频轨
+    本身由 assemble 从 tts 节点混入(视频与音频彻底分离,24G 显存档位的
+    标准架构)。first_frame 取 image_gen 产物或视频首帧皆可。
+    """
+    from shipin_platform.generation.local_media import local_dub
+    p = node.get("params") or {}
+    first = resolved_input(graph, node, "first_frame", nodemap)
+    audio = resolved_input(graph, node, "audio", nodemap)
+    if not first:
+        raise ValueError("dub 需要首帧连线（image_gen 输出即可）")
+    if not audio:
+        raise ValueError("dub 需要音频连线（tts 输出即可）")
+    engine = str(p.get("engine") or "infinitetalk")
+    if engine != "infinitetalk":
+        raise ValueError(f"未知配音引擎 {engine!r}(仅 infinitetalk)")
+    dur = max(1, int(p.get("duration", 5) or 5))
+    out = str(_artifact_path(graph["id"], node["id"], "mp4"))
+    aspect = str(p.get("aspect") or "portrait")
+    w, h = (720, 1280) if aspect == "portrait" else (1280, 720)
+    r = local_dub(str(first), str(audio), out, duration=dur,
+                  engine=engine, width=w, height=h)
+    if not r.get("ok"):
+        raise RuntimeError(f"配音失败({engine}): {r.get('error', r)}")
+    _record_graph_cost(graph, "video", model="infinitetalk-dub",
+                       units=float(dur), note=node["id"])
+    return {"kind": "video", "value": out,
+            "meta": {"model": "infinitetalk-dub", "anchored": True,
+                     "warnings": [], "dub": True,
+                     "transition": str(p.get("transition") or "softcut"),
+                     "transition_duration": float(
+                         p.get("transition_duration", 0.4) or 0.4)}}
+
+
 # 轮50(九审 P1-4):花钱节点类型——执行前过预算熔断、成功后入账
-_SPEND_NODE_TYPES = ("image_gen", "video_gen", "tts")
+_SPEND_NODE_TYPES = ("image_gen", "video_gen", "tts", "dub")
 
 EXECUTORS: dict[str, Callable[[dict, dict, dict], dict]] = {
     "text": _exec_text,
     "image_gen": _exec_image_gen,
     "video_gen": _exec_video_gen,
+    "dub": _exec_dub,
     "tts": _exec_tts,
     "qc": _exec_qc,
     "assemble": _exec_assemble,
@@ -753,18 +915,52 @@ EXECUTORS: dict[str, Callable[[dict, dict, dict], dict]] = {
 
 def add_node(g: dict, type_: str, x: float = 0.0, y: float = 0.0,
              params: dict | None = None,
-             title: str | None = None) -> dict:
-    """追加一个节点（校验类型后分配不重复 id）。"""
+             title: str | None = None,
+             created_by: str = "",
+             connect_to: Optional[dict] = None) -> dict:
+    """追加一个节点（校验类型后分配不重复 id）。
+
+    轮71(AI 编排通道):x/y 缺省(<=0)时自动排布——旧实现默认 (0,0),
+    外部 AI(Codex 等)经 POST /nodes 批量建节点全部叠在左上角,画布不可用。
+    现在取现有节点的右/下方第一个空位(每节点占 260x170 槽位)。
+    created_by: "ai" | "manual" | ""——来源标识,前端给 AI 节点打角标。
+    connect_to: {"from": node_id, "port": "prompt"...} 建完即连到既有节点,
+    解决 AI 建 video_gen 后不连 prompt/first_frame 的空节点问题。
+    """
     get_def(type_)  # 未知类型抛 ValueError
     used = {n.get("id") for n in g.get("nodes", [])}
     i = 1
     while f"n{i}" in used:
         i += 1
+    nodes = g.setdefault("nodes", [])
+    if x <= 0 and y <= 0:
+        occupied = {(round(float(n.get("x") or 0)),
+                     round(float(n.get("y") or 0))) for n in nodes}
+        x, y = 0.0, 0.0
+        for gy in range(60):
+            for gx in range(12):
+                cand = (gx * 280 + 40, gy * 190 + 40)
+                if cand not in occupied:
+                    x, y = float(cand[0]), float(cand[1])
+                    break
+            if (round(x), round(y)) not in occupied and x:
+                break
     node = {"id": f"n{i}", "type": type_, "x": x, "y": y,
             "params": params or {}}
     if title:
         node["title"] = title
-    g.setdefault("nodes", []).append(node)
+    if created_by:
+        node["created_by"] = created_by
+    nodes.append(node)
+    if connect_to and isinstance(connect_to, dict):
+        src_id = str(connect_to.get("from") or "")
+        src_port = str(connect_to.get("port") or "prompt")
+        if src_id and any(n.get("id") == src_id for n in nodes):
+            g.setdefault("edges", []).append({
+                "from": src_id, "from_port": src_port,
+                "to": node["id"], "to_port": connect_to.get("to_port") or "prompt",
+                "order": len(g.get("edges", [])),
+            })
     save_graph(g)
     return node
 

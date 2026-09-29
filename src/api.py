@@ -2562,7 +2562,10 @@ def _preview_frame_urls(project_id: str) -> list[str]:
     d = _project_dir(project_id) / "preview_frames"
     if not d.is_dir():
         return []
-    names = sorted(p.name for p in d.glob("*.jpg"))
+    # A 审计实证：抽帧落 .png（extract_frames 输出），此处只 glob *.jpg →
+    # frames:[] 且直取 URL 404。两种扩展名都收（.jpg/.jpeg/.png）。
+    names = sorted(p.name for p in d.glob("*")
+                   if p.suffix.lower() in (".jpg", ".jpeg", ".png"))
     return [f"/api/pipeline/{project_id}/preview/{n}" for n in names]
 
 

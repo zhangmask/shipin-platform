@@ -5,7 +5,27 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/svg+xml" href="/ui/favicon.svg" />
     <title>Shipin Platform</title>
-  </head>
+  <script>
+// 轮68:前端诊断哨兵——此前无错误边界+无捕获,渲染崩溃=静默白屏,
+// 线上排错零信息。现常驻捕获 window.error/unhandledrejection/
+// console.error 到 window.__E(附加到 document.title 便于复制),
+// 任何路由白屏先读它。
+window.__E = window.__E || [];
+window.addEventListener("error", function (e) {
+  window.__E.push("ERR: " + (e.message || "") + " | " + String((e.error && e.error.stack) || "").split("\n").slice(0, 4).join(" <> "));
+});
+window.addEventListener("unhandledrejection", function (e) {
+  window.__E.push("REJ: " + String(e.reason).slice(0, 500));
+});
+var _ce = console.error;
+console.error = function () {
+  var parts = [];
+  for (var i = 0; i < arguments.length; i++) parts.push(String(arguments[i]).slice(0, 400));
+  window.__E.push("CE: " + parts.join(" | "));
+  _ce.apply(console, arguments);
+};
+</script>
+</head>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>

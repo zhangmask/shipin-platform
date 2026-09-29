@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import urllib.request
 from pathlib import Path
+from typing import Optional
 
 from shipin_platform.services.provider_registry import (
     creds as _registry_creds,
@@ -247,7 +248,9 @@ def generate_video_agnes(prompt: str, model: str = "agnes-video-2.5-flash",
                           negative_prompt: str = "",
                           seed: int | None = None,
                           poll_interval: int = 5,
-                          poll_attempts: int = 60) -> dict:
+                          poll_attempts: int = 60,
+                          width: int = 0, height: int = 0,
+                          ref_images: Optional[list[str]] = None) -> dict:
     """Generate video via Agnes AI, first/last-frame anchored when possible.
 
     Agnes /videos 接口两代协议：
@@ -281,7 +284,11 @@ def generate_video_agnes(prompt: str, model: str = "agnes-video-2.5-flash",
                 first_frame=first_frame or "",
                 last_frame=last_frame or "",
                 duration=int(duration),
-                engine=_local_engine(model, "video"))
+                engine=_local_engine(model, "video"),
+                width=width, height=height,
+                # 一致性升级(2026-09-26):ref_images 非空 → H3 Ref2VA 参考模式
+                # (角色金参考+本镜首帧),见 local_media.local_video 注释
+                ref_images=ref_images)
         except local_media.LocalMediaError:
             if os.environ.get("SHIPIN_MEDIA_BACKEND", "auto") == "local":
                 raise

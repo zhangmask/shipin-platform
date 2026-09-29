@@ -64,15 +64,16 @@ LOCATION_TOKENS = ["写字楼", "办公室", "会议室", "办公桌", "工位",
 SCRIPT_PROMPT = """你是严格的 TVC 编剧。依据 brief 创作剧本,输出严格 JSON(无 markdown、无解释):
 {"duration_sec": <int>, "shots": [{"shot_id": "S01", "duration_sec": <2-5>, "narration": "<一句≤14字的画外旁白,可空串>", "dialogue": {"role_code": "hero_male|colleague_male|assistant_female", "text": "<该角色在镜头内说出口的台词,≤20字>"} 或省略, "scene": "<单一地点单一事件,≤30字>"}]}
 硬规则:镜头 5-10 个(短片取下限,保证每镜 ≥2.5s);结构 hook→pain→turn→value→outro(末镜=品牌落版);每镜必须有 narration 或 dialogue 之一(两拍换声,忌双轨同压);**全片至少 2 镜必须有 dialogue**(真人开口说话,禁全片只剩话外音旁白);总字数(旁白+台词 words) ≈ duration×2.7;台词必须口语短句、一句一个意思、≤20字,禁书面腔;台词与旁白不得重复同一句话(同一信息二选一);说话角色每镜至多一个,ROLE_CODE 只取自列表;禁"然后"与旁白覆盖产品价值句;每个 scene 只有一个地点一个事件(单镜头必须可连续拍完);品牌元素≥3镜。
-台词质感红线:dialogue 必须像真人开口说话——口语短句(如"你喝一口试试""等我三分钟"),禁书面语长句、禁宣传口号腔;全片任意两句 narration 禁止逐字重复(同一句画外旁白全片只能出现一次);全片 narration/dialogue 禁止出现 XX/xxx/占位符/TBD/TODO/【】 等任何模板占位符,品牌名一律用 brief 中的真实名称;旁白念出来必须自然,有停顿有语气,禁诗歌腔。
-落版镜专项:末镜必须是【静态可拍画面】--暖色调背景上产品静置,品牌名与 slogan 以字幕/台词呈现(不在 scene 里写"叠加/浮现/多景切换"等非拍摄描述);末镜 narration=品牌名+slogan(不再设 dialogue)。
+台词质感红线:dialogue 必须像真人开口说话——口语短句(如"你喝一口试试""等我一会儿"),禁书面语长句、禁宣传口号腔;全片任意两句 narration 禁止逐字重复(同一句画外旁白全片只能出现一次);全片 narration/dialogue 禁止出现 XX/xxx/占位符/TBD/TODO/【】 等任何模板占位符,品牌名一律用 brief 中的真实名称;旁白念出来必须自然,有停顿有语气,禁诗歌腔。
+数字红线(2026-09-29 用户实测反馈):narration/dialogue **禁止出现阿拉伯数字与序数词**(0-9、几点、X分钟、第X、X折、第二杯等)——口播念数字 TTS 必念错、字幕也违和;时间/数量/优惠一律改写为无数字口语("加班到很晚""就走几步""出示这条视频有优惠")。
+落版镜专项:末镜必须是【静态可拍画面】--暖色调背景上产品静置,品牌名与 slogan 以字幕/台词呈现(不在 scene 里写"叠加/浮现/多景切换"等非拍摄描述);**末镜 scene 严禁写品牌名/logo/字幕等画面文字描述(画面无字,文字只由独立字幕轨烧录)**;末镜 narration=品牌名+slogan(不再设 dialogue)。
 
 brief:
 {brief}"""
 
 STORYBOARD_PROMPT = """你是严格的 TVC 分镜师。把剧本展开为分镜，输出严格 JSON（无 markdown、无解释）：
 {"hero_shot": "<shot_id>", "shots": [{"shot_id": "...", "duration_sec": <秒>, "beat": "hook|pain|turn|value|outro", "rhythm": "slow|medium|fast", "sfx": "sfx_<n>", "shot_size": "ecu|cu|mcu|cs|ms|ws|ows", "subject": "<与全片逐字一致的主角锚定>", "motion": "<英文运动短语，必含具体动作动词+速度/幅度词，如 slowly lifts the cup / turns her head gently / steam rises softly，禁中文>", "scene": "<单一地点>", "spatial": "<构图>", "camera": "<机位/运动术语：dolly/truck/crane/pedestal，禁zoom表移动>", "cause": "<承接上一镜的可拍视觉过渡>", "effect": "<给下一镜的可拍衔接点>", "narration": "<逐字复制剧本旁白,无旁白则空串>", "dialogue": "<逐字复制剧本台词,无台词则空串>", "speaking": "<仅当有 dialogue 时:该角色说话时的面部与口型英文描述,如 speaks the line with lips moving clearly, mouth shapes visible; 无台词则为空串>"}]}
-硬规则：每镜只一个连续动作；motion 必须是英文且含动作动词与速度/幅度副词（i2v 规则强校验）；**有 dialogue 的镜头 motion 必须含明显的说话/口型动作（speaks naturally / talking while doing X），并且 subject 必须保持说话人开口；无台词则 speaking 留空**；相邻镜 shot_size 必须不同档；主角锚定逐字一致（第一镜的 subject 后续镜逐字复制）；相邻镜间 cause/effect 必须可拍（动作接力/视线/光线）；**相邻镜头 camera 必须换机位（dolly/truck/crane/pedestal 交替使用，禁连镜重复同一机位）——仅在末镜品牌落版（scene 含 logo/纯色背景）允许 static 收尾**；**narration 逐字复制剧本且全片唯一，禁止把同一句旁白重复给两镜**；**全片 subject/scene/motion/narration 禁止出现 XX/占位符/TBD/TODO 等模板残留，品牌名用剧本真实名称**；末镜为品牌落版（静态画面+大字 logo，motion 写 static product shot with soft light drift，dialogue/speaking 留空）；品牌元素≥3镜。
+硬规则：每镜只一个连续动作；motion 必须是英文且含动作动词与速度/幅度副词（i2v 规则强校验）；**有 dialogue 的镜头 motion 必须含明显的说话/口型动作（speaks naturally / talking while doing X），并且 subject 必须保持说话人开口；无台词则 speaking 留空**；相邻镜 shot_size 必须不同档；主角锚定逐字一致（第一镜的 subject 后续镜逐字复制）；相邻镜间 cause/effect 必须可拍（动作接力/视线/光线）；**相邻镜头 camera 必须换机位（dolly/truck/crane/pedestal 交替使用，禁连镜重复同一机位）——仅在末镜品牌落版（scene 含 logo/纯色背景）允许 static 收尾**；**narration 逐字复制剧本且全片唯一，禁止把同一句旁白重复给两镜**；**全片 subject/scene/motion/narration 禁止出现 XX/占位符/TBD/TODO 等模板残留，品牌名用剧本真实名称**；**narration/dialogue 禁阿拉伯数字与序数词(0-9/几点/X分钟/第X/第二杯),时间数量优惠改写为无数字口语**；末镜为品牌落版（**scene 只描述无字的静态产品/纯色背景画面，严禁写入品牌名、logo、字幕等画面文字——文字只走独立字幕轨**；motion 写 static product shot with soft light drift，dialogue/speaking 留空）；品牌元素≥3镜。
 
 剧本(含台词):
 {script}
@@ -206,6 +207,52 @@ def _bind_brand(storyboard: dict, brief: dict) -> dict:
     return storyboard
 
 
+def _sanitize_spoken_text(storyboard: dict) -> dict:
+    """口播文本确定性清洗(2026-09-29 用户实测反馈后新增)。
+
+    两件事:
+    1. **阿拉伯数字 → 中文口语**:TTS 听到 "3分钟/六点/第二杯" 这类混排
+       必念错(实测 S03 字幕与音频对不上、坏 take);合成前统一转中文数词
+       ("三分钟"),字幕按实际音频转写后也自然。
+    2. **序号词记账**:第X/X折/序数不改写(改写会动内容),只在 manifest
+       留__spoken_numerals__ 告警条目供人审——源头 rubric 已禁。
+    只动 narration / dialogue.text(口播),不碰 scene/subject/motion
+    (那些是给生成模型的画面描述,动不得)。
+    """
+    _CN = {"0": "零", "1": "一", "2": "二", "3": "三", "4": "四",
+           "5": "五", "6": "六", "7": "七", "8": "八", "9": "九"}
+    warns: list[str] = []
+
+    def _digits_to_cn(text: str) -> str:
+        # 两位整十(15→十五)按位拼,其余逐位;足够口播场景
+        def _num(m):
+            s = m.group(0)
+            if len(s) == 2 and s[0] == "1":
+                return "十" + (_CN.get(s[1], s[1]) if s[1] != "0" else "")
+            if len(s) == 2 and s[1] == "0" and s[0] != "0":
+                return _CN.get(s[0], s[0]) + "十"
+            return "".join(_CN.get(c, c) for c in s)
+        return re.sub(r"\d+", _num, text)
+
+    for s in storyboard.get("shots", []) or []:
+        if not isinstance(s, dict):
+            continue
+        d = s.get("dialogue")
+        if isinstance(d, dict) and isinstance(d.get("text"), str):
+            t = d["text"]
+            if re.search(r"\d", t):
+                d["text"] = _digits_to_cn(t)
+        n = s.get("narration")
+        if isinstance(n, str) and re.search(r"\d", n):
+            s["narration"] = _digits_to_cn(n)
+        joined = f"{s.get('narration') or ''}{(d or {}).get('text') or '' if isinstance(d, dict) else ''}"
+        if re.search(r"第[一二三四五六七八九十百\d]|[0-9]", joined):
+            warns.append(f"{s.get('shot_id')}: 口播仍含数字/序数词")
+    if warns:
+        storyboard["__spoken_numerals__"] = warns
+    return storyboard
+
+
 # ---------------------------------------------------------------------------
 # 意图传导 helper：brief 的字段必须真的「传导」到下游，而不是被散落常量截断
 # ---------------------------------------------------------------------------
@@ -296,17 +343,20 @@ def _ffprobe_size(path: str) -> Optional[tuple[int, int]]:
 
 
 def _normalize_canvas(src: Path, dst: Path, w: int, h: int) -> bool:
-    """把任意画幅素材统一到目标画幅（比例不符时中心裁剪+黑边）。
+    """把任意画幅素材统一到目标画幅（比例不符时**中心裁剪填充**）。
 
-    stitch 的 xfade 链要求全部入镜尺寸一致；AGNES 固定输出 720p 横屏，
-    9:16 项目必须显式归一化，否则拼接阶段报尺寸不匹配。尺寸已吻合时
-    直接返回 False（不转码，零开销）。
+    2026-09-26 用户实测反馈:「很多视频比例前后不一致,被压扁或拉伸,必须统一
+    限定,一开始限定了就不允许别的比例」。旧实现用 decrease+pad(信箱填充)——
+    横屏素材进竖屏画布会留下 58% 高度的黑边,且同片内满屏落版卡与信箱镜头
+    交替,比例观感前后劈叉。改为 increase+crop:放大到覆盖画布后中心裁剪,
+    不拉伸不变形无黑边;裁剪损失的只是构图边缘,换取全片比例绝对一致。
+    尺寸已吻合时直接返回 False（不转码，零开销）。
     """
     size = _ffprobe_size(src)
     if size == (w, h):
         return False
-    vf = (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
-          f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1")
+    vf = (f"scale={w}:{h}:force_original_aspect_ratio=increase,"
+          f"crop={w}:{h},setsar=1")
     r = subprocess.run(
         ["ffmpeg", "-y", "-i", str(src), "-vf", vf,
          "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an", str(dst)],
@@ -795,6 +845,30 @@ def _media_error_result(sid: str, what: str, exc: Exception,
             "report": report}
 
 
+def _gen_dims_for_canvas(w: int, h: int) -> tuple[int, int]:
+    """画布尺寸 → 视频生成尺寸。H3 要求宽高为 32 的倍数且总像素不超
+    1344x768(103 万);画布 720x1280 的 720 不是 32 倍数会被拒。按画幅
+    吸附到官方预设(竖 768x1344 / 横 1344x768)——同比例,归一化回画布时
+    零裁剪、≤20px 微边(对比旧行为:横屏素材塞竖屏画布的 40% 大黑边)。"""
+    if not w or not h:
+        return (0, 0)
+    if h >= w:  # 竖屏(含方形偏竖)
+        return (768, 1344)
+    return (1344, 768)
+
+
+def _subject_is_person(subject: str) -> bool:
+    """分镜主体是否人物镜(一致性策略用)。与 review.hard_gates._is_person_shot
+    同口径:先否决「无人物/无人」前缀再做子串匹配(产品静物镜的 subject 常
+    含「人物」二字,不否决会被当成人物镜做身份 conditioning)。"""
+    text = str(subject or "")
+    if text.startswith("无人物") or text.startswith("无人"):
+        return False
+    return any(w in text for w in ("主角", "主人公", "人物", "模特",
+                                   "女性", "男性", "女孩", "男孩",
+                                   "女人", "男人", "演员", "顾客"))
+
+
 def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) -> dict:
     """首帧图 → 首尾帧链 → 锚定视频 → QC(重试≤2)→ TTS → 对齐。
     全程确定性;LLM 不参与。返回逐镜报告。"""
@@ -820,6 +894,11 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
     storyboard = _load(project_id, "storyboard.json")
     brief0 = _load(project_id, "brief.json") or {}
     storyboard = _bind_brand(storyboard, brief0)
+    # 口播文本确定性清洗(数字转中文/序数记账)——必须在绑品牌之后:
+    # 品牌名可能带数字,先绑再洗才不会把品牌名里的数字也转掉(本函数只动
+    # narration/dialogue,不碰 scene/subject,品牌名在旁白里的情形由
+    # _digits_to_cn 统一转成中文数词,TTS 才念得对)。
+    storyboard = _sanitize_spoken_text(storyboard)
     # 数据形状归一:storyboard 模板(STORYBOARD_PROMPT)把 dialogue 拍成纯
     # 字符串,而 TTS 合成/align/assemble 三处都只认 {role_code,text} dict
     # ——不归一则台词音频永远不合成(成片只剩旁白、字幕缺台词,且无门能
@@ -836,14 +915,27 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
     style = _style_anchor(_load(project_id, "brief.json"))
     canvas_w, canvas_h, kb_size = _canvas_for_brief(
         _load(project_id, "brief.json"))
+    # 视频生成尺寸:按画布画幅吸附 H3 合法预设(见 _gen_dims_for_canvas)
+    _gen_w, _gen_h = _gen_dims_for_canvas(canvas_w, canvas_h)
+    # 本地媒体后端 → 精简提示词模板(见下方 vid_prompts 派生处注释)
+    _LOCAL_VIDEO_BACKEND = (
+        os.environ.get("SHIPIN_MEDIA_BACKEND", "auto").strip().lower() == "local")
     brief0 = _load(project_id, "brief.json")
     brand_name0 = _resolve_brand(brief0)
-    # C 变体实测(2026-09-21):提示词里给出品牌名+落点(杯身/物件)
-    # 即可驱动品牌入画(brand_seen False→True)。无品牌名不注入。
-    brand_shot = (f" The brand name {brand_name0!r} printed on a small "
-                  f"product label or cup, readable, softly lit." if brand_name0 else "")
+    # 2026-09-29 用户架构裁定:品牌名**不再进生成 prompt**(原做法
+    # brand_shot 让模型把品牌名印在杯身/标签上——实测被写成错别字烧进
+    # 画面,与独立字幕轨对不上)。品牌只走确定性通道:末镜 narration
+    # 念出品牌名 + SRT 字幕烧录。brand_shot 保留为空串占位(下游判定
+    # 已改为旁白/字幕文本含品牌名即过,见 hard_gates 的 BRAND_MISSING)。
+    brand_shot = ""
     img_prompts, vid_prompts = [], []
     _n_shots = len(storyboard["shots"])
+    # 2026-09-29 用户架构裁定:帧内不再出现任何文字——品牌与字幕一律走
+    # 确定性通道(末镜 narration 念品牌名 + SRT 独立字幕轨烧录),视频
+    # 生成模型一个字的指令都不给(实测:让模型画品牌名会把「瑞幸」写成
+    # 「瑞幸☕☕」/错别字烧进画面,与字幕轨对不上;落版镜 scene 写「叠加
+    # logo」同样被模型渲染成烧录字幕)。下面 _brand 只保留**排除**类
+    # 指令(不许发明文字/竞品标),去掉一切「把某文字画进去」的正向指令。
     # 轮60(终审 finding 实证):shot_size 景别词表——分镜表有 shot_size
     # (ecu/cu/mcu/cs/ms/ws/ows)但旧模板景别硬编码 "medium close-up",
     # S03(分镜 cu 特写手部)被生成成中景站姿,S01(ws)光线词在 scene 中段
@@ -865,21 +957,21 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
         # 品牌 Logo」两条 SHOT_STORY_MISMATCH 正是这种:场景要求了,
         # prompt 没给。按 scene 关键词命中补充。
         _scene_txt = str(s.get("scene") or "")
-        _brand = brand_shot if (_i == 0 or _i == _n_shots - 1) else ""
-        if not _brand and re.search(r"品牌|logo|Logo|LOGO|吊牌", _scene_txt):
-            _brand = brand_shot
+        # 2026-09-29 用户架构裁定:正向品牌指令(把品牌名画进画面)全部
+        # 移除——brand_shot 已置空。这里只保留**排除**类指令:画面里不
+        # 许出现任何文字(字幕/品牌字/水印),更不许发明竞品标。
+        _brand = ""
         # 轮60 二轮(终审实证):品牌**专有否定式**——模型会发明竞品
         # Logo(S04 实测杯身出星巴克标),prompt 必须显式排除他牌;
         # 屏显指定(S05 实测屏幕显示 '25th year' 而非品牌名)。
         if brand_name0:
-            _brand += (f" The only visible brand anywhere is "
-                       f"'{brand_name0}'. No other logos, no Starbucks "
-                       f"or any third-party brand marks, no invented "
-                       f"text or English words on screens, cups, walls "
-                       f"or clothing.")
+            _brand += (f" No text anywhere in the frame — no letters, no "
+                       f"brand names, no logos, no watermarks, no invented "
+                       f"words on screens, cups, walls or clothing, no "
+                       f"third-party brand marks such as Starbucks.")
             if re.search(r"屏幕", _scene_txt):
-                _brand += (f" If a screen is visible it displays exactly "
-                           f"'{brand_name0}', nothing else.")
+                _brand += (f" If a screen is visible it stays blank and "
+                           f"unmarked.")
         # 光线-动作一致性:scene 写明室内/冷色黎明而 motion 却是阳光
         # 移动(S01 实测死结:模型要么无阳光→finding『无阳光移动』,
         # 要么加暖光→finding『光线色温不符」)。此时代入可拍的等效
@@ -906,7 +998,12 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
         img_prompts.append({"shot_id": s["shot_id"], "prompt_en":
                             f"{s['subject']}. {_motion_txt}{speaking_en} "
                             f"Scene: {s['scene']}. "
-                            f"{s['spatial']}. {s['camera']}. {style}, no text"
+                            f"{s['spatial']}. {s['camera']}. {style}, "
+                            # 2026-09-29 用户实测反馈:画面文字(字幕/品牌
+                            # 字/水印)一律不进生成——字幕是独立轨(烧录在
+                            # 成片上),生成画面里出现文字=字幕与画面对不上、
+                            # 品牌字被模型写错。prompt 末尾显式排除。
+                            f"no text, no letters, no logos, no watermark"
                             # 轮61(生成策略转向):prompt 层对「按键位置」
                             # 已到边际(三重约束仍侧面键)——改从**首帧
                             # 锚定图**锚死构图:AGNES 2.5 以首帧为条件
@@ -915,18 +1012,57 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                             # 在正面面板、Logo 正旁的特写构图。
                             + (f" Frame composition: tight close-up of the "
                                f"finger pressing the brew button on the "
-                               f"machine's FRONT panel, with the "
-                               f"'{brand_name0}' logo printed directly "
+                               f"machine's FRONT panel, with a small blank "
+                               f"circular logo badge printed directly "
                                f"beside the button — the button is "
                                f"front-facing and centered, clearly NOT "
                                f"a side-panel control, shallow depth of "
                                f"field."
-                               if brand_name0 and re.search(
+                               if re.search(
                                    r"按下|按键|出水键|按钮",
                                    _scene_txt) and str(
                                    s.get("shot_size") or "").lower() in
                                ("ecu", "cu", "mcu")
                                else "")})
+        # 2026-09-25 本地后端(H3/ComfyUI)走精简模板:完整长模板(景别括号
+        # 注释/锁定构图三连 no establishing+no pull-back/长品牌否定串)是
+        # 为 agnes-video-2.5 云端模型逐条 finding 堆出来的,H3 上过度约束
+        # 反而不稳——实测同一 motion 竖屏下精简提示词一次过(qc=ok cuts=0),
+        # 完整模板 9 连败(INTERNAL_CUTS/MORPH)。核心约束(单镜头/不切镜/
+        # 不形变/主体居中/景深)保留,云端专属堆料砍掉。
+        if _LOCAL_VIDEO_BACKEND:
+            # 2026-09-29 用户实测反馈:品牌字/字幕**不许进视频生成 prompt**
+            # ——模型会把品牌名写成错别字烧进画面(实测 S05 落版镜画面出现
+            # 「瑞幸☕☕」,与独立字幕轨的文字对不上)。品牌只走 TTS 旁白 +
+            # SRT 字幕的确定性通道(见 _bind_brand/烧录段),prompt 里一个字
+            # 都不给,改为显式排除画面文字。
+            _center = ("" if str(s.get("subject") or "").startswith("无人物")
+                       else ", subject stays centered")
+            # 2026-09-26 一致性升级(GitHub 调研:character-anchor-skill 锚卡
+            # 方法论 + Seedance 多参考参考图):人物镜带「参考图锁定声明」——
+            # 挂在 camera 子句上(不新起一句,省 380 字门配额):明写身份不许
+            # 变(脸/发/服装)、随本镜变的只有场景/机位/光线,与 Ref2VA 的
+            # 金参考 conditioning 配合。
+            _is_person = (not str(s.get("subject") or "").startswith("无人物")
+                          and _subject_is_person(s.get("subject")))
+            _lock = (" — the same person as the reference images, with "
+                     "unchanged face, hair and outfit" if _is_person else "")
+            # speaking 口型子句保留:A/B 对照实验(2026-09-25 子智能体 A)证明
+            # 带口型的说话镜在竖屏下一次过(qc=ok cuts=0),它只压低运动能量
+            # (6.8 vs 14.9)不引发硬切——真正根因是首尾帧锚点与 motion 错拍。
+            vid_prompts.append({"shot_id": s["shot_id"],
+                                "prompt_text": (
+                                    f"{s['subject']}. "
+                                    f"{_motion_txt}{speaking_en} "
+                                    f"Scene: {s['scene']}. "
+                                    f"Camera: {s['camera']}, medium close-up, "
+                                    f"shallow depth of field{_center}{_lock}. "
+                                    f"One single continuous take — no camera "
+                                    f"cut, no scene change, no morphing, "
+                                    f"smooth ending. No text, no letters, "
+                                    f"no logos, no watermark, no subtitles "
+                                    f"anywhere in the frame.")})
+            continue
         vid_prompts.append({"shot_id": s["shot_id"],
                             # 模板升级(2026-09-21 A/B 实测):A(中文短模板)在 2.5s
                             # 出现主体变形;英文长模板(scene+固定机位+景深+主体居中
@@ -969,12 +1105,12 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                                             # 正旁,禁侧面/禁通用键。
                                             + (f" The pressed control is the "
                                                f"brew button on the machine's "
-                                               f"front panel with the "
-                                               f"'{brand_name0}' logo printed "
+                                               f"front panel with a small "
+                                               f"blank circular logo badge "
                                                f"directly beside it — not a "
                                                f"side button, not a generic "
                                                f"control."
-                                               if brand_name0 and re.search(
+                                               if re.search(
                                                    r"按下|按键|出水键|按钮",
                                                    _scene_txt)
                                                else "")
@@ -1073,10 +1209,32 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
     # 永远 NOT_STARTED,发布硬闸形同虚设。这里把每镜关键帧的实体指纹打进
     # 状态机,重跑/替换素材都会让 hash 变化。
     from shipin_platform.contracts import stable_artifact_hash as _sah
+    # 2026-09-26 一致性升级(GitHub 角色锚卡方法论):项目级角色金参考——
+    # 一张中性肖像,后续所有人物镜以它为 Ref2VA 参考图,跨镜身份不再各靠
+    # 各自首帧(每镜首帧由同一 subject 文本独立生成,五官/发型/服装会漂移)。
+    # 幂等:已存在则不重生(重跑 generate 不换参考,否则参考自己也在漂移)。
+    char_ref = str(manifest.get("character_ref") or "")
+    _person_shots = [s for s in shots if _subject_is_person(s.get("subject"))]
+    if _person_shots and not (char_ref and Path(char_ref).is_file()):
+        _ref_path = work / "_char_ref.jpg"
+        _anchor_subject = str(_person_shots[0].get("subject") or "")
+        try:
+            _rr = generate_image_agnes(
+                f"{_anchor_subject}. Neutral front-facing portrait, calm "
+                f"expression, looking at camera, clean simple background. "
+                f"{style}, cinematic look",
+                canvas_w, canvas_h, str(_ref_path))
+            if _rr.get("ok") and _ref_path.is_file():
+                char_ref = str(_ref_path)
+                manifest["character_ref"] = char_ref
+                record_cost(project_id, "image", model="agnes-image",
+                            units=1.0, note="角色金参考(一致性)")
+        except Exception as _e:  # noqa: BLE001 — 金参考失败不阻断,退回 i2v
+            char_ref = ""
     img_fp = {}
     for sid, mrec in manifest["shots"].items():
         for k in ("first_frame", "last_frame"):
-            p = mrec.get(k)
+            p = mrec.get(k) if k != "character_ref" else mrec.get("character_ref")
             fp = Path(p) if p else None
             img_fp[f"{sid}:{k}"] = (
                 str(fp) if fp and fp.is_file() else "",
@@ -1135,7 +1293,14 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
             report.append({"shot_id": sid, "qc": "ok", "cached": True,
                            "pooled": _pooled})
             continue
-        clip = work / f"{sid}_clip.mp4"
+        # C 审计 N1(2026-09-26,阻塞级):旧代码把 `clip` 在画布归一化后
+        # 重绘成 canvas 路径,定向重试(attempt≥1)的 generate_video_agnes
+        # 就**把 raw 输出写进 canvas 文件**——1280x720 覆盖归一化后的
+        # 720x1280,随后 _normalize_canvas(src==dst) 因 ffmpeg 拒绝原地
+        # 编辑静默返回 False,归一化被跳过,raw 横屏混入竖屏队列炸 stitch。
+        # 修法:生成/QC 永远走 raw 路径,canvas 只是归一化派生物。
+        raw = work / f"{sid}_clip.mp4"
+        clip = str(raw)
         # 轮21:关键帧 vs 分镜文本门——视频模型以 first_frame 为条件
         # 生成,关键帧跑偏整镜必歪,而 qc_clip 的 dHash 只比「clip 首帧
         # vs 参考图」(同源几乎必然一致),没人审过参考图本身。视频生成
@@ -1196,11 +1361,18 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
             if attempt == 0:
                 prompt = vid_map.get(sid, s["motion"]) + _hard
             elif attempt == 1:
-                prompt = (f"ONE single uninterrupted take, FIXED camera, no camera "
-                          f"movement at all. {s['motion']}" + _hard)
+                # 2026-09-25:阶梯必须基于**派生提示词**追加修饰,不能退回裸
+                # motion——裸 motion 会丢掉 scene/subject/锁定构图/反形变
+                # 全部约束(竖屏 H3 首试失败率高,重试全用残血提示词=必败,
+                # 实测 S03 竖屏 6 连败的根因)。
+                prompt = (vid_map.get(sid, s["motion"])
+                          + " ONE single uninterrupted take, FIXED camera, "
+                            "no camera movement at all."
+                          + _hard)
             else:
-                prompt = (f"ONE single uninterrupted take, FIXED camera, no camera "
-                          f"movement. The subject moves minimally: {s['motion']}"
+                prompt = (vid_map.get(sid, s["motion"])
+                          + " ONE single uninterrupted take, FIXED camera, "
+                            "no camera movement. The subject moves minimally."
                           + _hard)
             # 轮62:seed 阶梯——与 prompt 变体正交的采样维度。定向重试
             # (单镜诊断 critical)与 QC 重试都走同一阶梯:attempt 1/2 分别
@@ -1212,15 +1384,28 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
                 _seed = 4242 + attempt * 7919
             net_retries = 0
             r = None
+            # 一致性升级:人物镜走 H3 Ref2VA——参考图=[项目角色金参考, 本镜
+            # 首帧],前者锁身份(脸/发/服装),后者锁本镜构图。产品/空镜镜不传
+            # (无身份可锁,且 Ref2VA 与 i2v 是两套权重,不必换)。
+            _refs = None
+            if (char_ref and mrec.get("first_frame")
+                    and _subject_is_person(s.get("subject"))):
+                _refs = [char_ref, str(mrec["first_frame"])]
             while True:
                 try:
                     r = generate_video_agnes(
                         prompt=prompt + " Single continuous take, no cuts.",
                         duration=int(max(dur, 2)), resolution="720p",
                         first_frame=mrec["first_frame"], last_frame=mrec["last_frame"],
-                        output_path=str(clip),
+                        output_path=str(raw),
                         negative_prompt=NEG,
-                        seed=_seed)
+                        seed=_seed,
+                        # 画布画幅必须传导到生成端:本地 H3 默认出 1344x768
+                        # 横屏,竖屏项目不传就会被 normalize 加黑边缩成小横条,
+                        # 成片比例观感前后不一(用户实测反馈 2026-09-25)。
+                        # 720x1280 不是 32 倍数会被 H3 拒,按画幅吸附官方预设。
+                        width=_gen_w, height=_gen_h,
+                        ref_images=_refs)
                     break
                 except Exception as e:
                     net_retries += 1
@@ -1238,7 +1423,7 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
             mrec["master"] = r.get("master_path")
             record_cost(project_id, "video", model="agnes-video",
                         units=round(max(dur, 2), 1), note=sid)
-            qc = qc_clip(str(clip), shot_id=sid,
+            qc = qc_clip(str(raw), shot_id=sid,
                          expected_duration_sec=dur,
                          reference_image=mrec["first_frame"],
                          use_vlm=True)  # M5(2026-09-21 审计):dHash 盲区用 VLM 补
@@ -1255,12 +1440,33 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
             if qc["verdict"] == "ok":
                 generated = True
                 mrec["qc"] = "ok"
-                # 画布归一化:AGNES 固定出 720p 横屏,9:16 项目必须统一到目标
-                # 画幅(中心裁剪+黑边),否则 stitch 的 xfade 链因尺寸不一致失败;
-                # master 也要同步归一化(转场会从 master 借帧补时长)。
+                # 画布归一化:任何画幅的生成结果都统一到目标画幅(中心裁剪
+                # 填充,见 _normalize_canvas——2026-09-26 用户要求比例一刀切:
+                # 项目画布是唯一合法比例,信箱/拉伸都不允许);master 也要同步
+                # 归一化(转场会从 master 借帧补时长)。
+                # N1 修复:永远从 raw 派生 canvas(此前 clip 已被重绘为
+                # canvas,导致 src==dst 原地编辑被 ffmpeg 拒→归一化静默跳过)。
                 cvp = work / f"{sid}_canvas.mp4"
-                if _normalize_canvas(str(clip), cvp, canvas_w, canvas_h):
+                _raw_size = _ffprobe_size(raw)
+                if _normalize_canvas(raw, cvp, canvas_w, canvas_h):
                     clip = str(cvp)
+                    if _raw_size and _raw_size != (canvas_w, canvas_h):
+                        # 生成端没按画布比例出片(云端固定横屏/模型自由发挥):
+                        # 已裁剪填充修复,如实记账——「一开始限定就不允许别的
+                        # 比例」,这是唯一允许的补偿且必须留痕。
+                        mrec["ratio_repaired"] = (
+                            f"{_raw_size[0]}x{_raw_size[1]}->"
+                            f"{canvas_w}x{canvas_h}(crop-fill)")
+                else:
+                    clip = str(raw)
+                # 硬门:入拼素材必须精确等于画布尺寸,否则本镜判失败——
+                # 比例不一致不允许流入 assemble(用户实测反馈 2026-09-26)。
+                if _ffprobe_size(Path(clip)) != (canvas_w, canvas_h):
+                    attempts.append({"attempt": attempt + 1,
+                                     "error": f"比例不合规: {clip} 尺寸 "
+                                              f"{_ffprobe_size(Path(clip))} != 画布 "
+                                              f"{(canvas_w, canvas_h)}"})
+                    continue
                 if (mrec.get("master") and Path(mrec["master"]).is_file()
                         and _normalize_canvas(Path(mrec["master"]),
                                               work / f"{sid}_canvas_master.mp4",
@@ -1464,6 +1670,36 @@ def run_generate_phase(project_id: str, store, workdir: Optional[str] = None) ->
             # 照播)、align 按旧音频算窗口,而新指纹让该镜永远"新鲜",
             # 无门能发现。删/置空台词时必须显式摘掉。
             manifest["shots"][s["shot_id"]].pop("dlg", None)
+    # 轮73:每镜 TTS 成品 ASR 内容校验(默认开;SHIPIN_TTS_ASR=off 关闭)。
+    # 用户 2026-09-29 明确要求:ASR 乱说话检测必须强制/默认启用。放在
+    # 这里而不是只留在 assemble 终审——配音阶段当场抓,坏 take 立刻重
+    # 做,不带着乱说话的音频走完后续全链路。协议失败(sidecar 挂)判
+    # skip 不阻断;内容失配 fail-closed。
+    if os.environ.get("SHIPIN_TTS_ASR", "on").strip().lower() not in (
+            "0", "off", "false"):
+        _asr_bad = _tts_asr_check(shots, manifest)
+        if _asr_bad:
+            return {"ok": False, "phase": "generate",
+                    "reason": ("TTS 语音内容校验未过(ASR 逐镜回读): "
+                               + "; ".join(_asr_bad[:3])[:240]),
+                    "report": report}
+    # 轮73:有台词且启用配音模式时,用 InfiniteTalk 照帧重说——音频驱动重新
+    # 生成嘴型(用户 2026-09-29:24G 或更小显存的节点,生成完视频后必须走照
+    # 视频配音模型,音乐分轨)。放在 TTS/ASR 之后:台词音频此刻才存在,且
+    # ASR 已保证音频内容不乱——配音模型是「照着好音频演」,输入音频先过门。
+    # 只动**有台词的人物镜**:旁白镜(画外音)没有嘴可对,产品镜没有脸,
+    # 硬上配音模型会把整镜画面(机位运动/产品交互)毁成静态近照。
+    if _dub_mode(project_id):
+        _dub_res = _dub_pass(shots, manifest, work, project_id,
+                             canvas_w, canvas_h)
+        if _dub_res.get("dubbed"):
+            report = report + _dub_res["dubbed"]
+            _save(project_id, "manifest.json", manifest)
+        if _dub_res.get("error"):
+            # 配音失败不静默降级:用户显式要求(24G 档)配音是必选项,
+            # 失败必须 fail-closed——否则「必须配音」的片子里混着未配音镜。
+            return {"ok": False, "phase": "generate",
+                    "reason": _dub_res["error"], "report": report}
     align = align_narration([{"shot_id": s["shot_id"],
                               "duration_sec": float(s.get("duration_sec") or 3),
                               # 轮47:纯台词镜 manifest 无 tts 键——用
@@ -1514,8 +1750,197 @@ def _tts_text_sha(s: dict) -> str:
     dlg = s.get("dialogue")
     dtext = (str(dlg.get("text") or "") if isinstance(dlg, dict)
              else str(dlg or ""))
-    payload = f"{str(s.get('narration') or '')}\x00{dtext}"
+    payload = f"v5-voxcpm65\x00{str(s.get('narration') or '')}\x00{dtext}"
     return _hl3.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+_DUB_STATE: dict = {"checked": False, "on": False, "vram_gb": 0.0}
+
+
+def _dub_mode(project_id: str) -> bool:
+    """轮73:配音(InfiniteTalk 照帧重说)启用判定。
+
+    SHIPIN_DUB_MODE: on(强制) | off(默认,关) | auto。
+    auto = 探测本地节点显存:≤32G(24G 档及以下)自动开——这类节点跑不动
+    大模型的满血视频生成,用户的既定架构就是「生成完视频后必须用照视频
+    配音模型」。探测复用 local_media._get(内部已带 _assert_local_url
+    行内 SSRF 守卫),失败(本地后端不可达/非本地后端)判 off。
+    """
+    mode = str(os.environ.get("SHIPIN_DUB_MODE", "off") or "off").strip().lower()
+    if mode in ("on", "1", "true", "force"):
+        return True
+    if mode in ("", "off", "0", "false", "auto") and mode != "auto":
+        return False
+    if mode != "auto":
+        return False
+    if _DUB_STATE["checked"]:
+        return _DUB_STATE["on"]
+    _DUB_STATE["checked"] = True
+    try:
+        from shipin_platform.generation import local_media
+        stats = local_media._get("/v1/health")
+        devs = (stats or {}).get("comfy_stats", {}).get("devices") or []
+        if not devs:
+            return False
+        vram = float(devs[0].get("vram_total") or 0)
+        _DUB_STATE["vram_gb"] = round(vram / 1e9, 1)
+        _DUB_STATE["on"] = 0 < vram <= 32e9
+    except Exception:
+        _DUB_STATE["on"] = False
+    return _DUB_STATE["on"]
+
+
+def _pad_audio_to(src: str, dst: str, seconds: float) -> bool:
+    """把台词音频 pad/trim 到镜头时长(apad+atrim,16k 单声道 wav)。
+
+    InfiniteTalk 的 length 按音频秒数定;而拼接是硬切、镜头时长由分镜
+    决定——不对齐的话配音产物会比镜头短,成片总时长塌掉。静音 pad 不引
+    入内容(音频轨本身仍由 assemble 从 TTS 文件混,这里只喂给配音模型)。
+    """
+    import subprocess as _sp
+    r = _sp.run(["ffmpeg", "-y", "-v", "error", "-i", src,
+                 "-af", f"apad,atrim=0:{seconds:.2f}",
+                 "-ac", "1", "-ar", "16000", dst],
+                capture_output=True)
+    return r.returncode == 0 and Path(dst).is_file()
+
+
+def _dub_pass(shots: list, manifest: dict, work: Path, project_id: str,
+              canvas_w: int, canvas_h: int) -> dict:
+    """轮73:逐镜配音。对有台词的人物镜,用 InfiniteTalk 拿首帧+台词音频
+    重新生成嘴型,产物替换本镜 clip(画布归一化后)。返回 {dubbed:[...],
+    error:str|None};任一镜失败即 error(fail-closed,不静默降级)。
+    """
+    from shipin_platform.generation import local_media
+    from shipin_platform.contracts import stable_artifact_hash as _sah
+    import hashlib as _hl_dub
+    dubbed = []
+    for s in shots:
+        sid = s["shot_id"]
+        mrec = manifest["shots"].get(sid) or {}
+        dlg = mrec.get("dlg")
+        if not (dlg and Path(dlg).is_file()):
+            continue
+        if not _subject_is_person(s.get("subject")):
+            continue  # 无脸可对:产品/空镜不上配音模型(会毁掉整镜画面)
+        frame = mrec.get("first_frame")
+        if not (frame and Path(frame).is_file()):
+            continue
+        try:
+            dur = float(s.get("duration_sec") or 3)
+            padded = work / f"{sid}_dlg_dub.wav"
+            if not _pad_audio_to(dlg, str(padded), dur):
+                return {"dubbed": dubbed,
+                        "error": f"{sid} 配音音频 pad 失败({dlg})"}
+            out = work / f"{sid}_dub.mp4"
+            r = local_media.local_dub(str(frame), str(padded), str(out),
+                                      duration=dur, width=canvas_w,
+                                      height=canvas_h)
+            if not r.get("ok"):
+                return {"dubbed": dubbed, "error": f"{sid} 配音失败"}
+            record_cost(project_id, "video", model="infinitetalk-dub",
+                        units=round(dur, 1), note=f"{sid} 配音")
+            cvp = work / f"{sid}_canvas.mp4"
+            if _normalize_canvas(out, cvp, canvas_w, canvas_h):
+                clip = str(cvp)
+            else:
+                clip = str(out)
+            mrec["clip"] = clip
+            # master 同步指向配音版:转场从 master 借帧,若 master 还是
+            # 旧画面,叠化边界会出现旧嘴型/新嘴型跳变。
+            mrec["master"] = clip
+            mrec["clip_sha256"] = _hl_dub.sha256(
+                Path(clip).read_bytes()).hexdigest()
+            mrec["dub"] = str(out)
+            mrec["dub_audio_sha"] = _sah({"audio": Path(dlg).read_bytes()})
+            mrec["dub_from_frame"] = str(frame)
+            dubbed.append({"shot_id": sid, "qc": "dubbed",
+                           "clip": clip,
+                           "note": "InfiniteTalk 照帧重说(台词音频驱动)"})
+        except Exception as e:  # noqa: BLE001
+            return {"dubbed": dubbed, "error": f"{sid} 配音异常: "
+                                              f"{type(e).__name__}: {e}"}
+    return {"dubbed": dubbed, "error": None}
+
+
+def _tts_asr_check(shots: list, manifest: dict) -> list[str]:
+    """轮73:逐镜把 TTS 成品音 ASR 回读,与剧本文本比对——乱说话
+    (串轨/漂移/吞字)在**配音阶段**当场拦截,不再等 assemble 终审才发现
+    (用户 2026-09-29 明确要求 ASR 检测强制/默认启用)。
+
+    阈值与终审 check_narration_content 同款(短句 ≤8 字走低档),
+    保证两处口径一致。返回 critical 描述列表;ASR 协议失败返回空列表
+    (skip,协议失败不冒充判决也不阻断——失配才 fail-closed)。
+    """
+    import difflib as _dl
+    from shipin_platform.review.hard_gates import (
+        _asr_segments_default, _norm_text,
+        _NARR_CONTENT_CRIT, _NARR_SHORT_CRIT, _NARR_SHORT_CHARS)
+    bad: list[str] = []
+    for s in shots:
+        if not isinstance(s, dict):
+            continue
+        sid = str(s.get("shot_id") or "?")
+        text, kind = str(s.get("narration") or "").strip(), "旁白"
+        if not text:
+            dlg = s.get("dialogue")
+            text = (str((dlg or {}).get("text") or "").strip()
+                    if isinstance(dlg, dict) else str(dlg or "").strip())
+            kind = "台词"
+        if not text:
+            continue
+        rec = (manifest.get("shots") or {}).get(sid) or {}
+        path = rec.get("tts") if kind == "旁白" else rec.get("dlg")
+        if not path or not Path(path).is_file():
+            continue
+        try:
+            segs = _asr_segments_default(str(path), initial_prompt=text)
+        except Exception:
+            return []  # ASR 不可用:skip,存在性门另管「有没有声」
+        heard = _norm_text("".join(str(g.get("text") or "") for g in segs))
+        exp = _norm_text(text)
+        if not exp:
+            continue
+        _crit_t = (_NARR_SHORT_CRIT if len(exp) <= _NARR_SHORT_CHARS
+                   else _NARR_CONTENT_CRIT)
+        sim = _dl.SequenceMatcher(None, exp, heard).ratio()
+        if sim < _crit_t:
+            bad.append(f"{sid} {kind}疑似乱说话(相似度 {sim:.2f} < {_crit_t}: "
+                       f"应「{text[:14]}」/ ASR 实「{heard[:14]}」)")
+            continue
+        # 轮73b:无偏置复核。initial_prompt 偏置会把解码器拉向期望文本——
+        # 实测(2026-09-29 咖啡 E2E):VoxCPM 坏 take 无偏置读出「音箱断播」,
+        # 偏置后却读出期望词,相似度虚高直接放行,坏音频一路带到成片
+        # (终审 NARRATION_MISMATCH 才抓到)。故偏置读过关后,再用无偏置
+        # 读一次:读不到任何内容、或与期望文本几乎零重合 → 坏 take,
+        # fail-closed(重合成)。无偏置调用本身失败时不回拦(以偏置结果为准)。
+        try:
+            segs_u = _asr_segments_default(str(path), initial_prompt="")
+        except Exception:
+            continue
+        heard_u = _norm_text("".join(str(g.get("text") or "")
+                                    for g in segs_u))
+        # 字幕确定性来源(2026-09-29 用户裁定:字幕必须与音频对得上):
+        # 记**无偏置转写**与它对剧本的相似度——那是音频里实际念的话。
+        # assemble 的 _build_srt 按 asr_sim 二选一:相似度高(≥0.75)=
+        # ASR 识别噪声(同音字),字幕显示干净的剧本文本;真分歧才显示
+        # ASR 文本(音频确实念了别的)。双读都过=音频念的就是这句。
+        if rec is not None and heard_u.strip():
+            _sim_u = _dl.SequenceMatcher(None, exp, heard_u).ratio()
+            rec["asr_text" if kind == "旁白" else "dlg_asr_text"] = \
+                heard_u.strip()
+            rec["asr_sim" if kind == "旁白" else "dlg_asr_sim"] = \
+                round(_sim_u, 3)
+        if not heard_u.strip():
+            bad.append(f"{sid} {kind}疑似坏 take(无偏置 ASR 读不到任何"
+                       f"内容;偏置读「{heard[:12]}」不可信,重合成)")
+            continue
+        sim_u = _dl.SequenceMatcher(None, exp, heard_u).ratio()
+        if sim_u < _crit_t * 0.5:
+            bad.append(f"{sid} {kind}疑似坏 take(无偏置 ASR 实「{heard_u[:14]}」"
+                       f"与应「{text[:14]}」几乎无关,相似度 {sim_u:.2f};"
+                       f"偏置相似度 {sim:.2f} 系偏置虚高)")
+    return bad
 
 
 def _tts_failures(segments) -> list:
@@ -1782,7 +2207,9 @@ def run_assemble_phase(project_id: str, store) -> dict:
     # 1) 落版卡:beat 含 落/out 的末镜 → kenburns(窗口+td,供转场借帧)
     last_sid = sids[-1]
     last_shot = next(s for s in shots if s["shot_id"] == last_sid)
+    card_last = False
     if re.search(r"落|out|版|束", str(last_shot.get("beat") or ""), re.I):
+        card_last = True
         w9 = windows[-1]
         # 首帧图:先取素材池引用,缺则回退本地约定命名(变体共享 dataRoot 时
         # 落版卡沿用基准首帧,避免为同一画面重新生成)
@@ -1822,12 +2249,16 @@ def run_assemble_phase(project_id: str, store) -> dict:
     # 2) 逐边界转场拼接(clip 路径缺失时回退到约定命名)
     clips = [_clip_src(manifest, s, work) for s in sids]
     masters = [manifest["shots"][s].get("master") for s in sids]
-    bts = [manifest["shots"][s].get("boundary", "dissolve") for s in sids[1:]]
+    # 轮64(用户实测「切换生硬」):逐边界选型——同场景 3 帧软切、换场景
+    # 短叠化、进落版卡叠化,manifest 显式链式(cut)时硬切;重叠区由出镜
+    # 侧供给(见 build_transition_stitch docstring)。
+    bts = _classify_boundaries(shots, manifest)
     st = build_transition_stitch(clips, windows, str(work / "stitched.mp4"),
                                  transition_duration=comp_trans.get(
                                      "transition_duration", DEFAULT_TD),
                                  masters=masters,
-                                 boundary_transitions=bts)
+                                 boundary_transitions=bts,
+                                 card_last=card_last)
     if not st.get("ok"):
         return {"ok": False, "phase": "assemble", "reason": f"stitch: {st.get('error')}"}
     out["stitch"] = {k: st.get(k) for k in ("duration", "expected_sec",
@@ -1971,8 +2402,11 @@ def run_assemble_phase(project_id: str, store) -> dict:
                       bgm_gain_db=float(comp_snd.get("bgm_gain_db", -19.0)),
                       duck=bool(comp_snd.get("duck", True)),
                       narration_events=events,
+                      # 轮64:whoosh 只在真叠化边界(换场景/进落版卡)响;
+                      # 3 帧软切是同场景换景别,配 whoosh 会显得忙乱。
                       sfx_events=[{"time": t_["audio_start_sec"], "kind": "whoosh"}
-                                  for t_ in tl[1:]])
+                                  for k, t_ in enumerate(tl[1:], start=1)
+                                  if k <= len(bts) and bts[k - 1] == "dissolve"])
     if not ma.get("ok"):
         return {"ok": False, "phase": "assemble", "reason": f"master: {ma.get('error')}"}
     out["audio"] = {k: ma.get(k) for k in ("bgm_ducked", "sfx_count")}
@@ -2013,6 +2447,11 @@ def run_assemble_phase(project_id: str, store) -> dict:
               or "享受每一刻")[:40]
     ctx = {"product_info": str(brief.get("product_info", "")),
            "brand_name": brand_name, "slogan": slogan,
+           # 2026-09-29 用户架构裁定:品牌/字幕不进视频生成,改走确定性
+           # 通道。终审 BRAND_MISSING 因此扩为「VLM 画面看到」或「旁白/
+           # 字幕文本含品牌名」任一成立即过——这里把已烧录的 SRT 文本传
+           # 进去,让文本通道可判(见 hard_gates.vlm_review_final)。
+           "subtitle_text": srt,
            # 轮17:主角锚定(与 text 阶段同一解析式)——剧本钉了服装发型
            # 式样时,终审把跨镜换装从 warning 升 critical(违反剧本)
            "actor_anchor": (str(brief.get("actor_anchor")
@@ -2175,6 +2614,54 @@ def _clip_src(manifest: dict, shot_id: str, work: Path) -> str:
     return str(work / f"{shot_id}_clip.mp4")
 
 
+def _scene_tokens(scene: str) -> set:
+    """场景描述头部地点段的判别二元组(前 6 个汉字)。
+
+    中文无空格分词,直接按连续汉字切词拿不到共享地点词;而全句二元组
+    会被尾部动作短语稀释(长句里 1/8 的共享率被阈值误杀),也会被
+    「女孩」这类跨场景主语词造成假同场。scene 的地点声明在句头
+    (「吧台后,…」「冷白出租屋,…」),只比前 6 字:吧台后↔吧台前共享
+    「吧台」=同场景换景别;「吧台后」vs「台灯下」零交集(只有单字
+    「台」相通,不构成同场景);「出租屋」vs「走廊」零交集。
+    """
+    s = re.sub(r"[^\u4e00-\u9fff]", "", str(scene or ""))[:6]
+    return {s[i:i + 2] for i in range(len(s) - 1)}
+
+
+def _same_scene(a: str, b: str) -> bool:
+    ta, tb = _scene_tokens(a), _scene_tokens(b)
+    if not ta or not tb:
+        return False
+    return bool(ta & tb)
+
+
+def _classify_boundaries(shots: list[dict], manifest: dict) -> list[str]:
+    """逐边界转场选型（2026-09-27 用户实测「切换生硬」的修复）。
+
+    旧行为:所有边界一律 dissolve 0.4s,且本地无 master 时靠冻结入镜
+    首帧借位——每切一刀都有约 10 帧静止顿挫,同场景换景别也被叠化
+    拖慢。现在:
+    - manifest 显式记 "cut"(首尾帧链式) → 硬切,动作接力;
+    - 相邻镜同一场景(共享地点词) → softcut(3 帧软切,藏硬边不藏动作);
+    - 换场景 → dissolve(短叠化,重叠区由出镜侧真实素材供给);
+    - 进末镜落版卡 → dissolve(收束)。
+    """
+    bts: list[str] = []
+    for k in range(len(shots) - 1):
+        a, b = shots[k], shots[k + 1]
+        man = (manifest.get("shots") or {}).get(str(b.get("shot_id"))) or {}
+        if str(man.get("boundary") or "") == "cut":
+            bts.append("cut")
+            continue
+        if (k + 1 == len(shots) - 1
+                and re.search(r"落|out|版|束", str(b.get("beat") or ""), re.I)):
+            bts.append("dissolve")
+            continue
+        bts.append("softcut" if _same_scene(a.get("scene"), b.get("scene"))
+                   else "dissolve")
+    return bts
+
+
 _WRAP_PUNCT = "，。！？；、,!?;:"
 _WRAP_MIN_HEAD = 6    # 折点后最少保留字符(防「主角: 」前缀孤行)
 _WRAP_MIN_ORPHAN = 3  # 末行少于此长度才触发借字(1-2 字孤行)
@@ -2306,9 +2793,40 @@ def _build_srt(storyboard: dict, tl: list[dict], manifest: Optional[dict] = None
     旁白随后（align 算好的 narr_at 起）。无台词镜只出旁白。
     折行(轮44d 引入,轮51 治本)：优先 max_line_px 真字体度量折行；
     max_line_px<=0 时回退 max_line_chars 字符折行；都为 0 不折。
+
+    2026-09-29 用户裁定(字幕必须与音频对得上、字幕是独立轨):文本来源
+    按 manifest 的 ASR 记录二选一——`asr_sim`(无偏置转写 vs 剧本)≥0.75
+    说明音频念的就是这句、差异只是 ASR 同音字噪声,字幕用干净剧本文本;
+    真分歧(音频念了别的)才用 asr_text。无 ASR 记录时退回剧本文本。
     """
-    narr = {s["shot_id"]: s.get("narration", "") for s in storyboard["shots"]}
-    dlg = {s["shot_id"]: s.get("dialogue") for s in storyboard["shots"]}
+    _mshots = ((manifest or {}).get("shots") or {})
+
+    def _pick(sid: str, script_text, asr_key: str, sim_key: str) -> str:
+        _rec = _mshots.get(sid) or {}
+        _asr = str(_rec.get(asr_key) or "").strip()
+        if not _asr:
+            return script_text
+        try:
+            _sim = float(_rec.get(sim_key) or 0)
+        except (TypeError, ValueError):
+            _sim = 0.0
+        # ASR 噪声(同音字) → 剧本文本更干净且与音频一致;真分歧 → ASR 文本
+        return script_text if _sim >= 0.5 else _asr
+
+    narr = {}
+    for s in storyboard["shots"]:
+        sid = s["shot_id"]
+        narr[sid] = _pick(sid, s.get("narration", ""), "asr_text", "asr_sim")
+    dlg = {}
+    for s in storyboard["shots"]:
+        sid = s["shot_id"]
+        _d = s.get("dialogue")
+        if isinstance(_d, dict) and _d.get("text"):
+            dlg[sid] = {"role_code": _d.get("role_code"),
+                        "text": _pick(sid, _d["text"], "dlg_asr_text",
+                                      "dlg_asr_sim")}
+        else:
+            dlg[sid] = _d
     ROLE_NAMES = {"hero_male": "主角", "colleague_male": "同事",
                   "assistant_female": "助理", "biz_female": "旁白"}
 

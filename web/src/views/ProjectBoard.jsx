@@ -1,7 +1,7 @@
 // P5：`/projects/:pid` 看板 —— 阶段状态 / 闸门 / 产物编辑 / 版本 diff /
 // 事件瀑布 / 成本 / 预览。原有单页能力全量保留并拆路由。
 import React, { useCallback, useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   api, STAGES, GATES, ARTIFACTS, REWRITABLE, KIND_LABEL, POLL_MS,
   fmtMoney, baseName, diffLines,
@@ -140,8 +140,22 @@ export default function ProjectBoard() {
   );
 
   // P1：长任务走 async 车道 + 进度条
-  const runStageAsync = async (label, url) => {
+  // 轮68:摊成逐镜画布——管线产物 → 每镜可编辑节点(一句话/景别/运动/
+  // 转场/引擎/语速),改完在画布上重跑,不用回管线。
+  const openCanvas = async () => {
     setBanner(null);
+    try {
+      const r = await api(
+        `/api/graphs/from-project/${encodeURIComponent(pid)}?aspect=portrait`,
+        { method: "POST" });
+      if (!r || !r.id) throw new Error(r?.detail || "导出失败");
+      navigate(`/graph?g=${encodeURIComponent(r.id)}`);
+    } catch (e) {
+      setBanner({ kind: "err", text: `导出画布失败: ${e.message || e}` });
+    }
+  };
+
+  const runStageAsync = async (label, url) => {    setBanner(null);
     try {
       const r = await api(url + "?async=true",
                           { method: "POST",
@@ -211,6 +225,13 @@ export default function ProjectBoard() {
   const overBudget = budget && budget.max_budget_usd != null
                      && costs && costs.total_usd > budget.max_budget_usd;
 
+  const shotRows = manifest && manifest.shots
+    ? (Array.isArray(manifest.shots)
+       ? manifest.shots
+       : Object.entries(manifest.shots).map(([sid, sc]) => (
+           { shot_id: sid, ...(sc && typeof sc === "object" ? sc : {}) })))
+    : [];
+
   return (
     <main className="main">
       {banner && <div className={`banner ${banner.kind}`}>{banner.text}</div>}
@@ -233,6 +254,10 @@ export default function ProjectBoard() {
           <button disabled={busy}
                   onClick={() => runStageAsync("阶段三 · 成片", "/api/pipeline/assemble")}>
             阶段三 · 成片
+          </button>
+          <button disabled={busy} title="摊成画布：每镜一句话/景别/运动/转场全部可改，改完重跑"
+                  onClick={openCanvas}>
+            🎬 逐镜画布编辑
           </button>
           <Link className="btn"
                 to={`/projects/${encodeURIComponent(pid)}/timeline`}>
@@ -487,7 +512,7 @@ export default function ProjectBoard() {
           <table>
             <thead><tr><th>镜头</th><th>策略</th><th>clip</th><th>QC</th><th>时长</th></tr></thead>
             <tbody>
-              {(manifest.shots || []).map((sc) => (
+              {shotRows.map((sc) => (
                 <tr key={sc.shot_id || sc.shotIndex}>
                   <td className="num">{sc.shot_id || sc.shotIndex}</td>
                   <td>{sc.strategy || "—"}</td>
@@ -496,7 +521,7 @@ export default function ProjectBoard() {
                   <td className="num">{sc.duration_sec ?? "—"}</td>
                 </tr>
               ))}
-              {(manifest.shots || []).length === 0 && (
+              {shotRows.length === 0 && (
                 <tr><td colSpan="5" className="fade">尚未生成</td></tr>
               )}
             </tbody>

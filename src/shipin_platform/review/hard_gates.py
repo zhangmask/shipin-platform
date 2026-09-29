@@ -371,8 +371,11 @@ def _norm_text(t: str) -> str:
                    if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
 
 
-def _asr_segments_default(video: str) -> list[dict]:
+def _asr_segments_default(video: str,
+                          initial_prompt: str = "") -> list[dict]:
     """默认 ASR 后端:WhisperService(zh)整片转写,读回 segments。
+    initial_prompt(轮73):预期文本偏置,压掉短句 ASR 噪声——调用方
+    知道该听到什么时(逐镜校验)应传入。
     协议失败向上抛由调用方转 available=False——本层绝不吞
     (静默 None/空 List 冒充审过正是轮45 修掉的病)。"""
     import json as _json
@@ -382,6 +385,8 @@ def _asr_segments_default(video: str) -> list[dict]:
         svc = WhisperService(model=os.environ.get("SHIPIN_ASR_MODEL",
                                                   "base"),
                              language="zh")
+        if initial_prompt:
+            svc._initial_prompt = str(initial_prompt)
         r = svc.transcribe(Path(video), output_dir=tmp,
                            output_format="json", word_timestamps=False)
         data = _json.loads(Path(r["json_path"]).read_text(encoding="utf-8"))
@@ -856,7 +861,14 @@ _PERSON_ROLES = ("顾客", "店员", "咖啡师", "消费者", "用户",
 
 
 def _is_person_shot(subject: str) -> bool:
-    return any(h in str(subject or "") for h in _PERSON_HINTS)
+    # 「无人物,产品静物…」类显式无主体镜头必须先否决再做子串匹配——
+    # _PERSON_HINTS 含「人物」二字,纯产品镜(落版卡/产品特写)的 subject
+    # 会字面命中,导致身份门拿产品图和别的人物镜比脸(实测 2026-09-25:
+    # IDENTITY_SWITCH/COSTUME_SWAP 100% 误报,本地/云端两条路径都卡发布)。
+    text = str(subject or "")
+    if text.startswith("无人物") or text.startswith("无人"):
+        return False
+    return any(h in text for h in _PERSON_HINTS)
 
 
 # 轮17:剧本钉外观判定——anchor/任一镜主体写了服装发型具体式样时,
@@ -1195,6 +1207,11 @@ _BOUNDARY_MARGIN = 2.0  # 采样帧距剪辑瞬间 0.45~1.6s,跨镜对帧最远 
 _BOUNDARY_MIN_COVER = 1.6
 _BOUNDARY_SWITCH_WORDS = ("切换", "换镜", "转场", "镜头交替", "切至",
                           "镜头切换", "跨镜头", "正常交接", "过渡")
+# VLM 自己给切换定性为「正常/自然/分镜间」的词——它的描述已经完成了分类,
+# 不需要再用 t 窗口二次猜测(2026-09-25 实证:切换发现帧滞后真实剪辑点
+# 1.9s,±1.6s 窗打空,两条后端路径都被这些「正常切换」卡发布)。
+_BOUNDARY_NORMAL_WORDS = ("正常", "自然", "分镜间", "镜头间的正常",
+                          "之间的正常")
 _BOUNDARY_ALARM_WORDS = ("错位", "异常", "疑似", "崩坏", "花屏", "变形",
                          "漂移", "鬼影", "残影", "撕裂", "闪烁", "闪白",
                          "闪帧", "雪花", "污染", "缺损", "丢失")
@@ -1217,6 +1234,14 @@ def _is_boundary_transition(t_b: Optional[float], kind: str, desc: str,
     margin 默认 _BOUNDARY_MARGIN(全片终审);单镜诊断(轮12)传更紧的
     边缘窗口——短 clip 上用 2.0s 会把大半个镜头都豁免掉。
     """
+    # 第 0 关(语义):VLM 自己把切换定性为正常/自然/分镜间,且没有告警词
+    # 共现——它的描述已完成分类,不再用 t 窗口二次猜测。这条专门接住
+    # 「切换发现帧滞后真实剪辑点」导致的漏豁免。
+    _has_switch = any(w in desc for w in _BOUNDARY_SWITCH_WORDS)
+    _has_normal = any(w in desc for w in _BOUNDARY_NORMAL_WORDS)
+    _has_alarm = any(w in desc for w in _BOUNDARY_ALARM_WORDS)
+    if _has_switch and _has_normal and not _has_alarm:
+        return True
     if t_b is None or not bounds:
         return False
     for idx, b in enumerate(bounds):
@@ -1678,13 +1703,30 @@ def vlm_review_final(video_path: str, frames_count: int = DEFAULT_FRAMES,
     # brief 的硬性交付物;实测 C 变体证明提示词可驱动 brand_seen,
     # 所以未入画=生成失败,不是审查过严)。首/尾镜含品牌提示词的
     # 项目在这里全面收口;无品牌名（纯信息展示）则不受影响。
-    if not brand_seen and str(ctx.get("brand_name") or "").strip():
-        _bn = ctx.get("brand_name")
+    # 2026-09-29 用户架构裁定:品牌/字幕**不进视频生成**(模型会把品牌名
+    # 写成错别字烧进画面,与独立字幕轨的文字对不上)。品牌改走确定性
+    # 通道——TTS 旁白 narration/dialogue + SRT 字幕烧录。故 brand_seen
+    # 判定扩为「VLM 画面看到」**或**「旁白/字幕文本含品牌名」任一成立
+    # 即过;VLM 画面结果仍记录(供参考/回归对照)。
+    _bn = str(ctx.get("brand_name") or "").strip()
+    _brand_in_text = False
+    if _bn:
+        _hay = " ".join(
+            [str((s or {}).get("narration") or "")
+             + str((s or {}).get("dialogue") or "")
+             for s in (ctx.get("shots") or [])]
+            + [str(ctx.get("subtitle_text") or ""),
+               str(ctx.get("slogan") or "")])
+        _brand_in_text = _bn in _hay
+    if _brand_in_text and not brand_seen:
+        brand_seen = "via_narration_srt"
+    if (not brand_seen and not _brand_in_text) and _bn:
         all_findings.append({
             "severity": "critical", "code": "BRAND_MISSING",
-            "message": (f"brief 声明的品牌「{_bn}」在成片全程未被 VLM 检测到"
-                        f"——品牌未落版，不能作为交付物。请在提示词中明确品牌"
-                        f"文字落点(杯身/灯箱/落版卡)后重生成")})
+            "message": (f"brief 声明的品牌「{_bn}」既未被 VLM 在画面检测到,"
+                        f"也未出现在旁白/字幕文本里——品牌未落版,不能作为"
+                        f"交付物。品牌走确定性通道:末镜 narration 念出品牌名"
+                        f"+ SRT 字幕烧录(不要再让视频生成模型画品牌字)")})
     verdict = "pass" if not all_findings else "fix"
     _reason = (f"确定性 {len(det_findings)} + VLM 断帧 {len(breaks)}"
                f" + 内容崩坏 {len([a for a in anomalies if a])}")

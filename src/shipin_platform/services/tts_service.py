@@ -102,6 +102,9 @@ class TtsService:
             else:
                 fallback = f"role_code {role_code!r} 未在 cast_roles 配置——回落默认音色"
         seg = TtsSegment(shot_id=shot_id, text=text, voice=voice, rate=rate)
+        # 轮65:role_code 落到段上——本地引擎(voxcpm)按角色选克隆参考,
+        # 没有它本地路径永远拿不到角色(voice_cast.db 为空也是同病)
+        seg.role_code = role_code or seg.role_code
         if fallback:
             seg.voice_fallback = fallback
         return seg
@@ -129,9 +132,12 @@ class TtsService:
         if os.environ.get("SHIPIN_MEDIA_BACKEND", "").strip().lower() == "local":
             from shipin_platform.generation import local_media
             try:
+                # 轮65:role_code 透传给本地引擎(voxcpm 按角色选克隆参考;
+                # vibevoice 忽略该字段,行为不变)
                 res = local_media.local_tts(
                     segment.text, str(out),
-                    engine=os.environ.get("SHIPIN_LOCAL_TTS_ENGINE", "vibevoice"))
+                    engine=os.environ.get("SHIPIN_LOCAL_TTS_ENGINE", "vibevoice"),
+                    voice=str(segment.role_code or ""))
                 segment.output_path = res["path"]
                 segment.duration_sec = self._probe_duration(res["path"])
                 return segment

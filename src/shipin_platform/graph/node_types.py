@@ -43,6 +43,34 @@ IMAGE_MODELS = [
     {"value": "pil", "label": "本地 PIL 占位图（不花钱）"},
 ]
 
+# 轮68:画布 lanes 的本地引擎路由(与 DGX 部署对齐:h3/wan22-i2v/
+# wan21-flf2v)。画布与管线同底座——H3 连续 2 次 VLM critical 的
+# 运动镜可直接在画布上换 FLF2V 重跑(端点锚定,专治动作时刻)。
+LOCAL_ENGINES = [
+    {"value": "h3", "label": "H3 turbo(本地,快,默认)"},
+    {"value": "wan22", "label": "Wan2.2 I2V 4步(本地,双expert)"},
+    {"value": "wan21-flf2v", "label": "Wan2.1 FLF2V(本地,首尾帧锚定)"},
+]
+# 轮73:配音引擎(音频驱动嘴型重生成;画布与管线同底座)
+DUB_ENGINES = [
+    {"value": "infinitetalk", "label": "InfiniteTalk 照帧重说(本地,音频驱动口型)"},
+]
+# 景别词表(与管线 video_prompt 同一套,画布上手选等价于改剧本景别)
+SHOT_SIZES = [
+    {"value": "ecu", "label": "大特写 ECU"},
+    {"value": "cu", "label": "特写 CU"},
+    {"value": "mcu", "label": "中近景 MCU"},
+    {"value": "ms", "label": "中景 MS"},
+    {"value": "ls", "label": "全景 LS"},
+]
+# 转场选型(与 assembly.build_transition_stitch 的边界类型一致)
+TRANSITIONS = [
+    {"value": "cut", "label": "硬切(同场景动作接力)"},
+    {"value": "softcut", "label": "软切3帧(同场景换景别)"},
+    {"value": "dissolve", "label": "叠化0.4s(换场景)"},
+    {"value": "fade", "label": "淡入淡出"},
+]
+
 # 2.5 协议语义：模型 → 参数视图
 _V25_MODELS = {"agnes-video-2.5-flash", "agnes-video-2.5"}
 
@@ -147,17 +175,41 @@ REGISTRY: dict[str, NodeTypeDef] = {
           "required": True},
          {"name": "last_frame", "kind": KIND_IMAGE, "label": "尾帧图（可选）"}],
         [{"name": "video", "kind": KIND_VIDEO, "label": "视频"}],
-        [{"key": "model", "label": "视频模型",
+        [{"key": "engine", "label": "生成引擎",
+          "schema": {"type": P_SELECT, "value": "agnes-cloud",
+                     "options": [{"value": "agnes-cloud",
+                                  "label": "agnes 云端(默认)"}] + LOCAL_ENGINES,
+                     "hint": "本地引擎复用 DGX：H3 快；FLF2V 首尾帧锚定攻动作时刻"}},
+         {"key": "model", "label": "视频模型(云端)",
           "schema": {"type": P_SELECT, "value": VIDEO_MODELS[0]["value"],
                      "options": VIDEO_MODELS}},
          {"key": "prompt", "label": "提示词",
           "schema": {"type": P_TEXT, "value": "", "hint": "与上游则连线二选一"}},
+         {"key": "shot_size", "label": "景别",
+          "schema": {"type": P_SELECT, "value": "mcu",
+                     "options": SHOT_SIZES,
+                     "hint": "抬头强约束，等价于改分镜景别"}},
+         {"key": "motion", "label": "镜头内运动",
+          "schema": {"type": P_TEXT, "value": "",
+                     "hint": "主语+一个连续动作，慢而稳；改写即改运镜/表演"}},
+         {"key": "transition", "label": "本镜入场合场",
+          "schema": {"type": P_SELECT, "value": "softcut",
+                     "options": TRANSITIONS,
+                     "hint": "与上一镜之间的转场；cut=硬切/softcut=3帧/dissolve=叠化"}},
+         {"key": "transition_duration", "label": "转场时长(秒)",
+          "schema": {"type": P_NUM, "value": 0.4, "min": 0.05, "max": 1.0,
+                     "step": 0.05, "hint": "仅 softcut/dissolve 等非 cut 生效"}},
          {"key": "duration", "label": "镜头时长",
           "schema": {"type": P_NUM, "value": 5, "min": 2, "max": 10}},
          {"key": "resolution", "label": "分辨率",
           "schema": {"type": P_SELECT, "value": "720p",
-                     "options": [{"value": "720p", "label": "720p"}]}}],
-        hint="输出 5s 镜头；多镜头连线到拼接节点即延片"),
+                     "options": [{"value": "720p", "label": "720p"}]}},
+         {"key": "aspect", "label": "画幅",
+          "schema": {"type": P_SELECT, "value": "portrait",
+                     "options": [{"value": "portrait", "label": "竖屏 720x1280"},
+                                 {"value": "landscape", "label": "横屏 1280x720"}],
+                     "hint": "本地引擎按此传宽高(竖屏项目不再被 normalize 切)"}}],
+        hint="输出镜头；多镜头连线到拼接节点即延片"),
     "tts": _mk(
         "tts", "配音 TTS", "音频", "#10b981",
         [{"name": "text", "kind": KIND_TEXT, "label": "配音文案", "required": True}],
@@ -168,8 +220,31 @@ REGISTRY: dict[str, NodeTypeDef] = {
           "schema": {"type": P_SELECT, "value": "biz_female",
                      "options": [{"value": "biz_female", "label": "商务女声"},
                                  {"value": "biz_male", "label": "商务男声"},
-                                 {"value": "crisp_female", "label": "清脆女声"}]}}],
+                                 {"value": "crisp_female", "label": "清脆女声"}]}},
+         {"key": "speed", "label": "语速倍率",
+          "schema": {"type": P_NUM, "value": 1.0, "min": 0.6, "max": 1.6,
+                     "step": 0.05,
+                     "hint": "本地引擎(VoxCPM)原生调速；嫌快就往 0.85-0.9 调"}}],
         hint="旁白配音；输出音频供拼接节点混音"),
+    "dub": _mk(
+        "dub", "配音驱动口型（照帧重说）", "生成", "#0ea5e9",
+        [{"name": "first_frame", "kind": KIND_IMAGE, "label": "首帧(人物)",
+          "required": True},
+         {"name": "audio", "kind": KIND_AUDIO, "label": "驱动音频",
+          "required": True}],
+        [{"name": "video", "kind": KIND_VIDEO, "label": "配音视频"}],
+        [{"key": "engine", "label": "配音引擎",
+          "schema": {"type": P_SELECT, "value": "infinitetalk",
+                     "options": DUB_ENGINES}},
+         {"key": "duration", "label": "输出时长(秒)",
+          "schema": {"type": P_NUM, "value": 5, "min": 2, "max": 10,
+                     "hint": "与音频时长对齐;短于音频会截断,长于音频静音补齐"}},
+         {"key": "aspect", "label": "画幅",
+          "schema": {"type": P_SELECT, "value": "portrait",
+                     "options": [{"value": "portrait", "label": "竖屏 720x1280"},
+                                 {"value": "landscape", "label": "横屏 1280x720"}],
+                     "hint": "InfiniteTalk 480p 档生成后由平台归一化到画布"}}],
+        hint="音频驱动重新生成嘴型/表情;24G 显存档位的标准做法(视频+音频分离)"),
     "qc": _mk(
         "qc", "逐镜质检 QC", "质检", "#f59e0b",
         [{"name": "video", "kind": KIND_VIDEO, "label": "视频", "required": True}],
@@ -183,14 +258,22 @@ REGISTRY: dict[str, NodeTypeDef] = {
         hint="硬门：时长/内切/运动/首帧一致；verdict=ok 才进拼接"),
     "assemble": _mk(
         "assemble", "拼接出片", "交付", "#ef4444",
-        [{"name": "clips", "kind": KIND_VIDEO, "label": "镜头(可多台)", "required": True}],
+        [{"name": "clips", "kind": KIND_VIDEO, "label": "镜头(可多台)", "required": True},
+         {"name": "audio", "kind": KIND_AUDIO, "label": "配音(可多台)"}],
         [{"name": "final", "kind": KIND_VIDEO, "label": "成片"}],
         [{"key": "fps", "label": "帧率", "schema": {"type": P_NUM, "value": 24, "min": 12}},
          {"key": "color_grade", "label": "商业温暖调色",
           "schema": {"type": P_BOOL, "value": True}},
          {"key": "burn_audio", "label": "混入配音",
-          "schema": {"type": P_BOOL, "value": True}}],
-        hint="按连线顺序串联多镜头 → 单个成片（时长 = 各镜之和）"),
+          "schema": {"type": P_BOOL, "value": True}},
+         {"key": "default_transition", "label": "默认转场",
+          "schema": {"type": P_SELECT, "value": "softcut",
+                     "options": TRANSITIONS,
+                     "hint": "各镜头节点未指定转场时的兜底"}},
+         {"key": "transition_duration", "label": "默认转场时长(秒)",
+          "schema": {"type": P_NUM, "value": 0.4, "min": 0.05, "max": 1.0,
+                     "step": 0.05}}],
+        hint="按连线顺序串联多镜头 → 单个成片（时长 = 各镜之和，转场按逐镜参数）"),
 
     # ---------------- 阶段流水线（AI 驱动：上游 AI 写入 → 用户确认 → 逐级下推）----
     # 与生成节点不同，这些是「编排节点」：内容由外部 AI（Codex 等）经 API 写入，
